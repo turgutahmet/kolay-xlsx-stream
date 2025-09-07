@@ -1,0 +1,57 @@
+{
+    "name": "kolay/xlsx-stream",
+    "description": "High-performance XLSX streaming writer for Laravel with zero disk I/O and direct S3 support",
+    "keywords": [
+        "laravel",
+        "excel",
+        "xlsx",
+        "streaming",
+        "s3",
+        "aws",
+        "export",
+        "spreadsheet",
+        "performance",
+        "memory-efficient"
+    ],
+    "homepage": "https://github.com/turgutahmet/kolay-xlsx-stream",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Turgut Ahmet",
+            "email": "turgut@kolay.com",
+            "role": "Developer"
+        }
+    ],
+    "require": {
+        "php": "^8.0",
+        "illuminate/support": "^9.0|^10.0|^11.0",
+        "aws/aws-sdk-php": "^3.0"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^9.0|^10.0",
+        "orchestra/testbench": "^7.0|^8.0|^9.0",
+        "mockery/mockery": "^1.4"
+    },
+    "autoload": {
+        "psr-4": {
+            "Kolay\\XlsxStream\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Kolay\\XlsxStream\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Kolay\\XlsxStream\\XlsxStreamServiceProvider"
+            ]
+        }
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "minimum-stability": "dev",
+    "prefer-stable": true
+}
