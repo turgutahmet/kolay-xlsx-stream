@@ -3,6 +3,7 @@
 [![Latest Version on Packagist](https://img.shields.io/packagist/v/kolay/xlsx-stream.svg?style=flat-square)](https://packagist.org/packages/kolay/xlsx-stream)
 [![Total Downloads](https://img.shields.io/packagist/dt/kolay/xlsx-stream.svg?style=flat-square)](https://packagist.org/packages/kolay/xlsx-stream)
 [![License](https://img.shields.io/packagist/l/kolay/xlsx-stream.svg?style=flat-square)](https://packagist.org/packages/kolay/xlsx-stream)
+[![PHP Version](https://img.shields.io/packagist/php-v/kolay/xlsx-stream.svg?style=flat-square)](https://packagist.org/packages/kolay/xlsx-stream)
 
 High-performance XLSX streaming writer for Laravel with **zero disk I/O** and **direct S3 support**. Perfect for exporting millions of rows without memory issues.
 
