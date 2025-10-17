@@ -97,7 +97,7 @@ The ± values in S3 memory represent **normal memory fluctuation** during stream
 ## Requirements
 
 - PHP 8.0+
-- Laravel 9.0+ (also supports Laravel 10 & 11)
+- Laravel 9.0+ (supports Laravel 9, 10, 11 & 12)
 - AWS SDK (only if using S3 streaming)
 
 ## Installation
