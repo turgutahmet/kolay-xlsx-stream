@@ -5,9 +5,9 @@ All notable changes to `kolay/xlsx-stream` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.2.0] — 2026-05-03
 
-### Added — styling & multi-sheet (v2.2)
+### Added — styling & multi-sheet
 
 - **`StyleRegistry`** — internal helper that emits `xl/styles.xml` on demand,
   deduplicates fonts, fills, number formats, and cellXfs by value so the
@@ -152,6 +152,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Initial release: high-performance XLSX streaming writer with FileSink and
   S3MultipartSink, multi-sheet support, and configurable compression.
 
+[2.2.0]: https://github.com/turgutahmet/kolay-xlsx-stream/compare/v2.1.0...v2.2.0
 [2.1.0]: https://github.com/turgutahmet/kolay-xlsx-stream/compare/v2.0.1...v2.1.0
 [2.0.1]: https://github.com/turgutahmet/kolay-xlsx-stream/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/turgutahmet/kolay-xlsx-stream/compare/v1.0.2...v2.0.0
