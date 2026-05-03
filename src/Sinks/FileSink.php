@@ -6,7 +6,7 @@ use Kolay\XlsxStream\Contracts\Sink;
 
 /**
  * File Sink - Local file system implementation
- * 
+ *
  * Simple wrapper around file operations
  * Provides same interface as S3MultipartSink for compatibility
  */
@@ -16,7 +16,7 @@ class FileSink implements Sink
     private string $path;
     private int $bytesWritten = 0;
     private bool $closed = false;
-    
+
     /**
      * @param string $path File path to write to
      * @param string $mode File open mode (default: 'wb')
@@ -24,7 +24,7 @@ class FileSink implements Sink
     public function __construct(string $path, string $mode = 'wb')
     {
         $this->path = $path;
-        
+
         // Ensure directory exists
         $dir = dirname($path);
         if (!is_dir($dir)) {
@@ -32,17 +32,17 @@ class FileSink implements Sink
                 throw new \RuntimeException("Failed to create directory: {$dir}");
             }
         }
-        
+
         // Open file
         $this->handle = fopen($path, $mode);
         if ($this->handle === false) {
             throw new \RuntimeException("Failed to open file: {$path}");
         }
-        
+
         // Set write buffer for better performance
         stream_set_write_buffer($this->handle, 1 << 20); // 1MB buffer
     }
-    
+
     /**
      * Write data to file
      */
@@ -51,16 +51,16 @@ class FileSink implements Sink
         if ($this->closed) {
             throw new \RuntimeException('Cannot write to closed sink');
         }
-        
+
         $written = fwrite($this->handle, $data);
-        
+
         if ($written === false) {
             throw new \RuntimeException("Failed to write to file: {$this->path}");
         }
-        
+
         $this->bytesWritten += $written;
     }
-    
+
     /**
      * Close the file
      */
@@ -69,15 +69,15 @@ class FileSink implements Sink
         if ($this->closed) {
             return;
         }
-        
+
         if ($this->handle) {
             fflush($this->handle);
             fclose($this->handle);
         }
-        
+
         $this->closed = true;
     }
-    
+
     /**
      * Abort and cleanup
      */
@@ -86,20 +86,20 @@ class FileSink implements Sink
         if ($this->closed) {
             return;
         }
-        
+
         // Close file handle
         if ($this->handle) {
             fclose($this->handle);
         }
-        
+
         // Delete partial file
         if (file_exists($this->path)) {
             unlink($this->path);
         }
-        
+
         $this->closed = true;
     }
-    
+
     /**
      * Get total bytes written
      */
@@ -107,7 +107,7 @@ class FileSink implements Sink
     {
         return $this->bytesWritten;
     }
-    
+
     /**
      * Get file path
      */
@@ -115,7 +115,7 @@ class FileSink implements Sink
     {
         return $this->path;
     }
-    
+
     /**
      * Destructor - ensure file is closed.
      *

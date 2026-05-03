@@ -9,6 +9,12 @@
         "trailing_comma_in_multiline": true
     },
     "exclude": [
-        "vendor"
+        "vendor",
+        "config",
+        "examples",
+        "tests"
+    ],
+    "notName": [
+        "benchmark-*.php"
     ]
 }

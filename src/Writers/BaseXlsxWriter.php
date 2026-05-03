@@ -6,7 +6,7 @@ use Kolay\XlsxStream\Exceptions\XlsxStreamException;
 
 /**
  * Base XLSX Writer - Core streaming functionality
- * 
+ *
  * Excel limits:
  * - Max rows per sheet: 1,048,576
  * - Max columns: 16,384 (XFD)
@@ -15,33 +15,33 @@ abstract class BaseXlsxWriter
 {
     protected array $centralDirectory = [];
     protected int $currentOffset = 0;
-    
+
     // ZIP constants
-    const LOCAL_FILE_HEADER_SIGNATURE = 0x04034b50;
-    const CENTRAL_FILE_HEADER_SIGNATURE = 0x02014b50;
-    const END_OF_CENTRAL_DIR_SIGNATURE = 0x06054b50;
-    const DATA_DESCRIPTOR_SIGNATURE = 0x08074b50;
-    
+    public const LOCAL_FILE_HEADER_SIGNATURE = 0x04034b50;
+    public const CENTRAL_FILE_HEADER_SIGNATURE = 0x02014b50;
+    public const END_OF_CENTRAL_DIR_SIGNATURE = 0x06054b50;
+    public const DATA_DESCRIPTOR_SIGNATURE = 0x08074b50;
+
     // Compression methods
-    const COMPRESSION_STORED = 0;
-    const COMPRESSION_DEFLATED = 8;
-    
+    public const COMPRESSION_STORED = 0;
+    public const COMPRESSION_DEFLATED = 8;
+
     // Version info
-    const VERSION_MADE_BY = 0x001E; // 3.0 UNIX
-    const VERSION_NEEDED = 0x0014;  // 2.0
-    
+    public const VERSION_MADE_BY = 0x001E; // 3.0 UNIX
+    public const VERSION_NEEDED = 0x0014;  // 2.0
+
     // Excel limits
-    const MAX_ROWS_PER_SHEET = 1048576; // Excel's hard limit
-    const ROWS_PER_SHEET = 1048575; // MAX - 1 for header safety
-    const MAX_COLUMNS = 16384; // Excel column limit (XFD)
+    public const MAX_ROWS_PER_SHEET = 1048576; // Excel's hard limit
+    public const ROWS_PER_SHEET = 1048575; // MAX - 1 for header safety
+    public const MAX_COLUMNS = 16384; // Excel column limit (XFD)
 
     // Style ids registered in getStylesXml() cellXfs
-    const STYLE_DEFAULT = 0;
-    const STYLE_DATETIME = 1;
+    public const STYLE_DEFAULT = 0;
+    public const STYLE_DATETIME = 1;
 
     // Excel epoch: serial 1 = 1900-01-01, but Excel mistakenly treats 1900 as a leap year.
     // Using 1899-12-30 as base so Unix timestamps map correctly for all post-1900 dates.
-    const EXCEL_EPOCH_TIMESTAMP = -2209161600; // 1899-12-30 00:00:00 UTC
+    public const EXCEL_EPOCH_TIMESTAMP = -2209161600; // 1899-12-30 00:00:00 UTC
 
     // Sheet management
     protected array $sheets = [];
@@ -70,12 +70,12 @@ abstract class BaseXlsxWriter
 
     // Column letter cache for performance
     protected array $colLetterCache = [];
-    
+
     /**
      * Write data to destination (must be implemented by child classes)
      */
     abstract protected function writeToDest(string $data): void;
-    
+
     /**
      * Set deflate compression level (1-9)
      * 3 = fast (20-35% speed boost, larger files)
@@ -90,7 +90,7 @@ abstract class BaseXlsxWriter
         $this->deflateLevel = $level;
         return $this;
     }
-    
+
     /**
      * Set row buffer flush interval
      * Lower = more responsive streaming
@@ -104,27 +104,27 @@ abstract class BaseXlsxWriter
         $this->bufferFlushInterval = $rows;
         return $this;
     }
-    
+
     /**
      * Convert Unix timestamp to DOS time and date (separate fields)
      */
     protected function dosTimeParts(int $timestamp): array
     {
         $d = getdate($timestamp);
-        
+
         // DOS Time: bits 15-11: hours, 10-5: minutes, 4-0: seconds/2
         $dosTime = (($d['hours'] & 0x1F) << 11) |
                    (($d['minutes'] & 0x3F) << 5) |
                    (($d['seconds'] >> 1) & 0x1F);
-        
+
         // DOS Date: bits 15-9: year-1980, 8-5: month, 4-0: day
         $dosDate = ((($d['year'] - 1980) & 0x7F) << 9) |
                    (($d['mon'] & 0x0F) << 5) |
                    (($d['mday'] & 0x1F));
-        
+
         return [$dosTime, $dosDate];
     }
-    
+
     /**
      * Start XLSX file with headers and static files
      */
@@ -185,7 +185,7 @@ abstract class BaseXlsxWriter
             $this->flushRowBuffer();
         }
     }
-    
+
     /**
      * Write multiple rows efficiently
      */
@@ -195,7 +195,7 @@ abstract class BaseXlsxWriter
             $this->writeRow($row);
         }
     }
-    
+
     /**
      * Flush row buffer to stream
      */
@@ -207,21 +207,21 @@ abstract class BaseXlsxWriter
             $this->rowBufferCount = 0;
         }
     }
-    
+
     /**
      * Sanitize sheet name for Excel compatibility
      */
     protected function sanitizeSheetName(string $name): string
     {
         $name = preg_replace('/[:*?\/\\\[\]]/', '_', $name);
-        
+
         if (mb_strlen($name, 'UTF-8') > 31) {
             $name = mb_substr($name, 0, 31, 'UTF-8');
         }
-        
+
         return $name === '' ? 'Sheet' : $name;
     }
-    
+
     /**
      * Start a new sheet
      */
@@ -229,24 +229,24 @@ abstract class BaseXlsxWriter
     {
         $sheetName = "Sheet{$this->currentSheetIndex}";
         if ($this->currentSheetIndex === 1) {
-            $sheetName = "Report";
+            $sheetName = 'Report';
         }
-        
+
         $sheetName = $this->sanitizeSheetName($sheetName);
         $filename = "xl/worksheets/sheet{$this->currentSheetIndex}.xml";
-        
+
         $this->sheets[] = [
             'index' => $this->currentSheetIndex,
             'name' => $sheetName,
             'filename' => $filename,
-            'rows' => 0
+            'rows' => 0,
         ];
-        
+
         $this->sheetOffset = $this->currentOffset;
         $this->currentSheetRow = 0;
-        
+
         [$mtime, $mdate] = $this->dosTimeParts(time());
-        
+
         // Write local file header
         $header = pack('V', self::LOCAL_FILE_HEADER_SIGNATURE);
         $header .= pack('v', self::VERSION_NEEDED);
@@ -260,9 +260,9 @@ abstract class BaseXlsxWriter
         $header .= pack('v', strlen($filename));
         $header .= pack('v', 0);
         $header .= $filename;
-        
+
         $this->writeToDest($header);
-        
+
         // Initialize deflate context
         $this->deflateCtx = deflate_init(ZLIB_ENCODING_RAW, ['level' => $this->deflateLevel]);
         $this->crcContext = hash_init('crc32b');
@@ -271,12 +271,12 @@ abstract class BaseXlsxWriter
         $this->sheetCompressedSize = 0;
         $this->rowBuffer = '';
         $this->rowBufferCount = 0;
-        
+
         // Write sheet header
         $sheetHeader = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
         $sheetHeader .= '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">';
         $sheetHeader .= '<sheetData>';
-        
+
         if (!empty($this->columns)) {
             $headerRow = '<row r="1">';
             foreach ($this->columns as $i => $header) {
@@ -288,10 +288,10 @@ abstract class BaseXlsxWriter
             $sheetHeader .= $headerRow;
             $this->currentSheetRow = 1;
         }
-        
+
         $this->writeSheetData($sheetHeader);
     }
-    
+
     /**
      * Write data to current sheet with streaming compression
      */
@@ -299,42 +299,42 @@ abstract class BaseXlsxWriter
     {
         hash_update($this->crcContext, $data);
         $this->sheetUncompressedSize += strlen($data);
-        
+
         $compressed = deflate_add($this->deflateCtx, $data, ZLIB_NO_FLUSH);
         if ($compressed !== false && strlen($compressed) > 0) {
             $this->writeToDest($compressed);
             $this->sheetCompressedSize += strlen($compressed);
         }
     }
-    
+
     /**
      * Finish current sheet
      */
     protected function finishCurrentSheet(): void
     {
         $this->flushRowBuffer();
-        
+
         $sheetFooter = '</sheetData></worksheet>';
-        
+
         hash_update($this->crcContext, $sheetFooter);
         $this->sheetUncompressedSize += strlen($sheetFooter);
-        
+
         $this->sheetCrc = hexdec(hash_final($this->crcContext));
-        
+
         $compressed = deflate_add($this->deflateCtx, $sheetFooter, ZLIB_FINISH);
         if ($compressed !== false) {
             $this->writeToDest($compressed);
             $this->sheetCompressedSize += strlen($compressed);
         }
-        
+
         // Write data descriptor
         $descriptor = pack('V', self::DATA_DESCRIPTOR_SIGNATURE);
         $descriptor .= pack('V', $this->sheetCrc);
         $descriptor .= pack('V', $this->sheetCompressedSize);
         $descriptor .= pack('V', $this->sheetUncompressedSize);
-        
+
         $this->writeToDest($descriptor);
-        
+
         // Add to central directory
         $sheetInfo = end($this->sheets);
         $this->centralDirectory[] = [
@@ -345,12 +345,12 @@ abstract class BaseXlsxWriter
             'offset' => $this->sheetOffset,
             'compression' => self::COMPRESSION_DEFLATED,
             'flags' => 0x0008,
-            'timestamp' => time()
+            'timestamp' => time(),
         ];
-        
+
         $this->sheets[count($this->sheets) - 1]['rows'] = $this->currentSheetRow;
     }
-    
+
     /**
      * Build row XML with optimization
      */
@@ -446,7 +446,7 @@ abstract class BaseXlsxWriter
 
         return false;
     }
-    
+
     /**
      * Get column letter with caching
      */
@@ -464,7 +464,7 @@ abstract class BaseXlsxWriter
         }
         return $this->colLetterCache[$index];
     }
-    
+
     /**
      * Ultra-fast XML escaping
      */
@@ -475,18 +475,18 @@ abstract class BaseXlsxWriter
             '<' => '&lt;',
             '>' => '&gt;',
             '"' => '&quot;',
-            "'" => '&apos;'
+            "'" => '&apos;',
         ];
-        
+
         if (strpbrk($str, '&<>"\'\x00\x01\x02\x03\x04\x05\x06\x07\x08\x0B\x0C\x0E\x0F\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1A\x1B\x1C\x1D\x1E\x1F') === false) {
             return $str;
         }
-        
+
         $str = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F]/', '', $str);
-        
+
         return strtr($str, $trans);
     }
-    
+
     /**
      * Write static ZIP entry
      */
@@ -496,9 +496,9 @@ abstract class BaseXlsxWriter
         $compressedContent = gzdeflate($content, $this->deflateLevel);
         $compressedSize = strlen($compressedContent);
         $crc32 = crc32($content);
-        
+
         [$mtime, $mdate] = $this->dosTimeParts(time());
-        
+
         $this->centralDirectory[] = [
             'filename' => $filename,
             'crc32' => $crc32,
@@ -507,9 +507,9 @@ abstract class BaseXlsxWriter
             'offset' => $this->currentOffset,
             'compression' => self::COMPRESSION_DEFLATED,
             'flags' => 0x0000,
-            'timestamp' => time()
+            'timestamp' => time(),
         ];
-        
+
         $header = pack('V', self::LOCAL_FILE_HEADER_SIGNATURE);
         $header .= pack('v', self::VERSION_NEEDED);
         $header .= pack('v', 0x0000);
@@ -522,11 +522,11 @@ abstract class BaseXlsxWriter
         $header .= pack('v', strlen($filename));
         $header .= pack('v', 0);
         $header .= $filename;
-        
+
         $this->writeToDest($header);
         $this->writeToDest($compressedContent);
     }
-    
+
     /**
      * Write ZIP central directory
      */
@@ -534,10 +534,10 @@ abstract class BaseXlsxWriter
     {
         $centralDirStart = $this->currentOffset;
         $centralDirSize = 0;
-        
+
         foreach ($this->centralDirectory as $entry) {
             [$mtime, $mdate] = $this->dosTimeParts($entry['timestamp']);
-            
+
             $header = pack('V', self::CENTRAL_FILE_HEADER_SIGNATURE);
             $header .= pack('v', self::VERSION_MADE_BY);
             $header .= pack('v', self::VERSION_NEEDED);
@@ -556,11 +556,11 @@ abstract class BaseXlsxWriter
             $header .= pack('V', 0x81A40000);
             $header .= pack('V', $entry['offset']);
             $header .= $entry['filename'];
-            
+
             $this->writeToDest($header);
             $centralDirSize += strlen($header);
         }
-        
+
         $endRecord = pack('V', self::END_OF_CENTRAL_DIR_SIGNATURE);
         $endRecord .= pack('v', 0);
         $endRecord .= pack('v', 0);
@@ -569,10 +569,10 @@ abstract class BaseXlsxWriter
         $endRecord .= pack('V', $centralDirSize);
         $endRecord .= pack('V', $centralDirStart);
         $endRecord .= pack('v', 0);
-        
+
         $this->writeToDest($endRecord);
     }
-    
+
     /**
      * Finalize the XLSX file
      */
@@ -602,31 +602,31 @@ abstract class BaseXlsxWriter
             'bytes' => $this->currentOffset,
             'rows' => $this->totalRows,
             'sheets' => count($this->sheets),
-            'sheet_details' => $this->sheets
+            'sheet_details' => $this->sheets,
         ];
     }
-    
+
     // XLSX structure generators
-    
+
     protected function getContentTypesXml(): string
     {
         $xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
     <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
     <Default Extension="xml" ContentType="application/xml"/>';
-        
+
         for ($i = 1; $i <= count($this->sheets); $i++) {
             $xml .= "\n    " . '<Override PartName="/xl/worksheets/sheet' . $i . '.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>';
         }
-        
+
         $xml .= '
     <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
     <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
 </Types>';
-        
+
         return $xml;
     }
-    
+
     protected function getRelsXml(): string
     {
         return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -634,43 +634,43 @@ abstract class BaseXlsxWriter
     <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
 </Relationships>';
     }
-    
+
     protected function getWorkbookRelsXml(): string
     {
         $xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">';
-        
+
         for ($i = 1; $i <= count($this->sheets); $i++) {
             $xml .= "\n    " . '<Relationship Id="rId' . $i . '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet' . $i . '.xml"/>';
         }
-        
+
         $styleId = count($this->sheets) + 1;
         $xml .= "\n    " . '<Relationship Id="rId' . $styleId . '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>';
-        
+
         $xml .= '
 </Relationships>';
-        
+
         return $xml;
     }
-    
+
     protected function getWorkbookXml(): string
     {
         $xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
     <sheets>';
-        
+
         foreach ($this->sheets as $sheet) {
             $escapedName = $this->fastXmlEscape($sheet['name']);
             $xml .= "\n        " . '<sheet name="' . $escapedName . '" sheetId="' . $sheet['index'] . '" r:id="rId' . $sheet['index'] . '"/>';
         }
-        
+
         $xml .= '
     </sheets>
 </workbook>';
-        
+
         return $xml;
     }
-    
+
     protected function getStylesXml(): string
     {
         // Custom numFmt 164 = ISO datetime; 14 (built-in) = m/d/yy date.

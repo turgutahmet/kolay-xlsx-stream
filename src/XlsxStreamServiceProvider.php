@@ -15,7 +15,8 @@ class XlsxStreamServiceProvider extends ServiceProvider
     {
         // Merge config
         $this->mergeConfigFrom(
-            __DIR__.'/../config/xlsx-stream.php', 'xlsx-stream'
+            __DIR__.'/../config/xlsx-stream.php',
+            'xlsx-stream'
         );
     }
 

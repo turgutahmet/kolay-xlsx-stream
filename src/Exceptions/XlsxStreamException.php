@@ -44,7 +44,7 @@ class XlsxStreamException extends \Exception
      */
     public static function writerAlreadyClosed(): self
     {
-        return new self("Cannot perform operation on closed writer.");
+        return new self('Cannot perform operation on closed writer.');
     }
 
     /**
@@ -52,7 +52,7 @@ class XlsxStreamException extends \Exception
      */
     public static function headersNotSet(): self
     {
-        return new self("Headers must be set before writing rows. Call startFile() first.");
+        return new self('Headers must be set before writing rows. Call startFile() first.');
     }
 
     /**
@@ -60,7 +60,7 @@ class XlsxStreamException extends \Exception
      */
     public static function alreadyStarted(): self
     {
-        return new self("Writer has already been started. startFile() can only be called once.");
+        return new self('Writer has already been started. startFile() can only be called once.');
     }
 
     /**
