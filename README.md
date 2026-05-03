@@ -1,6 +1,7 @@
 # Kolay XLSX Stream
 
 [![Latest Version on Packagist](https://img.shields.io/packagist/v/kolay/xlsx-stream.svg?style=flat-square)](https://packagist.org/packages/kolay/xlsx-stream)
+[![Tests](https://img.shields.io/github/actions/workflow/status/turgutahmet/kolay-xlsx-stream/tests.yml?branch=main&label=tests&style=flat-square)](https://github.com/turgutahmet/kolay-xlsx-stream/actions/workflows/tests.yml)
 [![Total Downloads](https://img.shields.io/packagist/dt/kolay/xlsx-stream.svg?style=flat-square)](https://packagist.org/packages/kolay/xlsx-stream)
 [![License](https://img.shields.io/packagist/l/kolay/xlsx-stream.svg?style=flat-square)](https://packagist.org/packages/kolay/xlsx-stream)
 [![PHP Version](https://img.shields.io/packagist/php-v/kolay/xlsx-stream.svg?style=flat-square)](https://packagist.org/packages/kolay/xlsx-stream)
@@ -96,9 +97,11 @@ The ± values in S3 memory represent **normal memory fluctuation** during stream
 
 ## Requirements
 
-- PHP 8.0+
-- Laravel 9.0+ (supports Laravel 9, 10, 11 & 12)
+- PHP 8.1+
+- Laravel 10, 11, 12 or 13
 - AWS SDK (only if using S3 streaming)
+
+> Upgrading from v1.x? See [UPGRADE.md](UPGRADE.md) for the v2.0 migration guide.
 
 ## Installation
 
@@ -280,6 +283,31 @@ class ExportUsersJob implements ShouldQueue
 ```
 
 ## Advanced Features
+
+### Supported Cell Data Types
+
+The writer infers the right Excel cell type from each PHP value:
+
+| PHP value | Excel cell |
+|---|---|
+| `int`, `float` | numeric (`t="n"`) |
+| `bool` | native boolean (`t="b"`) — `1` for true, `0` for false |
+| `\DateTimeInterface` (`DateTime`, `DateTimeImmutable`, `Carbon`, …) | numeric serial date with `yyyy-mm-dd hh:mm:ss` format — sortable as a date in Excel |
+| numeric string ≤ 15 digits | numeric (`t="n"`) |
+| numeric string > 15 digits, leading-zero (`"00123"`), or `+`-prefixed | inline string — preserves precision and formatting |
+| `null` or `''` | empty cell |
+| anything else | inline string (`t="inlineStr"`) |
+
+```php
+$writer->writeRow([
+    1,                                  // numeric
+    'Acme Co.',                         // string
+    new DateTime('2026-01-15 10:30'),   // date cell
+    true,                               // boolean cell
+    '12345678901234567890',             // big-int preserved as text
+    '+90 555 123 4567',                 // phone preserved as text
+]);
+```
 
 ### Multi-Sheet Support (Automatic)
 
