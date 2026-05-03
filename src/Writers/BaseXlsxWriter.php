@@ -3,6 +3,7 @@
 namespace Kolay\XlsxStream\Writers;
 
 use Kolay\XlsxStream\Exceptions\XlsxStreamException;
+use Kolay\XlsxStream\Styles\StyleRegistry;
 
 /**
  * Base XLSX Writer - Core streaming functionality
@@ -75,6 +76,18 @@ abstract class BaseXlsxWriter
     protected ?\Closure $progressCallback = null;
     protected int $progressInterval = 10000;
 
+    // Styling (v2.2+)
+    protected StyleRegistry $styles;
+    protected ?int $headerStyleId = null;
+
+    /** @var array<int, int> 1-based column index => cellXfs style id */
+    protected array $columnStyleIds = [];
+
+    public function __construct()
+    {
+        $this->styles = new StyleRegistry();
+    }
+
     /**
      * Write data to destination (must be implemented by child classes)
      */
@@ -139,6 +152,56 @@ abstract class BaseXlsxWriter
             throw XlsxStreamException::invalidBufferSize($rows);
         }
         $this->progressInterval = $rows;
+
+        return $this;
+    }
+
+    /**
+     * Style the header row (the first row written by startFile).
+     *
+     * Options:
+     *  - bold (bool)
+     *  - color (#RRGGBB) — text color
+     *  - fill (#RRGGBB)  — background color
+     *  - size (int)      — font size, default 11
+     *
+     * Example:
+     *
+     *   $writer->setHeaderStyle([
+     *       'bold' => true,
+     *       'fill' => '#4F81BD',
+     *       'color' => '#FFFFFF',
+     *   ]);
+     */
+    public function setHeaderStyle(array $options): self
+    {
+        if ($this->started) {
+            throw new XlsxStreamException('setHeaderStyle() must be called before startFile().');
+        }
+        $this->headerStyleId = $this->styles->registerHeaderStyle($options);
+
+        return $this;
+    }
+
+    /**
+     * Apply a number format to a column (1-based).
+     *
+     * Accepts a preset name (see StyleRegistry::PRESETS) or a raw Excel
+     * format code. Same code reuses the same style id under the hood.
+     *
+     *   $writer->setColumnFormat(2, 'date');           // YYYY-MM-DD
+     *   $writer->setColumnFormat(3, 'currency_try');   // #,##0.00 ₺
+     *   $writer->setColumnFormat(4, '0.000');          // custom code
+     *
+     * Numeric values in that column are wrapped with the chosen format.
+     * String values pass through unchanged.
+     */
+    public function setColumnFormat(int $column, string $presetOrCode): self
+    {
+        if ($column < 1) {
+            throw new XlsxStreamException("Column index must be >= 1, got {$column}.");
+        }
+        $this->columnStyleIds[$column] = $this->styles->registerColumnFormat($presetOrCode);
 
         return $this;
     }
@@ -326,11 +389,12 @@ abstract class BaseXlsxWriter
         $sheetHeader .= '<sheetData>';
 
         if (!empty($this->columns)) {
+            $headerStyleAttr = $this->headerStyleId !== null ? ' s="'.$this->headerStyleId.'"' : '';
             $headerRow = '<row r="1">';
             foreach ($this->columns as $i => $header) {
                 $cellRef = $this->getColumnLetter($i + 1) . '1';
                 $escaped = $this->fastXmlEscape($header);
-                $headerRow .= '<c r="' . $cellRef . '" t="inlineStr"><is><t>' . $escaped . '</t></is></c>';
+                $headerRow .= '<c r="' . $cellRef . '"' . $headerStyleAttr . ' t="inlineStr"><is><t>' . $escaped . '</t></is></c>';
             }
             $headerRow .= '</row>';
             $sheetHeader .= $headerRow;
@@ -406,9 +470,11 @@ abstract class BaseXlsxWriter
     {
         $cells = [];
         $colIndex = 1;
+        $hasColumnStyles = ! empty($this->columnStyleIds);
 
         foreach ($data as $value) {
             $cellRef = $this->getColumnLetter($colIndex) . $rowIndex;
+            $colStyleId = $hasColumnStyles ? ($this->columnStyleIds[$colIndex] ?? null) : null;
             $colIndex++;
 
             // Null / empty string -> empty cell
@@ -424,15 +490,18 @@ abstract class BaseXlsxWriter
             }
 
             // DateTimeInterface -> Excel serial date with datetime style
+            // (column-specific format wins if set, else fallback to legacy STYLE_DATETIME)
             if ($value instanceof \DateTimeInterface) {
                 $serial = ($value->getTimestamp() - self::EXCEL_EPOCH_TIMESTAMP) / 86400;
-                $cells[] = '<c r="' . $cellRef . '" s="' . self::STYLE_DATETIME . '" t="n"><v>' . $serial . '</v></c>';
+                $styleId = $colStyleId ?? self::STYLE_DATETIME;
+                $cells[] = '<c r="' . $cellRef . '" s="' . $styleId . '" t="n"><v>' . $serial . '</v></c>';
                 continue;
             }
 
             // Numeric values
             if (is_int($value) || is_float($value)) {
-                $cells[] = '<c r="' . $cellRef . '" t="n"><v>' . $value . '</v></c>';
+                $styleAttr = $colStyleId !== null ? ' s="' . $colStyleId . '"' : '';
+                $cells[] = '<c r="' . $cellRef . '"' . $styleAttr . ' t="n"><v>' . $value . '</v></c>';
                 continue;
             }
 
@@ -442,7 +511,8 @@ abstract class BaseXlsxWriter
                     $escaped = $this->fastXmlEscape($value);
                     $cells[] = '<c r="' . $cellRef . '" t="inlineStr"><is><t>' . $escaped . '</t></is></c>';
                 } else {
-                    $cells[] = '<c r="' . $cellRef . '" t="n"><v>' . (0 + $value) . '</v></c>';
+                    $styleAttr = $colStyleId !== null ? ' s="' . $colStyleId . '"' : '';
+                    $cells[] = '<c r="' . $cellRef . '"' . $styleAttr . ' t="n"><v>' . (0 + $value) . '</v></c>';
                 }
                 continue;
             }
@@ -721,27 +791,6 @@ abstract class BaseXlsxWriter
 
     protected function getStylesXml(): string
     {
-        // Custom numFmt 164 = ISO datetime; 14 (built-in) = m/d/yy date.
-        // cellXfs index 0 = default, index 1 = STYLE_DATETIME (numFmtId 164).
-        return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-    <numFmts count="1">
-        <numFmt numFmtId="164" formatCode="yyyy-mm-dd hh:mm:ss"/>
-    </numFmts>
-    <fonts count="1">
-        <font><sz val="11"/><name val="Calibri"/></font>
-    </fonts>
-    <fills count="2">
-        <fill><patternFill patternType="none"/></fill>
-        <fill><patternFill patternType="gray125"/></fill>
-    </fills>
-    <borders count="1">
-        <border><left/><right/><top/><bottom/><diagonal/></border>
-    </borders>
-    <cellXfs count="2">
-        <xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
-        <xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>
-    </cellXfs>
-</styleSheet>';
+        return $this->styles->toXml();
     }
 }

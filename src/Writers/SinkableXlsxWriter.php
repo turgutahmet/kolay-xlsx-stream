@@ -20,6 +20,7 @@ class SinkableXlsxWriter extends BaseXlsxWriter
 
     public function __construct(Sink $sink)
     {
+        parent::__construct();
         $this->sink = $sink;
     }
 
