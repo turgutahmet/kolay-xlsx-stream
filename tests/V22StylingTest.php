@@ -239,6 +239,33 @@ class V22StylingTest extends TestCase
         $this->assertStringContainsString('<col min="2" max="2" width="24"', $sheet);
     }
 
+    public function test_auto_column_width_respects_format_minimum()
+    {
+        // Short header 'Salary' (6 chars) on a currency column should still
+        // render the value ('₺99,999.00' = 10+ chars) without being clipped.
+        $writer = new SinkableXlsxWriter(new FileSink($this->testFile));
+        $writer->setAutoColumnWidth();
+        $writer->setColumnFormat(2, 'currency_try');
+        $writer->setColumnFormat(3, 'datetime');
+        $writer->setColumnFormat(4, 'date');
+        $writer->setColumnFormat(5, 'percent');
+        $writer->startFile(['ID', 'Salary', 'Last Active', 'Date', 'Done']);
+        $writer->writeRow([1, 50000, new \DateTime('2026-01-15 10:30:00'), new \DateTime('2026-01-15'), 0.5]);
+        $writer->finishFile();
+
+        $sheet = $this->extract('xl/worksheets/sheet1.xml');
+        // ID (no format): max(8, 4) = 8
+        $this->assertStringContainsString('<col min="1" max="1" width="8"', $sheet);
+        // Salary (currency_try, header 6 → 8): format min 14 wins
+        $this->assertStringContainsString('<col min="2" max="2" width="14"', $sheet);
+        // Last Active (datetime, header 11 → 13): format min 20 wins
+        $this->assertStringContainsString('<col min="3" max="3" width="20"', $sheet);
+        // Date (date, header 4 → 8): format min 12 wins
+        $this->assertStringContainsString('<col min="4" max="4" width="12"', $sheet);
+        // Done (percent, header 4 → 8): format min 10 wins
+        $this->assertStringContainsString('<col min="5" max="5" width="10"', $sheet);
+    }
+
     public function test_manual_widths_override_auto()
     {
         $writer = new SinkableXlsxWriter(new FileSink($this->testFile));

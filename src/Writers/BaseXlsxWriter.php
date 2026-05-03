@@ -83,6 +83,9 @@ abstract class BaseXlsxWriter
     /** @var array<int, int> 1-based column index => cellXfs style id */
     protected array $columnStyleIds = [];
 
+    /** @var array<int, string> 1-based column index => format preset name (used for auto-width sizing) */
+    protected array $columnFormatNames = [];
+
     // Sheet view options (v2.2+)
     protected int $freezeRows = 0;
     protected int $freezeColumns = 0;
@@ -214,12 +217,14 @@ abstract class BaseXlsxWriter
      */
     public function freezeRowsAndColumns(int $rows = 1, int $columns = 0): self
     {
-        if ($this->started) {
-            throw new XlsxStreamException('freezeRowsAndColumns() must be called before startFile().');
+        if ($this->closed) {
+            throw XlsxStreamException::writerAlreadyClosed();
         }
         if ($rows < 0 || $columns < 0) {
             throw new XlsxStreamException('Freeze rows/columns must be >= 0.');
         }
+        // Settable any time before close — applies to the next sheet started
+        // via writeRow() or newSheet().
         $this->freezeRows = $rows;
         $this->freezeColumns = $columns;
 
@@ -238,8 +243,8 @@ abstract class BaseXlsxWriter
      */
     public function setColumnWidths(array $widths): self
     {
-        if ($this->started) {
-            throw new XlsxStreamException('setColumnWidths() must be called before startFile().');
+        if ($this->closed) {
+            throw XlsxStreamException::writerAlreadyClosed();
         }
         foreach ($widths as $col => $width) {
             if ($col < 1) {
@@ -266,8 +271,8 @@ abstract class BaseXlsxWriter
      */
     public function setAutoColumnWidth(bool $enabled = true): self
     {
-        if ($this->started) {
-            throw new XlsxStreamException('setAutoColumnWidth() must be called before startFile().');
+        if ($this->closed) {
+            throw XlsxStreamException::writerAlreadyClosed();
         }
         $this->autoColumnWidth = $enabled;
 
@@ -280,12 +285,12 @@ abstract class BaseXlsxWriter
      * The filter range is computed automatically from the sheet's columns
      * and final row count when the sheet is closed.
      */
-    public function enableAutoFilter(): self
+    public function enableAutoFilter(bool $enabled = true): self
     {
-        if ($this->started) {
-            throw new XlsxStreamException('enableAutoFilter() must be called before startFile().');
+        if ($this->closed) {
+            throw XlsxStreamException::writerAlreadyClosed();
         }
-        $this->autoFilterEnabled = true;
+        $this->autoFilterEnabled = $enabled;
 
         return $this;
     }
@@ -312,6 +317,29 @@ abstract class BaseXlsxWriter
             throw new XlsxStreamException("Column index must be >= 1, got {$column}.");
         }
         $this->columnStyleIds[$column] = $this->styles->registerColumnFormat($presetOrCode);
+        // Stored separately so the auto-width heuristic can pick a sensible
+        // minimum based on the format (e.g. currency cells need ~14 chars
+        // even when the header is shorter).
+        $this->columnFormatNames[$column] = $presetOrCode;
+
+        return $this;
+    }
+
+    /**
+     * Clear all column-level formats and widths.
+     *
+     * Useful between newSheet() calls when the next sheet has a different
+     * column layout — without this, formats set on the previous sheet leak
+     * into the next sheet's numeric cells and auto-width calculations.
+     */
+    public function clearColumnFormats(): self
+    {
+        if ($this->closed) {
+            throw XlsxStreamException::writerAlreadyClosed();
+        }
+        $this->columnStyleIds = [];
+        $this->columnFormatNames = [];
+        $this->columnWidths = [];
 
         return $this;
     }
@@ -622,7 +650,10 @@ abstract class BaseXlsxWriter
      *
      * Resolution order (per column):
      *   1. Explicit width from setColumnWidths()
-     *   2. Heuristic from header text length when setAutoColumnWidth(true)
+     *   2. setAutoColumnWidth() heuristic: max(format_min, header_len + 2, 8)
+     *      where format_min reflects the rendered width of values formatted
+     *      as date / datetime / currency / percent / decimal — fixes the
+     *      "Salary header is 6 chars but ₺50,000.00 needs ~14 chars" case
      *   3. Excel default (no <col> entry)
      */
     protected function buildColsXml(): string
@@ -638,7 +669,8 @@ abstract class BaseXlsxWriter
             }
             if ($this->autoColumnWidth && isset($this->columns[$col - 1])) {
                 $headerLen = mb_strlen((string) $this->columns[$col - 1], 'UTF-8');
-                $resolved[$col] = (float) max(8, $headerLen + 2);
+                $formatMin = $this->minWidthForFormat($this->columnFormatNames[$col] ?? null);
+                $resolved[$col] = (float) max(8, $headerLen + 2, $formatMin);
             }
         }
 
@@ -653,6 +685,27 @@ abstract class BaseXlsxWriter
         $xml .= '</cols>';
 
         return $xml;
+    }
+
+    /**
+     * Minimum sensible column width (in chars) for a given format preset.
+     * Returns 0 for unknown / unformatted columns so the header heuristic wins.
+     */
+    protected function minWidthForFormat(?string $name): int
+    {
+        return match ($name) {
+            'date' => 12,                    // 2026-01-15
+            'datetime', 'datetime_iso' => 20, // 2026-01-15 10:30:00
+            'time' => 10,                    // 10:30:00
+            'currency_try',
+            'currency_usd',
+            'currency_eur',
+            'currency_gbp' => 14,            // ₺99,999.99
+            'percent' => 10,                 // 100.00%
+            'decimal' => 12,                 // 99,999.99
+            'integer' => 10,                 // 99,999,999
+            default => 0,
+        };
     }
 
     /**
