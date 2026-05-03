@@ -27,7 +27,7 @@ Most PHP Excel libraries (PHPSpreadsheet, Spout, Laravel Excel) have critical li
 
 ## Performance Comparison
 
-### Latest Benchmark — v2.2 (May 2026)
+### Latest Benchmark — v2.2.2 (May 2026)
 
 Re-measured on an Apple Silicon laptop with PHP 8.2.28 and AWS SDK
 3.379 against the same `xlsx-test-package` bucket in `us-east-2`. The
@@ -36,35 +36,38 @@ mixed types, compression level 1).
 
 | Rows | Local Speed | Local Time | S3 Speed | S3 Memory | S3 Time | File Size |
 |------|-------------|------------|----------|-----------|---------|-----------|
-| 100 | 33,784 rows/s | 0.00s | 106 rows/s | 0 MB | 0.94s | 0.01 MB |
-| 500 | 153,942 rows/s | 0.00s | 481 rows/s | 0 MB | 1.04s | 0.02 MB |
-| 1,000 | 152,792 rows/s | 0.01s | 875 rows/s | 0 MB | 1.14s | 0.04 MB |
-| 5,000 | 160,639 rows/s | 0.03s | 3,342 rows/s | 0 MB | 1.50s | 0.2 MB |
-| 10,000 | 163,765 rows/s | 0.06s | 4,726 rows/s | 0 MB | 2.12s | 0.4 MB |
-| 25,000 | 173,144 rows/s | 0.14s | 11,357 rows/s | 0 MB | 2.20s | 1 MB |
-| 50,000 | 175,682 rows/s | 0.28s | 20,014 rows/s | 2 MB | 2.50s | 2 MB |
-| 100,000 | 175,130 rows/s | 0.57s | 22,372 rows/s | 4 MB | 4.47s | 4 MB |
-| 250,000 | 170,788 rows/s | 1.46s | 62,340 rows/s | 12 MB (±6) | 4.01s | 10 MB |
-| 500,000 | 171,361 rows/s | 2.92s | 83,525 rows/s | 20 MB (±18) | 5.99s | 20 MB |
-| 750,000 | 168,742 rows/s | 4.44s | 93,753 rows/s | 30 MB (±26) | 8.00s | 30 MB |
-| 1,000,000 | 161,250 rows/s | 6.20s | 95,070 rows/s | 40 MB (±38) | 10.52s | 40 MB |
-| 1,500,000 | 168,616 rows/s | 8.90s | 103,311 rows/s | 60 MB (±58) | 14.52s | 60 MB |
-| 2,000,000 | 166,369 rows/s | 12.02s | 95,629 rows/s | 79 MB (±77) | 20.91s | 79 MB |
-| 3,000,000 | – | – | 105,291 rows/s | 119 MB (±117) | 28.49s | 119 MB |
-| 4,000,000 | – | – | 106,815 rows/s | 158 MB (±156) | 37.45s | 158 MB |
-| 4,500,000 | – | – | 106,715 rows/s | 178 MB (±178) | 42.17s | 178 MB |
+| 100 | 45,290 rows/s | 0.00s | 112 rows/s | 0 MB | 0.89s | 0.01 MB |
+| 500 | 191,346 rows/s | 0.00s | 491 rows/s | 0 MB | 1.02s | 0.02 MB |
+| 1,000 | 184,836 rows/s | 0.01s | 966 rows/s | 0 MB | 1.03s | 0.04 MB |
+| 5,000 | 195,825 rows/s | 0.03s | 3,345 rows/s | 0 MB | 1.49s | 0.2 MB |
+| 10,000 | 198,898 rows/s | 0.05s | 2,551 rows/s | 0 MB | 3.92s | 0.4 MB |
+| 25,000 | 210,498 rows/s | 0.12s | 10,170 rows/s | 0 MB | 2.46s | 1 MB |
+| 50,000 | 217,123 rows/s | 0.23s | 15,597 rows/s | 2 MB | 3.21s | 2 MB |
+| 100,000 | 188,771 rows/s | 0.53s | 24,258 rows/s | 4 MB | 4.12s | 4 MB |
+| 250,000 | 215,340 rows/s | 1.16s | 63,713 rows/s | 12 MB (±6) | 3.92s | 10 MB |
+| 500,000 | 209,428 rows/s | 2.39s | 87,679 rows/s | 20 MB (±18) | 5.70s | 20 MB |
+| 750,000 | 211,315 rows/s | 3.55s | 84,221 rows/s | 30 MB (±26) | 8.91s | 30 MB |
+| 1,000,000 | 209,905 rows/s | 4.76s | 106,924 rows/s | 40 MB (±38) | 9.35s | 40 MB |
+| 1,500,000 | 207,503 rows/s | 7.23s | 117,631 rows/s | 60 MB (±58) | 12.75s | 60 MB |
+| 2,000,000 | 208,512 rows/s | 9.59s | 112,708 rows/s | 79 MB (±77) | 17.74s | 79 MB |
+| 3,000,000 | – | – | 112,229 rows/s | 119 MB (±117) | 26.73s | 119 MB |
+| 4,000,000 | – | – | 128,930 rows/s | 160 MB (±156) | 31.02s | 158 MB |
+| 4,500,000 | – | – | 130,293 rows/s | 178 MB (±178) | 34.54s | 178 MB |
 
 #### What changed since v1.x
 
-- **S3 throughput is up roughly 2–3×** for any workload above 50K rows
-  (1M: 95K rows/s vs 43K, 4.5M: 107K rows/s vs 46K). Most of the win
-  comes from updated `aws/aws-sdk-php` (3.379+) and a faster network on
-  the measurement machine — the multipart-upload code path itself is
-  unchanged.
-- **Local throughput is ~5–10% lower** than the v1.x numbers — the cost
-  of the v2.0+ per-cell type detection (boolean cells, `DateTimeInterface`
-  → serial date, big-integer-string preservation). It's a deliberate
-  trade-off: v1.x produced silently broken cells for those types.
+- **Local throughput is now ~15–25% *faster* than the v1.x baseline**
+  (1M rows: 210K rows/s vs 183K). The v2.0+ per-cell type detection
+  added a small overhead at first (v2.0 was about 5% slower than v1.x),
+  but v2.2.2 fixed a long-standing bug in the XML escape fast path — the
+  `strpbrk` needle was a single-quoted literal so `\xNN` escapes were
+  embedded as the characters `\`, `x`, `0..9`, `A..F` instead of as
+  actual control bytes. The fix shrank the needle from 129 to 36 chars
+  and per-cell sanitization got ~3.5× cheaper as a side effect.
+- **S3 throughput is up 2.5–3× over v1.x** for any workload above 50K
+  rows (1M: 107K rows/s vs 43K, 4.5M: 130K rows/s vs 46K). Drivers:
+  AWS SDK 3.379+, faster measurement-machine network, and a smaller
+  share from the per-row hot-path improvement.
 - **Memory is unchanged** — local stays at 0–2 MB constant, S3 keeps the
   same sawtooth pattern as the buffer fills and flushes per part.
 
@@ -122,10 +125,10 @@ The ± values in S3 memory represent **normal memory fluctuation** during stream
    - Pattern: Memory oscillates between ~2MB (after upload) and ~78MB (before upload)
    - This is **completely normal** and expected behavior
 
-### Performance Highlights *(v2.2, May 2026)*
+### Performance Highlights *(v2.2.2, May 2026)*
 
-- **Local File System**: ~160,000–175,000 rows/second with true O(1) memory
-- **S3 Streaming**: 90,000–110,000 rows/second above 1M rows (2–3× the v1.x baseline)
+- **Local File System**: ~190,000–215,000 rows/second with true O(1) memory
+- **S3 Streaming**: 105,000–130,000 rows/second above 1M rows (2.5–3× the v1.x baseline)
 - **Memory Efficiency**: Local uses <2 MB, S3 averages 40 MB per million rows
 - **Multi-sheet Support**: Automatic sheet creation at Excel's 1,048,576 row limit
 - **Production Ready**: Successfully tested with 4.5 million rows
@@ -137,8 +140,8 @@ The ± values in S3 memory represent **normal memory fluctuation** during stream
 | PHPSpreadsheet | ❌ Crashes | ~8GB | Full file | Indirect |
 | Spout | ~60 sec | ~100MB+ | Full file | Indirect |
 | Laravel Excel | ~90 sec | ~500MB+ | Full file | Indirect |
-| **Kolay XLSX Stream (Local)** | ✅ **6.2 sec** | ✅ **0 MB** | ✅ **Zero** | N/A |
-| **Kolay XLSX Stream (S3)** | ✅ **10.5 sec** | ✅ **40MB avg** | ✅ **Zero** | ✅ **Direct** |
+| **Kolay XLSX Stream (Local)** | ✅ **4.8 sec** | ✅ **0 MB** | ✅ **Zero** | N/A |
+| **Kolay XLSX Stream (S3)** | ✅ **9.4 sec** | ✅ **40MB avg** | ✅ **Zero** | ✅ **Direct** |
 
 ## Requirements
 
@@ -409,6 +412,13 @@ $writer->startFile($headers);
 $writer->writeRows($query->lazy());
 $writer->finishFile();
 ```
+
+> **Note on `$bytes`** — the byte counter only advances when zlib emits
+> compressed output. With small datasets (or when `setBufferFlushInterval()`
+> is large relative to `setProgressInterval()`), several events in a row
+> may report the same byte count between flushes. The row counter is always
+> exact; if you need accurate streamed-byte progress on small files, lower
+> `setBufferFlushInterval()` below your progress interval.
 
 ### Supported Cell Data Types
 
