@@ -92,12 +92,6 @@ class RealS3Test extends TestCase
         echo "\n✓ Successfully uploaded {$stats['rows']} rows to S3";
         echo "\n✓ File size: " . number_format($result['ContentLength']) . " bytes";
         echo "\n✓ Location: s3://{$bucket}/{$key}\n";
-
-        // Cleanup - delete test file
-        $this->s3Client->deleteObject([
-            'Bucket' => $bucket,
-            'Key' => $key,
-        ]);
     }
 
     public function test_real_s3_upload_larger_file()
@@ -152,11 +146,5 @@ class RealS3Test extends TestCase
         echo "\n✓ Successfully uploaded {$stats['rows']} rows to S3";
         echo "\n✓ File size: " . number_format($result['ContentLength']) . " bytes";
         echo "\n✓ Location: s3://{$bucket}/{$key}\n";
-
-        // Cleanup
-        $this->s3Client->deleteObject([
-            'Bucket' => $bucket,
-            'Key' => $key,
-        ]);
     }
 }
