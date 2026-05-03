@@ -92,6 +92,9 @@ abstract class BaseXlsxWriter
     protected array $columnWidths = [];
     protected bool $autoColumnWidth = false;
 
+    // Custom sheet name for the next sheet rotation (set by newSheet()).
+    protected ?string $nextSheetName = null;
+
     public function __construct()
     {
         $this->styles = new StyleRegistry();
@@ -410,6 +413,53 @@ abstract class BaseXlsxWriter
     }
 
     /**
+     * Start a new named sheet, optionally with its own header row.
+     *
+     *   $writer->startFile(['ID', 'Name']);
+     *   $writer->writeRow([1, 'Alice']);
+     *   $writer->newSheet('Orders', ['ID', 'Customer', 'Total']);
+     *   $writer->writeRow([100, 1, 49.90]);
+     *
+     * The current sheet is finalized first (if it has any rows). The new
+     * sheet is created eagerly so it shows up in the output even if no
+     * data rows follow.
+     *
+     * If $headers is null the previous header row is reused.
+     */
+    public function newSheet(string $name, ?array $headers = null): self
+    {
+        if (! $this->started) {
+            throw XlsxStreamException::headersNotSet();
+        }
+        if ($this->closed) {
+            throw XlsxStreamException::writerAlreadyClosed();
+        }
+        if ($name === '') {
+            throw new XlsxStreamException('Sheet name cannot be empty.');
+        }
+
+        // Finalize the current sheet so its data descriptor and central-dir
+        // entry are committed before we start writing the next sheet.
+        if ($this->currentSheetRow > 0) {
+            $this->flushRowBuffer();
+            $this->finishCurrentSheet();
+        }
+
+        if ($headers !== null) {
+            if (count($headers) > self::MAX_COLUMNS) {
+                throw XlsxStreamException::tooManyColumns(count($headers), self::MAX_COLUMNS);
+            }
+            $this->columns = $headers;
+        }
+
+        $this->nextSheetName = $name;
+        $this->currentSheetIndex++;
+        $this->startNewSheet();
+
+        return $this;
+    }
+
+    /**
      * Flush row buffer to stream
      */
     protected function flushRowBuffer(): void
@@ -440,9 +490,15 @@ abstract class BaseXlsxWriter
      */
     protected function startNewSheet(): void
     {
-        $sheetName = "Sheet{$this->currentSheetIndex}";
-        if ($this->currentSheetIndex === 1) {
+        // Custom name (from newSheet()) wins, else preserve the legacy default
+        // ("Report" for the first sheet, "SheetN" for auto-split overflow).
+        if ($this->nextSheetName !== null) {
+            $sheetName = $this->nextSheetName;
+            $this->nextSheetName = null;
+        } elseif ($this->currentSheetIndex === 1) {
             $sheetName = 'Report';
+        } else {
+            $sheetName = "Sheet{$this->currentSheetIndex}";
         }
 
         $sheetName = $this->sanitizeSheetName($sheetName);
