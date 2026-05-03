@@ -5,6 +5,48 @@ All notable changes to `kolay/xlsx-stream` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.1] — 2026-05-03
+
+### Added — polish
+
+- **Color hex validation** — `setHeaderStyle()` rejects anything that
+  isn't a 6-character hex value (with or without a leading `#`) up
+  front, instead of producing a styles.xml Excel silently rejects.
+- **Custom font name** — `setHeaderStyle(['name' => 'Arial', ...])` now
+  applies. The value is XML-escaped on the way out so font names
+  containing `&` or `"` don't break the workbook.
+- **Empty workbook is now a hard error** — calling `finishFile()` after
+  `startFile()` with no rows and no `newSheet()` now throws
+  `XlsxStreamException`. The previous behaviour produced `<sheets/>`
+  which Excel and most readers refuse to open.
+- **Out-of-range column format detection** —
+  `setColumnFormat($col, $preset)` with `$col > count($headers)` no
+  longer silently registers a format that's never applied. Validation
+  is deferred to the next `startNewSheet()` (called from `writeRow()`'s
+  auto-trigger or `newSheet()`) so callers can still pre-configure
+  formats for an upcoming `newSheet()` whose column count is different
+  from the current sheet's.
+
+### Changed
+
+- `BaseXlsxWriter::buildColsXml()` uses a plain `for` loop instead of
+  `range()`/`foreach`, so it no longer allocates a 1..N integer array
+  per sheet startup (matters at the 16,384 column limit).
+- `StyleRegistry::resolveCellXf()` and `resolveFont()` use strict (`===`)
+  comparison for dedup — same key order is guaranteed by the
+  registration code paths, and strict comparison is both faster and
+  semantically more correct.
+- Auto-width minimum for `integer` and `decimal` formats raised to 14
+  characters (was 10/12). The `#,##0` format adds thousand separators,
+  so a 10-digit integer renders as `1,234,567,890` (13 characters) —
+  the previous minimum was just below the threshold and Excel would
+  render `####`. Same root cause as the v2.2.0 currency-width fix.
+
+### Performance
+
+- No measurable regression vs v2.2.0 baseline (1M rows local: 169K
+  rows/s plain, 162K rows/s styled). Memory still O(1).
+
 ## [2.2.0] — 2026-05-03
 
 ### Added — styling & multi-sheet
@@ -152,6 +194,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Initial release: high-performance XLSX streaming writer with FileSink and
   S3MultipartSink, multi-sheet support, and configurable compression.
 
+[2.2.1]: https://github.com/turgutahmet/kolay-xlsx-stream/compare/v2.2.0...v2.2.1
 [2.2.0]: https://github.com/turgutahmet/kolay-xlsx-stream/compare/v2.1.0...v2.2.0
 [2.1.0]: https://github.com/turgutahmet/kolay-xlsx-stream/compare/v2.0.1...v2.1.0
 [2.0.1]: https://github.com/turgutahmet/kolay-xlsx-stream/compare/v2.0.0...v2.0.1

@@ -135,6 +135,13 @@ class SinkableXlsxWriter extends BaseXlsxWriter
                 $this->finishCurrentSheet();
             }
 
+            // Empty workbook = invalid XLSX (Excel and most readers reject
+            // <sheets/>). Fail loudly so the caller realises they had no
+            // data instead of producing a file users can't open.
+            if (empty($this->sheets)) {
+                throw XlsxStreamException::emptyWorkbook();
+            }
+
             $this->writeStaticFile('xl/styles.xml', $this->getStylesXml());
             $this->writeStaticFile('xl/_rels/workbook.xml.rels', $this->getWorkbookRelsXml());
             $this->writeStaticFile('xl/workbook.xml', $this->getWorkbookXml());

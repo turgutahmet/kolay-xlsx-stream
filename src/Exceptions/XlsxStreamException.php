@@ -70,4 +70,26 @@ class XlsxStreamException extends \Exception
     {
         return new self("Column count {$given} exceeds Excel's maximum of {$max} columns per sheet.");
     }
+
+    /**
+     * Create exception for finalize-with-no-data
+     */
+    public static function emptyWorkbook(): self
+    {
+        return new self(
+            'Cannot finalize an empty workbook. Write at least one row via writeRow() '.
+            'or call newSheet() to create a sheet before finishFile().'
+        );
+    }
+
+    /**
+     * Create exception for setColumnFormat targeting a column past the header count.
+     */
+    public static function columnIndexOutOfRange(int $given, int $max): self
+    {
+        return new self(
+            "Column index {$given} is out of range — the current header has {$max} columns. ".
+            'Call setColumnFormat() with an index between 1 and the header count.'
+        );
+    }
 }

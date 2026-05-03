@@ -388,6 +388,10 @@ class V22StylingTest extends TestCase
             ]);
         }
 
+        // Sheet 2 has fewer columns — drop the previous sheet's formats so
+        // the leftover cols 3/4 registrations don't fail validation against
+        // the smaller header row.
+        $writer->clearColumnFormats();
         $writer->newSheet('Summary', ['Metric', 'Value']);
         $writer->writeRow(['Total', 100]);
         $writer->writeRow(['Average', 50.5]);

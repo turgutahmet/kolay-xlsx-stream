@@ -316,6 +316,9 @@ abstract class BaseXlsxWriter
         if ($column < 1) {
             throw new XlsxStreamException("Column index must be >= 1, got {$column}.");
         }
+        // Range validation is deferred to startNewSheet() — at this point the
+        // user may be pre-configuring formats for an upcoming newSheet() call
+        // whose column count is different from the current sheet's.
         $this->columnStyleIds[$column] = $this->styles->registerColumnFormat($presetOrCode);
         // Stored separately so the auto-width heuristic can pick a sensible
         // minimum based on the format (e.g. currency cells need ~14 chars
@@ -524,6 +527,18 @@ abstract class BaseXlsxWriter
      */
     protected function startNewSheet(): void
     {
+        // Validate any column formats / widths against the now-known column
+        // count. Catches setColumnFormat(99, ...) typos at the point where
+        // the columns are actually committed for the sheet.
+        $columnCount = count($this->columns);
+        if ($columnCount > 0) {
+            foreach (array_keys($this->columnStyleIds) as $col) {
+                if ($col > $columnCount) {
+                    throw XlsxStreamException::columnIndexOutOfRange($col, $columnCount);
+                }
+            }
+        }
+
         // Custom name (from newSheet()) wins, else preserve the legacy default
         // ("Report" for the first sheet, "SheetN" for auto-split overflow).
         if ($this->nextSheetName !== null) {
@@ -660,8 +675,12 @@ abstract class BaseXlsxWriter
     {
         $resolved = [];
         $columnCount = count($this->columns);
+        $maxWidthCol = $this->columnWidths === [] ? 0 : max(array_keys($this->columnWidths));
+        $upperBound = $columnCount > $maxWidthCol ? $columnCount : $maxWidthCol;
 
-        foreach (range(1, max($columnCount, max(array_keys($this->columnWidths) ?: [0]))) as $col) {
+        // Plain for-loop (vs. range()) avoids allocating a 1..N array on
+        // every sheet startup — matters at the 16,384 column limit.
+        for ($col = 1; $col <= $upperBound; $col++) {
             if (isset($this->columnWidths[$col])) {
                 $resolved[$col] = $this->columnWidths[$col];
 
@@ -700,10 +719,10 @@ abstract class BaseXlsxWriter
             'currency_try',
             'currency_usd',
             'currency_eur',
-            'currency_gbp' => 14,            // ₺99,999.99
+            'currency_gbp' => 14,            // ₺1,234,567.89
             'percent' => 10,                 // 100.00%
-            'decimal' => 12,                 // 99,999.99
-            'integer' => 10,                 // 99,999,999
+            'decimal' => 14,                 // 1,234,567.89
+            'integer' => 14,                 // 1,234,567,890 (10-digit grouped)
             default => 0,
         };
     }
@@ -1019,6 +1038,10 @@ abstract class BaseXlsxWriter
         if ($this->currentSheetRow > 0) {
             $this->flushRowBuffer();
             $this->finishCurrentSheet();
+        }
+
+        if (empty($this->sheets)) {
+            throw XlsxStreamException::emptyWorkbook();
         }
 
         $this->writeStaticFile('xl/styles.xml', $this->getStylesXml());

@@ -98,15 +98,28 @@ class StyleRegistry
     /**
      * Register a header style and return its cellXfs index.
      *
-     * Options: bold (bool), color (#RRGGBB), fill (#RRGGBB), size (int).
+     * Options: bold (bool), color (#RRGGBB), fill (#RRGGBB), size (int),
+     * name (string — font family, default "Calibri").
+     *
+     * Color values are validated as 6-character hex (with or without a
+     * leading #). Anything else throws so the caller catches the typo
+     * here instead of producing an invalid xl/styles.xml that Excel
+     * silently rejects.
      */
     public function registerHeaderStyle(array $options): int
     {
+        if (isset($options['color'])) {
+            $this->assertHexColor($options['color'], 'color');
+        }
+        if (isset($options['fill'])) {
+            $this->assertHexColor($options['fill'], 'fill');
+        }
+
         $fontId = $this->resolveFont([
             'bold' => (bool) ($options['bold'] ?? false),
             'color' => $options['color'] ?? null,
             'size' => (int) ($options['size'] ?? 11),
-            'name' => 'Calibri',
+            'name' => (string) ($options['name'] ?? 'Calibri'),
         ]);
 
         $fillId = isset($options['fill']) ? $this->resolveFill($options['fill']) : 0;
@@ -119,6 +132,20 @@ class StyleRegistry
             'applyFont' => $fontId > 0 ? 1 : 0,
             'applyFill' => $fillId > 0 ? 1 : 0,
         ]);
+    }
+
+    /**
+     * Reject anything that isn't a 6-character hex color, with or without
+     * a leading "#". Surfaces typos at registration time instead of
+     * producing a styles.xml Excel will refuse to open.
+     */
+    private function assertHexColor(string $value, string $optionName): void
+    {
+        if (! preg_match('/^#?[0-9a-fA-F]{6}$/', $value)) {
+            throw new \Kolay\XlsxStream\Exceptions\XlsxStreamException(
+                "Style option '{$optionName}' must be a 6-character hex color (e.g. '#4F81BD'); got: {$value}"
+            );
+        }
     }
 
     /**
@@ -149,7 +176,7 @@ class StyleRegistry
             if ($font['color'] !== null) {
                 $xml .= '<color rgb="FF'.ltrim($font['color'], '#').'"/>';
             }
-            $xml .= '<name val="'.$font['name'].'"/>';
+            $xml .= '<name val="'.htmlspecialchars($font['name'], ENT_QUOTES | ENT_XML1).'"/>';
             $xml .= '</font>';
         }
         $xml .= '</fonts>';
@@ -207,8 +234,11 @@ class StyleRegistry
 
     private function resolveCellXf(array $xf): int
     {
+        // Strict comparison is safe: every cellXfs entry is constructed
+        // with the same key order in registerHeaderStyle / registerColumnFormat,
+        // so === is both faster and semantically more correct than ==.
         foreach ($this->cellXfs as $i => $existing) {
-            if ($existing == $xf) {
+            if ($existing === $xf) {
                 return $i;
             }
         }
@@ -220,7 +250,7 @@ class StyleRegistry
     private function resolveFont(array $font): int
     {
         foreach ($this->fonts as $i => $existing) {
-            if ($existing == $font) {
+            if ($existing === $font) {
                 return $i;
             }
         }
