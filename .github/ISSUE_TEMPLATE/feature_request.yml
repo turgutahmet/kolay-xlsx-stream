@@ -1,0 +1,42 @@
+name: Feature Request
+description: Suggest an idea for this package
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before submitting, check the [ROADMAP](../blob/main/ROADMAP.md) —
+        the feature you're requesting may already be planned.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the use case, not just the proposed solution.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed
+    attributes:
+      label: Proposed solution
+      description: How would you like this to work?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: |
+        What other approaches did you consider? Have you tried
+        achieving this with the current API?
+
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Are you willing to contribute?
+      options:
+        - label: I can submit a PR for this
+        - label: I can help test
+        - label: I'd like someone else to implement it
