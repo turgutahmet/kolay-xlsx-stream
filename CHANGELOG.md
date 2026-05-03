@@ -5,6 +5,38 @@ All notable changes to `kolay/xlsx-stream` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] — 2026-05-03
+
+### Added
+- **`SinkableXlsxWriter::forDisk($disk, $path)`** — Stream directly to any
+  Laravel filesystem disk without manually constructing an `S3Client`. Reads
+  credentials, region, bucket, and endpoint from
+  `config('filesystems.disks.{$disk}')`. Supports `s3` and `local` drivers.
+- **`onProgress(callable $cb)` + `setProgressInterval(int $rows)`** — Register
+  a callback that fires every N rows with `(int $rowsWritten, int $bytesWritten)`.
+  Null short-circuits when no callback is registered, so there is zero overhead
+  for users who do not opt in. Useful for queue jobs that update a progress UI.
+- **`writeRows(iterable)`** — `writeRows()` now accepts any iterable, not just
+  arrays. Generators, `Iterator`, and `IteratorAggregate` all work directly:
+
+  ```php
+  $writer->writeRows(User::query()->lazy(1000));
+  ```
+
+  Backwards compatible — existing array callers are unaffected.
+
+### Performance
+- No measurable regression vs v2.0.1 (1M rows: 169K r/s vs 170K r/s baseline).
+  All new features avoid the per-row hot path.
+
+## [2.0.1] — 2026-05-03
+
+### Changed
+- CI: lower PHPStan to level 5; restrict Pint to `src/` so legacy
+  `examples/`, `config/`, `tests/`, and `benchmark-comprehensive.php` are not
+  retroactively flagged. Apply Pint autofix to `src/` (purely cosmetic — no
+  runtime change).
+
 ## [2.0.0] — 2026-05-03
 
 ### Added
@@ -63,6 +95,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Initial release: high-performance XLSX streaming writer with FileSink and
   S3MultipartSink, multi-sheet support, and configurable compression.
 
+[2.1.0]: https://github.com/turgutahmet/kolay-xlsx-stream/compare/v2.0.1...v2.1.0
+[2.0.1]: https://github.com/turgutahmet/kolay-xlsx-stream/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/turgutahmet/kolay-xlsx-stream/compare/v1.0.2...v2.0.0
 [1.0.2]: https://github.com/turgutahmet/kolay-xlsx-stream/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/turgutahmet/kolay-xlsx-stream/compare/v1.0.0...v1.0.1

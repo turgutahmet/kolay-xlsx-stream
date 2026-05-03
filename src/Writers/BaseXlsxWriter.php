@@ -71,6 +71,10 @@ abstract class BaseXlsxWriter
     // Column letter cache for performance
     protected array $colLetterCache = [];
 
+    // Progress reporting
+    protected ?\Closure $progressCallback = null;
+    protected int $progressInterval = 10000;
+
     /**
      * Write data to destination (must be implemented by child classes)
      */
@@ -102,6 +106,40 @@ abstract class BaseXlsxWriter
             throw XlsxStreamException::invalidBufferSize($rows);
         }
         $this->bufferFlushInterval = $rows;
+
+        return $this;
+    }
+
+    /**
+     * Register a progress callback fired every $progressInterval rows.
+     *
+     * Signature: function(int $rowsWritten, int $bytesWritten): void
+     *
+     * Useful for queue jobs that update a progress UI:
+     *
+     *   $writer->onProgress(fn($rows, $bytes) =>
+     *       Cache::put("export:$jobId", compact('rows','bytes'))
+     *   );
+     */
+    public function onProgress(callable $callback): self
+    {
+        $this->progressCallback = $callback instanceof \Closure
+            ? $callback
+            : \Closure::fromCallable($callback);
+
+        return $this;
+    }
+
+    /**
+     * Set how often the progress callback fires (in rows).
+     */
+    public function setProgressInterval(int $rows): self
+    {
+        if ($rows < 1) {
+            throw XlsxStreamException::invalidBufferSize($rows);
+        }
+        $this->progressInterval = $rows;
+
         return $this;
     }
 
@@ -184,12 +222,22 @@ abstract class BaseXlsxWriter
         if ($this->rowBufferCount >= $this->bufferFlushInterval) {
             $this->flushRowBuffer();
         }
+
+        // Progress callback (null-check short-circuits when not registered)
+        if ($this->progressCallback !== null && $this->totalRows % $this->progressInterval === 0) {
+            ($this->progressCallback)($this->totalRows, $this->currentOffset);
+        }
     }
 
     /**
-     * Write multiple rows efficiently
+     * Write multiple rows efficiently.
+     *
+     * Accepts any iterable: array, Generator, Iterator, IteratorAggregate.
+     * Streaming-friendly with lazy collections (e.g. Eloquent's `lazy()` cursor):
+     *
+     *   $writer->writeRows(User::query()->lazy(1000));
      */
-    public function writeRows(array $rows): void
+    public function writeRows(iterable $rows): void
     {
         foreach ($rows as $row) {
             $this->writeRow($row);

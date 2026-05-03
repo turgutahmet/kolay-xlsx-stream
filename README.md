@@ -284,6 +284,87 @@ class ExportUsersJob implements ShouldQueue
 
 ## Advanced Features
 
+### Laravel Storage Disk Integration *(v2.1+)*
+
+Skip the manual `S3Client` setup — `forDisk()` reads everything from
+`config('filesystems.disks.{$disk}')`:
+
+```php
+use Kolay\XlsxStream\Writers\SinkableXlsxWriter;
+
+// Streams directly to S3 — credentials, region, bucket all from config
+$writer = SinkableXlsxWriter::forDisk('s3', 'exports/users.xlsx');
+
+// Or to a local disk — resolves to disk root + path
+$writer = SinkableXlsxWriter::forDisk('local', 'exports/users.xlsx');
+
+// Pass S3-specific options (ACL, ContentDisposition, Metadata) as the 3rd arg
+$writer = SinkableXlsxWriter::forDisk('s3', 'reports/q4.xlsx', [
+    'ACL' => 'public-read',
+    'CacheControl' => 'max-age=3600',
+]);
+
+$writer->startFile(['ID', 'Name'])
+       ->writeRow([1, 'Alice'])
+       ->finishFile();
+```
+
+### Streaming from Eloquent with `lazy()` *(v2.1+)*
+
+`writeRows()` accepts any iterable — pass an Eloquent `lazy()` cursor for
+constant-memory streaming over millions of rows:
+
+```php
+$writer = SinkableXlsxWriter::forDisk('s3', 'users-export.xlsx');
+$writer->startFile(['ID', 'Name', 'Email', 'Created']);
+
+$writer->writeRows(
+    User::query()
+        ->select(['id', 'name', 'email', 'created_at'])
+        ->orderBy('id')
+        ->lazy(1000)
+        ->map(fn ($u) => [$u->id, $u->name, $u->email, $u->created_at])
+);
+
+$writer->finishFile();
+```
+
+Generators work too:
+
+```php
+function rowsFromApi(): Generator {
+    $page = 1;
+    while ($batch = Http::get('/api/orders', ['page' => $page++])->json()) {
+        foreach ($batch as $order) {
+            yield [$order['id'], $order['total'], $order['status']];
+        }
+    }
+}
+
+$writer->writeRows(rowsFromApi());
+```
+
+### Progress Reporting for Queue Jobs *(v2.1+)*
+
+Register a callback that fires every N rows with `(rows, bytes)`. Zero
+overhead when not used:
+
+```php
+$writer = SinkableXlsxWriter::forDisk('s3', "exports/job-{$jobId}.xlsx");
+
+$writer->onProgress(function (int $rows, int $bytes) use ($jobId) {
+    Cache::put("export:{$jobId}", [
+        'rows' => $rows,
+        'bytes' => $bytes,
+        'updated_at' => now(),
+    ], 300);
+})->setProgressInterval(5000);  // fire every 5K rows
+
+$writer->startFile($headers);
+$writer->writeRows($query->lazy());
+$writer->finishFile();
+```
+
 ### Supported Cell Data Types
 
 The writer infers the right Excel cell type from each PHP value:
