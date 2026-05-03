@@ -187,9 +187,11 @@ abstract class BaseXlsxWriter
      */
     public function setHeaderStyle(array $options): self
     {
-        if ($this->started) {
-            throw new XlsxStreamException('setHeaderStyle() must be called before startFile().');
+        if ($this->closed) {
+            throw XlsxStreamException::writerAlreadyClosed();
         }
+        // Allowed before startFile() (for sheet 1) and between newSheet() calls
+        // (to give each manually-rotated sheet its own header style).
         $this->headerStyleId = $this->styles->registerHeaderStyle($options);
 
         return $this;
@@ -303,6 +305,9 @@ abstract class BaseXlsxWriter
      */
     public function setColumnFormat(int $column, string $presetOrCode): self
     {
+        if ($this->closed) {
+            throw XlsxStreamException::writerAlreadyClosed();
+        }
         if ($column < 1) {
             throw new XlsxStreamException("Column index must be >= 1, got {$column}.");
         }
@@ -349,9 +354,10 @@ abstract class BaseXlsxWriter
         $this->columns = $headers;
         $this->started = true;
 
-        // Write only static files that don't depend on sheet count
+        // Static files that don't depend on sheet count or registry state.
+        // styles.xml is deferred to finishFile() so styles registered between
+        // newSheet() calls (or during streaming) are all included.
         $this->writeStaticFile('_rels/.rels', $this->getRelsXml());
-        $this->writeStaticFile('xl/styles.xml', $this->getStylesXml());
     }
 
     /**
@@ -716,11 +722,13 @@ abstract class BaseXlsxWriter
     {
         $cells = [];
         $colIndex = 1;
+        // Hoist the styles-empty check so the fast (unstyled) path skips the
+        // per-cell lookup entirely — matches v2.0.1 hot-path cost.
         $hasColumnStyles = ! empty($this->columnStyleIds);
 
         foreach ($data as $value) {
             $cellRef = $this->getColumnLetter($colIndex) . $rowIndex;
-            $colStyleId = $hasColumnStyles ? ($this->columnStyleIds[$colIndex] ?? null) : null;
+            $col = $colIndex;
             $colIndex++;
 
             // Null / empty string -> empty cell
@@ -739,15 +747,20 @@ abstract class BaseXlsxWriter
             // (column-specific format wins if set, else fallback to legacy STYLE_DATETIME)
             if ($value instanceof \DateTimeInterface) {
                 $serial = ($value->getTimestamp() - self::EXCEL_EPOCH_TIMESTAMP) / 86400;
-                $styleId = $colStyleId ?? self::STYLE_DATETIME;
+                $styleId = $hasColumnStyles && isset($this->columnStyleIds[$col])
+                    ? $this->columnStyleIds[$col]
+                    : self::STYLE_DATETIME;
                 $cells[] = '<c r="' . $cellRef . '" s="' . $styleId . '" t="n"><v>' . $serial . '</v></c>';
                 continue;
             }
 
-            // Numeric values
+            // Numeric values — split fast/slow so unstyled exports keep v2.0.1 cost
             if (is_int($value) || is_float($value)) {
-                $styleAttr = $colStyleId !== null ? ' s="' . $colStyleId . '"' : '';
-                $cells[] = '<c r="' . $cellRef . '"' . $styleAttr . ' t="n"><v>' . $value . '</v></c>';
+                if ($hasColumnStyles && isset($this->columnStyleIds[$col])) {
+                    $cells[] = '<c r="' . $cellRef . '" s="' . $this->columnStyleIds[$col] . '" t="n"><v>' . $value . '</v></c>';
+                } else {
+                    $cells[] = '<c r="' . $cellRef . '" t="n"><v>' . $value . '</v></c>';
+                }
                 continue;
             }
 
@@ -756,9 +769,10 @@ abstract class BaseXlsxWriter
                 if ($this->shouldPreserveNumericString($value)) {
                     $escaped = $this->fastXmlEscape($value);
                     $cells[] = '<c r="' . $cellRef . '" t="inlineStr"><is><t>' . $escaped . '</t></is></c>';
+                } elseif ($hasColumnStyles && isset($this->columnStyleIds[$col])) {
+                    $cells[] = '<c r="' . $cellRef . '" s="' . $this->columnStyleIds[$col] . '" t="n"><v>' . (0 + $value) . '</v></c>';
                 } else {
-                    $styleAttr = $colStyleId !== null ? ' s="' . $colStyleId . '"' : '';
-                    $cells[] = '<c r="' . $cellRef . '"' . $styleAttr . ' t="n"><v>' . (0 + $value) . '</v></c>';
+                    $cells[] = '<c r="' . $cellRef . '" t="n"><v>' . (0 + $value) . '</v></c>';
                 }
                 continue;
             }
@@ -954,6 +968,7 @@ abstract class BaseXlsxWriter
             $this->finishCurrentSheet();
         }
 
+        $this->writeStaticFile('xl/styles.xml', $this->getStylesXml());
         $this->writeStaticFile('xl/_rels/workbook.xml.rels', $this->getWorkbookRelsXml());
         $this->writeStaticFile('xl/workbook.xml', $this->getWorkbookXml());
         $this->writeStaticFile('[Content_Types].xml', $this->getContentTypesXml());

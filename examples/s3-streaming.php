@@ -1,21 +1,30 @@
 <?php
 
-require __DIR__ . '/../vendor/autoload.php';
+require __DIR__.'/../vendor/autoload.php';
 
-use Kolay\XlsxStream\Writers\SinkableXlsxWriter;
-use Kolay\XlsxStream\Sinks\S3MultipartSink;
 use Aws\S3\S3Client;
+use Kolay\XlsxStream\Sinks\S3MultipartSink;
+use Kolay\XlsxStream\Writers\SinkableXlsxWriter;
 
 /**
- * Example: Direct S3 Streaming with Zero Disk I/O
- * 
- * This example demonstrates how to stream XLSX files directly to S3
- * without using any local disk space.
+ * Example: Direct S3 Streaming with Zero Disk I/O — showcases v2.2 styling.
+ *
+ * Generates a multi-sheet workbook with header styling, column formats,
+ * frozen first row, auto-filter, auto column widths, and progress reporting,
+ * then streams it straight to S3 using multipart upload (no temp files).
+ *
+ * Run with AWS env vars set, then download the file from S3 to inspect:
+ *   AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_BUCKET=... \
+ *     AWS_DEFAULT_REGION=us-east-2 php examples/s3-streaming.php
  */
 
-// Configure your AWS credentials
+// Bootstrap config from env (or .env if vlucas/phpdotenv is in the autoloader)
+if (file_exists(__DIR__.'/../.env') && class_exists(\Dotenv\Dotenv::class)) {
+    \Dotenv\Dotenv::createUnsafeImmutable(__DIR__.'/..')->safeLoad();
+}
+
 $awsConfig = [
-    'region' => 'us-east-1', // Change to your region
+    'region' => getenv('AWS_DEFAULT_REGION') ?: 'us-east-1',
     'version' => 'latest',
     'credentials' => [
         'key' => getenv('AWS_ACCESS_KEY_ID'),
@@ -25,161 +34,149 @@ $awsConfig = [
 
 $bucketName = getenv('AWS_BUCKET') ?: 'your-bucket-name';
 
-function exportToS3()
+if (! getenv('AWS_ACCESS_KEY_ID') || ! getenv('AWS_SECRET_ACCESS_KEY') || $bucketName === 'your-bucket-name') {
+    echo "ERROR: AWS credentials not found.\n";
+    echo "Set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_BUCKET, AWS_DEFAULT_REGION.\n";
+    exit(1);
+}
+
+function exportToS3(array $awsConfig, string $bucketName): void
 {
-    global $awsConfig, $bucketName;
-    
-    echo "Starting S3 streaming export...\n";
-    echo "Bucket: $bucketName\n\n";
-    
-    // Create S3 client
-    $s3Client = new S3Client($awsConfig);
-    
-    // Create S3 sink with 32MB parts for optimal performance
-    $filename = 'exports/users-' . date('Y-m-d-H-i-s') . '.xlsx';
+    echo "Streaming styled multi-sheet workbook to S3...\n";
+    echo "Bucket: {$bucketName}\n\n";
+
+    $s3 = new S3Client($awsConfig);
+    $key = 'examples/styled-'.date('Ymd-His').'.xlsx';
+
     $sink = new S3MultipartSink(
-        $s3Client,
+        $s3,
         $bucketName,
-        $filename,
-        32 * 1024 * 1024, // 32MB parts
+        $key,
+        32 * 1024 * 1024, // 32 MB parts
         [
             'ACL' => 'private',
-            'ContentType' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'ContentDisposition' => 'attachment; filename="users-export.xlsx"',
             'Metadata' => [
                 'generated-by' => 'kolay-xlsx-stream',
                 'generated-at' => date('c'),
-            ]
+            ],
         ]
     );
-    
-    // Create writer
+
     $writer = new SinkableXlsxWriter($sink);
-    
-    // Optimize for S3 streaming
-    $writer->setCompressionLevel(1)        // Fast compression
-           ->setBufferFlushInterval(10000); // 10K row buffer
-    
-    // Start file with headers
+
+    // ─── v2.2 styling ──────────────────────────────────────────────
+    $writer
+        ->setCompressionLevel(1)
+        ->setBufferFlushInterval(10000)
+        // header: bold white text on dark blue
+        ->setHeaderStyle([
+            'bold' => true,
+            'fill' => '#4F81BD',
+            'color' => '#FFFFFF',
+        ])
+        // column number formats — Excel will render these natively
+        ->setColumnFormat(1, 'integer')        // ID
+        ->setColumnFormat(7, 'date')           // Created Date
+        ->setColumnFormat(8, 'datetime')       // Last Active
+        ->setColumnFormat(9, 'currency_try')   // Salary
+        ->setColumnFormat(10, 'percent')       // Performance score
+        // explicit + auto column widths
+        ->setAutoColumnWidth()
+        ->setColumnWidths([4 => 24, 5 => 16, 6 => 14, 7 => 12, 8 => 18])
+        // freeze header row + auto-filter dropdowns
+        ->freezeFirstRow()
+        ->enableAutoFilter();
+
+    // ─── progress callback (v2.1) ──────────────────────────────────
+    $startTime = microtime(true);
+    $writer->onProgress(function (int $rows, int $bytes) use ($startTime) {
+        $elapsed = microtime(true) - $startTime;
+        $rate = $rows / max($elapsed, 0.001);
+        echo sprintf(
+            "  %s rows | %.2f MB streamed | %.0f rows/sec\n",
+            number_format($rows),
+            $bytes / 1024 / 1024,
+            $rate
+        );
+    })->setProgressInterval(10000);
+
+    // ─── sheet 1: Users (50,000 rows) ──────────────────────────────
+    echo "Sheet 1: Users\n";
+
     $writer->startFile([
-        'User ID',
+        'ID',
         'Username',
         'Email',
         'Full Name',
         'Department',
         'Role',
-        'Status',
         'Created Date',
-        'Last Active'
+        'Last Active',
+        'Salary',
+        'Performance',
     ]);
-    
-    // Simulate database query with chunking
-    $totalUsers = 100000;
-    $chunkSize = 1000;
+
     $departments = ['Engineering', 'Product', 'Sales', 'Marketing', 'Support', 'Operations'];
     $roles = ['Admin', 'Manager', 'Employee', 'Contractor'];
-    $statuses = ['Active', 'Inactive', 'Pending'];
-    
-    $startTime = microtime(true);
-    
-    for ($offset = 0; $offset < $totalUsers; $offset += $chunkSize) {
-        // Simulate chunk of users from database
-        $users = [];
-        for ($i = 1; $i <= $chunkSize && ($offset + $i) <= $totalUsers; $i++) {
-            $userId = $offset + $i;
-            $users[] = [
-                'id' => $userId,
-                'username' => "user_$userId",
-                'email' => "user$userId@company.com",
-                'full_name' => "User Name $userId",
-                'department' => $departments[array_rand($departments)],
-                'role' => $roles[array_rand($roles)],
-                'status' => $statuses[array_rand($statuses)],
-                'created_date' => date('Y-m-d', time() - rand(0, 365 * 24 * 60 * 60)),
-                'last_active' => date('Y-m-d H:i:s', time() - rand(0, 7 * 24 * 60 * 60))
-            ];
-        }
-        
-        // Write users to XLSX
-        foreach ($users as $user) {
-            $writer->writeRow([
-                $user['id'],
-                $user['username'],
-                $user['email'],
-                $user['full_name'],
-                $user['department'],
-                $user['role'],
-                $user['status'],
-                $user['created_date'],
-                $user['last_active']
-            ]);
-        }
-        
-        // Progress update
-        if (($offset + $chunkSize) % 10000 === 0) {
-            $progress = min($offset + $chunkSize, $totalUsers);
-            $elapsed = microtime(true) - $startTime;
-            $rate = $progress / $elapsed;
-            echo sprintf(
-                "Progress: %s / %s rows (%.1f%%) - %.0f rows/sec\n",
-                number_format($progress),
-                number_format($totalUsers),
-                ($progress / $totalUsers) * 100,
-                $rate
-            );
-        }
-    }
-    
-    // Finish file and upload
-    echo "\nFinalizing S3 upload...\n";
-    $stats = $writer->finishFile();
-    
-    $totalTime = microtime(true) - $startTime;
-    
-    echo "\n=== S3 Export Completed ===\n";
-    echo "File: s3://$bucketName/$filename\n";
-    echo "Total rows: " . number_format($stats['rows']) . "\n";
-    echo "Total sheets: {$stats['sheets']}\n";
-    echo "File size: " . number_format($stats['bytes']) . " bytes\n";
-    echo "Time taken: " . round($totalTime, 2) . " seconds\n";
-    echo "Average speed: " . number_format($stats['rows'] / $totalTime, 0) . " rows/sec\n";
-    echo "Memory peak: " . number_format(memory_get_peak_usage(true) / 1024 / 1024, 2) . " MB\n";
-    
-    // Generate presigned URL for download (optional)
-    try {
-        $cmd = $s3Client->getCommand('GetObject', [
-            'Bucket' => $bucketName,
-            'Key' => $filename
+
+    for ($i = 1; $i <= 50_000; $i++) {
+        $writer->writeRow([
+            $i,                                                                         // 1: integer
+            "user_{$i}",                                                                // 2: string
+            "user{$i}@company.com",                                                     // 3: string
+            "User Name {$i}",                                                           // 4: string
+            $departments[$i % count($departments)],                                     // 5: string
+            $roles[$i % count($roles)],                                                 // 6: string
+            new DateTime('2026-01-01 +'.($i % 90).' days', new DateTimeZone('UTC')),    // 7: date
+            new DateTime('2026-05-01 -'.($i % 7).' days', new DateTimeZone('UTC')),     // 8: datetime
+            45000 + ($i % 80) * 1000,                                                   // 9: currency
+            ($i % 100) / 100,                                                           // 10: percent
         ]);
-        $request = $s3Client->createPresignedRequest($cmd, '+1 hour');
-        $presignedUrl = (string) $request->getUri();
-        
-        echo "\nDownload URL (valid for 1 hour):\n";
-        echo $presignedUrl . "\n";
-    } catch (Exception $e) {
-        echo "\nCould not generate presigned URL: " . $e->getMessage() . "\n";
+    }
+
+    // ─── sheet 2: Summary ──────────────────────────────────────────
+    echo "\nSheet 2: Summary\n";
+
+    $writer
+        ->setHeaderStyle(['bold' => true, 'fill' => '#9BBB59', 'color' => '#FFFFFF'])
+        ->setColumnFormat(2, 'integer')
+        ->newSheet('Summary', ['Department', 'Headcount']);
+
+    foreach ($departments as $dept) {
+        $writer->writeRow([$dept, rand(500, 15000)]);
+    }
+
+    // ─── finalize ──────────────────────────────────────────────────
+    $stats = $writer->finishFile();
+    $totalTime = microtime(true) - $startTime;
+
+    echo "\n=== S3 Export Completed ===\n";
+    echo "File:       s3://{$bucketName}/{$key}\n";
+    echo "Sheets:     {$stats['sheets']}\n";
+    foreach ($stats['sheet_details'] as $sheet) {
+        echo sprintf("  • %-12s %s rows\n", $sheet['name'], number_format($sheet['rows']));
+    }
+    echo 'Total rows: '.number_format($stats['rows'])."\n";
+    echo 'File size:  '.number_format($stats['bytes'])." bytes\n";
+    echo 'Time:       '.round($totalTime, 2)." s\n";
+    echo 'Speed:      '.number_format($stats['rows'] / $totalTime, 0)." rows/sec\n";
+    echo 'Peak mem:   '.number_format(memory_get_peak_usage(true) / 1024 / 1024, 2)." MB\n";
+
+    // Presigned URL for quick browser download
+    try {
+        $cmd = $s3->getCommand('GetObject', ['Bucket' => $bucketName, 'Key' => $key]);
+        $url = (string) $s3->createPresignedRequest($cmd, '+1 hour')->getUri();
+        echo "\nDownload (valid 1 hour):\n{$url}\n";
+    } catch (\Throwable $e) {
+        echo "\nCould not generate presigned URL: ".$e->getMessage()."\n";
     }
 }
 
-// Check AWS credentials
-if (!getenv('AWS_ACCESS_KEY_ID') || !getenv('AWS_SECRET_ACCESS_KEY')) {
-    echo "ERROR: AWS credentials not found!\n";
-    echo "Please set the following environment variables:\n";
-    echo "  AWS_ACCESS_KEY_ID\n";
-    echo "  AWS_SECRET_ACCESS_KEY\n";
-    echo "  AWS_BUCKET (optional)\n\n";
-    echo "Example:\n";
-    echo "  export AWS_ACCESS_KEY_ID=your_key_here\n";
-    echo "  export AWS_SECRET_ACCESS_KEY=your_secret_here\n";
-    echo "  export AWS_BUCKET=your-bucket-name\n";
-    echo "  php " . __FILE__ . "\n";
-    exit(1);
-}
-
-// Run the export
 try {
-    exportToS3();
-} catch (Exception $e) {
-    echo "\nERROR: " . $e->getMessage() . "\n";
-    echo "Stack trace:\n" . $e->getTraceAsString() . "\n";
+    exportToS3($awsConfig, $bucketName);
+} catch (\Throwable $e) {
+    echo "\nERROR: ".$e->getMessage()."\n";
+    echo $e->getTraceAsString()."\n";
     exit(1);
 }
