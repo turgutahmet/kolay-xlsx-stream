@@ -20,6 +20,7 @@ class SinkableXlsxWriter extends BaseXlsxWriter
 
     public function __construct(Sink $sink)
     {
+        parent::__construct();
         $this->sink = $sink;
     }
 
@@ -134,6 +135,7 @@ class SinkableXlsxWriter extends BaseXlsxWriter
                 $this->finishCurrentSheet();
             }
 
+            $this->writeStaticFile('xl/styles.xml', $this->getStylesXml());
             $this->writeStaticFile('xl/_rels/workbook.xml.rels', $this->getWorkbookRelsXml());
             $this->writeStaticFile('xl/workbook.xml', $this->getWorkbookXml());
             $this->writeStaticFile('[Content_Types].xml', $this->getContentTypesXml());

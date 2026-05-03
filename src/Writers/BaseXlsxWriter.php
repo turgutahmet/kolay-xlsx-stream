@@ -3,6 +3,7 @@
 namespace Kolay\XlsxStream\Writers;
 
 use Kolay\XlsxStream\Exceptions\XlsxStreamException;
+use Kolay\XlsxStream\Styles\StyleRegistry;
 
 /**
  * Base XLSX Writer - Core streaming functionality
@@ -75,6 +76,33 @@ abstract class BaseXlsxWriter
     protected ?\Closure $progressCallback = null;
     protected int $progressInterval = 10000;
 
+    // Styling (v2.2+)
+    protected StyleRegistry $styles;
+    protected ?int $headerStyleId = null;
+
+    /** @var array<int, int> 1-based column index => cellXfs style id */
+    protected array $columnStyleIds = [];
+
+    /** @var array<int, string> 1-based column index => format preset name (used for auto-width sizing) */
+    protected array $columnFormatNames = [];
+
+    // Sheet view options (v2.2+)
+    protected int $freezeRows = 0;
+    protected int $freezeColumns = 0;
+    protected bool $autoFilterEnabled = false;
+
+    /** @var array<int, float> 1-based column index => width in characters */
+    protected array $columnWidths = [];
+    protected bool $autoColumnWidth = false;
+
+    // Custom sheet name for the next sheet rotation (set by newSheet()).
+    protected ?string $nextSheetName = null;
+
+    public function __construct()
+    {
+        $this->styles = new StyleRegistry();
+    }
+
     /**
      * Write data to destination (must be implemented by child classes)
      */
@@ -144,6 +172,179 @@ abstract class BaseXlsxWriter
     }
 
     /**
+     * Style the header row (the first row written by startFile).
+     *
+     * Options:
+     *  - bold (bool)
+     *  - color (#RRGGBB) — text color
+     *  - fill (#RRGGBB)  — background color
+     *  - size (int)      — font size, default 11
+     *
+     * Example:
+     *
+     *   $writer->setHeaderStyle([
+     *       'bold' => true,
+     *       'fill' => '#4F81BD',
+     *       'color' => '#FFFFFF',
+     *   ]);
+     */
+    public function setHeaderStyle(array $options): self
+    {
+        if ($this->closed) {
+            throw XlsxStreamException::writerAlreadyClosed();
+        }
+        // Allowed before startFile() (for sheet 1) and between newSheet() calls
+        // (to give each manually-rotated sheet its own header style).
+        $this->headerStyleId = $this->styles->registerHeaderStyle($options);
+
+        return $this;
+    }
+
+    /**
+     * Freeze the first row so it stays visible while scrolling.
+     *
+     * Equivalent to Excel's "View > Freeze Top Row".
+     */
+    public function freezeFirstRow(): self
+    {
+        return $this->freezeRowsAndColumns(1, 0);
+    }
+
+    /**
+     * Freeze a custom number of rows and/or columns.
+     *
+     *   $writer->freezeRowsAndColumns(rows: 1, columns: 2);
+     */
+    public function freezeRowsAndColumns(int $rows = 1, int $columns = 0): self
+    {
+        if ($this->closed) {
+            throw XlsxStreamException::writerAlreadyClosed();
+        }
+        if ($rows < 0 || $columns < 0) {
+            throw new XlsxStreamException('Freeze rows/columns must be >= 0.');
+        }
+        // Settable any time before close — applies to the next sheet started
+        // via writeRow() or newSheet().
+        $this->freezeRows = $rows;
+        $this->freezeColumns = $columns;
+
+        return $this;
+    }
+
+    /**
+     * Set explicit column widths in Excel character units.
+     *
+     *   $writer->setColumnWidths([1 => 8, 2 => 30, 3 => 15]);
+     *
+     * Keys are 1-based column indexes. Columns omitted from the array
+     * fall back to Excel's default width.
+     *
+     * @param array<int, float|int> $widths
+     */
+    public function setColumnWidths(array $widths): self
+    {
+        if ($this->closed) {
+            throw XlsxStreamException::writerAlreadyClosed();
+        }
+        foreach ($widths as $col => $width) {
+            if ($col < 1) {
+                throw new XlsxStreamException("Column index must be >= 1, got {$col}.");
+            }
+            if ($width <= 0) {
+                throw new XlsxStreamException("Column width must be > 0, got {$width}.");
+            }
+            $this->columnWidths[$col] = (float) $width;
+        }
+
+        return $this;
+    }
+
+    /**
+     * Auto-size columns from the header text.
+     *
+     * Heuristic: width = max(8, mb_strlen(header) + 2). Cheap, no
+     * per-row sampling, no streaming impact. Manual setColumnWidths()
+     * entries override the heuristic for the columns they cover.
+     *
+     * For sample-based auto-fit (scanning N rows of data), wait for
+     * a future release.
+     */
+    public function setAutoColumnWidth(bool $enabled = true): self
+    {
+        if ($this->closed) {
+            throw XlsxStreamException::writerAlreadyClosed();
+        }
+        $this->autoColumnWidth = $enabled;
+
+        return $this;
+    }
+
+    /**
+     * Add Excel's auto-filter dropdowns to the header row.
+     *
+     * The filter range is computed automatically from the sheet's columns
+     * and final row count when the sheet is closed.
+     */
+    public function enableAutoFilter(bool $enabled = true): self
+    {
+        if ($this->closed) {
+            throw XlsxStreamException::writerAlreadyClosed();
+        }
+        $this->autoFilterEnabled = $enabled;
+
+        return $this;
+    }
+
+    /**
+     * Apply a number format to a column (1-based).
+     *
+     * Accepts a preset name (see StyleRegistry::PRESETS) or a raw Excel
+     * format code. Same code reuses the same style id under the hood.
+     *
+     *   $writer->setColumnFormat(2, 'date');           // YYYY-MM-DD
+     *   $writer->setColumnFormat(3, 'currency_try');   // #,##0.00 ₺
+     *   $writer->setColumnFormat(4, '0.000');          // custom code
+     *
+     * Numeric values in that column are wrapped with the chosen format.
+     * String values pass through unchanged.
+     */
+    public function setColumnFormat(int $column, string $presetOrCode): self
+    {
+        if ($this->closed) {
+            throw XlsxStreamException::writerAlreadyClosed();
+        }
+        if ($column < 1) {
+            throw new XlsxStreamException("Column index must be >= 1, got {$column}.");
+        }
+        $this->columnStyleIds[$column] = $this->styles->registerColumnFormat($presetOrCode);
+        // Stored separately so the auto-width heuristic can pick a sensible
+        // minimum based on the format (e.g. currency cells need ~14 chars
+        // even when the header is shorter).
+        $this->columnFormatNames[$column] = $presetOrCode;
+
+        return $this;
+    }
+
+    /**
+     * Clear all column-level formats and widths.
+     *
+     * Useful between newSheet() calls when the next sheet has a different
+     * column layout — without this, formats set on the previous sheet leak
+     * into the next sheet's numeric cells and auto-width calculations.
+     */
+    public function clearColumnFormats(): self
+    {
+        if ($this->closed) {
+            throw XlsxStreamException::writerAlreadyClosed();
+        }
+        $this->columnStyleIds = [];
+        $this->columnFormatNames = [];
+        $this->columnWidths = [];
+
+        return $this;
+    }
+
+    /**
      * Convert Unix timestamp to DOS time and date (separate fields)
      */
     protected function dosTimeParts(int $timestamp): array
@@ -181,9 +382,10 @@ abstract class BaseXlsxWriter
         $this->columns = $headers;
         $this->started = true;
 
-        // Write only static files that don't depend on sheet count
+        // Static files that don't depend on sheet count or registry state.
+        // styles.xml is deferred to finishFile() so styles registered between
+        // newSheet() calls (or during streaming) are all included.
         $this->writeStaticFile('_rels/.rels', $this->getRelsXml());
-        $this->writeStaticFile('xl/styles.xml', $this->getStylesXml());
     }
 
     /**
@@ -245,6 +447,53 @@ abstract class BaseXlsxWriter
     }
 
     /**
+     * Start a new named sheet, optionally with its own header row.
+     *
+     *   $writer->startFile(['ID', 'Name']);
+     *   $writer->writeRow([1, 'Alice']);
+     *   $writer->newSheet('Orders', ['ID', 'Customer', 'Total']);
+     *   $writer->writeRow([100, 1, 49.90]);
+     *
+     * The current sheet is finalized first (if it has any rows). The new
+     * sheet is created eagerly so it shows up in the output even if no
+     * data rows follow.
+     *
+     * If $headers is null the previous header row is reused.
+     */
+    public function newSheet(string $name, ?array $headers = null): self
+    {
+        if (! $this->started) {
+            throw XlsxStreamException::headersNotSet();
+        }
+        if ($this->closed) {
+            throw XlsxStreamException::writerAlreadyClosed();
+        }
+        if ($name === '') {
+            throw new XlsxStreamException('Sheet name cannot be empty.');
+        }
+
+        // Finalize the current sheet so its data descriptor and central-dir
+        // entry are committed before we start writing the next sheet.
+        if ($this->currentSheetRow > 0) {
+            $this->flushRowBuffer();
+            $this->finishCurrentSheet();
+        }
+
+        if ($headers !== null) {
+            if (count($headers) > self::MAX_COLUMNS) {
+                throw XlsxStreamException::tooManyColumns(count($headers), self::MAX_COLUMNS);
+            }
+            $this->columns = $headers;
+        }
+
+        $this->nextSheetName = $name;
+        $this->currentSheetIndex++;
+        $this->startNewSheet();
+
+        return $this;
+    }
+
+    /**
      * Flush row buffer to stream
      */
     protected function flushRowBuffer(): void
@@ -275,9 +524,15 @@ abstract class BaseXlsxWriter
      */
     protected function startNewSheet(): void
     {
-        $sheetName = "Sheet{$this->currentSheetIndex}";
-        if ($this->currentSheetIndex === 1) {
+        // Custom name (from newSheet()) wins, else preserve the legacy default
+        // ("Report" for the first sheet, "SheetN" for auto-split overflow).
+        if ($this->nextSheetName !== null) {
+            $sheetName = $this->nextSheetName;
+            $this->nextSheetName = null;
+        } elseif ($this->currentSheetIndex === 1) {
             $sheetName = 'Report';
+        } else {
+            $sheetName = "Sheet{$this->currentSheetIndex}";
         }
 
         $sheetName = $this->sanitizeSheetName($sheetName);
@@ -323,14 +578,17 @@ abstract class BaseXlsxWriter
         // Write sheet header
         $sheetHeader = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
         $sheetHeader .= '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">';
+        $sheetHeader .= $this->buildSheetViewsXml();
+        $sheetHeader .= $this->buildColsXml();
         $sheetHeader .= '<sheetData>';
 
         if (!empty($this->columns)) {
+            $headerStyleAttr = $this->headerStyleId !== null ? ' s="'.$this->headerStyleId.'"' : '';
             $headerRow = '<row r="1">';
             foreach ($this->columns as $i => $header) {
                 $cellRef = $this->getColumnLetter($i + 1) . '1';
                 $escaped = $this->fastXmlEscape($header);
-                $headerRow .= '<c r="' . $cellRef . '" t="inlineStr"><is><t>' . $escaped . '</t></is></c>';
+                $headerRow .= '<c r="' . $cellRef . '"' . $headerStyleAttr . ' t="inlineStr"><is><t>' . $escaped . '</t></is></c>';
             }
             $headerRow .= '</row>';
             $sheetHeader .= $headerRow;
@@ -356,13 +614,124 @@ abstract class BaseXlsxWriter
     }
 
     /**
+     * Build the <sheetViews> block when freeze panes are configured.
+     * Must appear BEFORE <sheetData> per OOXML schema order.
+     */
+    protected function buildSheetViewsXml(): string
+    {
+        if ($this->freezeRows === 0 && $this->freezeColumns === 0) {
+            return '';
+        }
+
+        $topLeftCol = $this->getColumnLetter($this->freezeColumns + 1);
+        $topLeftRow = $this->freezeRows + 1;
+        $topLeftCell = $topLeftCol.$topLeftRow;
+
+        $activePane = match (true) {
+            $this->freezeRows > 0 && $this->freezeColumns > 0 => 'bottomRight',
+            $this->freezeRows > 0 => 'bottomLeft',
+            default => 'topRight',
+        };
+
+        $pane = '<pane';
+        if ($this->freezeColumns > 0) {
+            $pane .= ' xSplit="'.$this->freezeColumns.'"';
+        }
+        if ($this->freezeRows > 0) {
+            $pane .= ' ySplit="'.$this->freezeRows.'"';
+        }
+        $pane .= ' topLeftCell="'.$topLeftCell.'" activePane="'.$activePane.'" state="frozen"/>';
+
+        return '<sheetViews><sheetView workbookViewId="0">'.$pane.'</sheetView></sheetViews>';
+    }
+
+    /**
+     * Build the <cols> block emitted between <sheetViews> and <sheetData>.
+     *
+     * Resolution order (per column):
+     *   1. Explicit width from setColumnWidths()
+     *   2. setAutoColumnWidth() heuristic: max(format_min, header_len + 2, 8)
+     *      where format_min reflects the rendered width of values formatted
+     *      as date / datetime / currency / percent / decimal — fixes the
+     *      "Salary header is 6 chars but ₺50,000.00 needs ~14 chars" case
+     *   3. Excel default (no <col> entry)
+     */
+    protected function buildColsXml(): string
+    {
+        $resolved = [];
+        $columnCount = count($this->columns);
+
+        foreach (range(1, max($columnCount, max(array_keys($this->columnWidths) ?: [0]))) as $col) {
+            if (isset($this->columnWidths[$col])) {
+                $resolved[$col] = $this->columnWidths[$col];
+
+                continue;
+            }
+            if ($this->autoColumnWidth && isset($this->columns[$col - 1])) {
+                $headerLen = mb_strlen((string) $this->columns[$col - 1], 'UTF-8');
+                $formatMin = $this->minWidthForFormat($this->columnFormatNames[$col] ?? null);
+                $resolved[$col] = (float) max(8, $headerLen + 2, $formatMin);
+            }
+        }
+
+        if (empty($resolved)) {
+            return '';
+        }
+
+        $xml = '<cols>';
+        foreach ($resolved as $col => $width) {
+            $xml .= '<col min="'.$col.'" max="'.$col.'" width="'.$width.'" customWidth="1"/>';
+        }
+        $xml .= '</cols>';
+
+        return $xml;
+    }
+
+    /**
+     * Minimum sensible column width (in chars) for a given format preset.
+     * Returns 0 for unknown / unformatted columns so the header heuristic wins.
+     */
+    protected function minWidthForFormat(?string $name): int
+    {
+        return match ($name) {
+            'date' => 12,                    // 2026-01-15
+            'datetime', 'datetime_iso' => 20, // 2026-01-15 10:30:00
+            'time' => 10,                    // 10:30:00
+            'currency_try',
+            'currency_usd',
+            'currency_eur',
+            'currency_gbp' => 14,            // ₺99,999.99
+            'percent' => 10,                 // 100.00%
+            'decimal' => 12,                 // 99,999.99
+            'integer' => 10,                 // 99,999,999
+            default => 0,
+        };
+    }
+
+    /**
+     * Build the <autoFilter> element written AFTER </sheetData>.
+     * Range covers all populated rows and the configured column count.
+     */
+    protected function buildAutoFilterXml(): string
+    {
+        if (! $this->autoFilterEnabled || empty($this->columns) || $this->currentSheetRow < 1) {
+            return '';
+        }
+
+        $lastCol = $this->getColumnLetter(count($this->columns));
+        $range = 'A1:'.$lastCol.$this->currentSheetRow;
+
+        return '<autoFilter ref="'.$range.'"/>';
+    }
+
+    /**
      * Finish current sheet
      */
     protected function finishCurrentSheet(): void
     {
         $this->flushRowBuffer();
 
-        $sheetFooter = '</sheetData></worksheet>';
+        $sheetFooter = '</sheetData>'.$this->buildAutoFilterXml().'</worksheet>';
 
         hash_update($this->crcContext, $sheetFooter);
         $this->sheetUncompressedSize += strlen($sheetFooter);
@@ -406,9 +775,13 @@ abstract class BaseXlsxWriter
     {
         $cells = [];
         $colIndex = 1;
+        // Hoist the styles-empty check so the fast (unstyled) path skips the
+        // per-cell lookup entirely — matches v2.0.1 hot-path cost.
+        $hasColumnStyles = ! empty($this->columnStyleIds);
 
         foreach ($data as $value) {
             $cellRef = $this->getColumnLetter($colIndex) . $rowIndex;
+            $col = $colIndex;
             $colIndex++;
 
             // Null / empty string -> empty cell
@@ -424,15 +797,23 @@ abstract class BaseXlsxWriter
             }
 
             // DateTimeInterface -> Excel serial date with datetime style
+            // (column-specific format wins if set, else fallback to legacy STYLE_DATETIME)
             if ($value instanceof \DateTimeInterface) {
                 $serial = ($value->getTimestamp() - self::EXCEL_EPOCH_TIMESTAMP) / 86400;
-                $cells[] = '<c r="' . $cellRef . '" s="' . self::STYLE_DATETIME . '" t="n"><v>' . $serial . '</v></c>';
+                $styleId = $hasColumnStyles && isset($this->columnStyleIds[$col])
+                    ? $this->columnStyleIds[$col]
+                    : self::STYLE_DATETIME;
+                $cells[] = '<c r="' . $cellRef . '" s="' . $styleId . '" t="n"><v>' . $serial . '</v></c>';
                 continue;
             }
 
-            // Numeric values
+            // Numeric values — split fast/slow so unstyled exports keep v2.0.1 cost
             if (is_int($value) || is_float($value)) {
-                $cells[] = '<c r="' . $cellRef . '" t="n"><v>' . $value . '</v></c>';
+                if ($hasColumnStyles && isset($this->columnStyleIds[$col])) {
+                    $cells[] = '<c r="' . $cellRef . '" s="' . $this->columnStyleIds[$col] . '" t="n"><v>' . $value . '</v></c>';
+                } else {
+                    $cells[] = '<c r="' . $cellRef . '" t="n"><v>' . $value . '</v></c>';
+                }
                 continue;
             }
 
@@ -441,6 +822,8 @@ abstract class BaseXlsxWriter
                 if ($this->shouldPreserveNumericString($value)) {
                     $escaped = $this->fastXmlEscape($value);
                     $cells[] = '<c r="' . $cellRef . '" t="inlineStr"><is><t>' . $escaped . '</t></is></c>';
+                } elseif ($hasColumnStyles && isset($this->columnStyleIds[$col])) {
+                    $cells[] = '<c r="' . $cellRef . '" s="' . $this->columnStyleIds[$col] . '" t="n"><v>' . (0 + $value) . '</v></c>';
                 } else {
                     $cells[] = '<c r="' . $cellRef . '" t="n"><v>' . (0 + $value) . '</v></c>';
                 }
@@ -638,6 +1021,7 @@ abstract class BaseXlsxWriter
             $this->finishCurrentSheet();
         }
 
+        $this->writeStaticFile('xl/styles.xml', $this->getStylesXml());
         $this->writeStaticFile('xl/_rels/workbook.xml.rels', $this->getWorkbookRelsXml());
         $this->writeStaticFile('xl/workbook.xml', $this->getWorkbookXml());
         $this->writeStaticFile('[Content_Types].xml', $this->getContentTypesXml());
@@ -721,27 +1105,6 @@ abstract class BaseXlsxWriter
 
     protected function getStylesXml(): string
     {
-        // Custom numFmt 164 = ISO datetime; 14 (built-in) = m/d/yy date.
-        // cellXfs index 0 = default, index 1 = STYLE_DATETIME (numFmtId 164).
-        return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-    <numFmts count="1">
-        <numFmt numFmtId="164" formatCode="yyyy-mm-dd hh:mm:ss"/>
-    </numFmts>
-    <fonts count="1">
-        <font><sz val="11"/><name val="Calibri"/></font>
-    </fonts>
-    <fills count="2">
-        <fill><patternFill patternType="none"/></fill>
-        <fill><patternFill patternType="gray125"/></fill>
-    </fills>
-    <borders count="1">
-        <border><left/><right/><top/><bottom/><diagonal/></border>
-    </borders>
-    <cellXfs count="2">
-        <xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
-        <xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>
-    </cellXfs>
-</styleSheet>';
+        return $this->styles->toXml();
     }
 }

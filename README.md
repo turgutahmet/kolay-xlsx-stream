@@ -27,7 +27,52 @@ Most PHP Excel libraries (PHPSpreadsheet, Spout, Laravel Excel) have critical li
 
 ## Performance Comparison
 
-### Comprehensive Benchmark Results (September 2025)
+### Latest Benchmark — v2.2 (May 2026)
+
+Re-measured on an Apple Silicon laptop with PHP 8.2.28 and AWS SDK
+3.379 against the same `xlsx-test-package` bucket in `us-east-2`. The
+workload is identical to the v1.x baseline below (8 columns,
+mixed types, compression level 1).
+
+| Rows | Local Speed | Local Time | S3 Speed | S3 Memory | S3 Time | File Size |
+|------|-------------|------------|----------|-----------|---------|-----------|
+| 100 | 33,784 rows/s | 0.00s | 106 rows/s | 0 MB | 0.94s | 0.01 MB |
+| 500 | 153,942 rows/s | 0.00s | 481 rows/s | 0 MB | 1.04s | 0.02 MB |
+| 1,000 | 152,792 rows/s | 0.01s | 875 rows/s | 0 MB | 1.14s | 0.04 MB |
+| 5,000 | 160,639 rows/s | 0.03s | 3,342 rows/s | 0 MB | 1.50s | 0.2 MB |
+| 10,000 | 163,765 rows/s | 0.06s | 4,726 rows/s | 0 MB | 2.12s | 0.4 MB |
+| 25,000 | 173,144 rows/s | 0.14s | 11,357 rows/s | 0 MB | 2.20s | 1 MB |
+| 50,000 | 175,682 rows/s | 0.28s | 20,014 rows/s | 2 MB | 2.50s | 2 MB |
+| 100,000 | 175,130 rows/s | 0.57s | 22,372 rows/s | 4 MB | 4.47s | 4 MB |
+| 250,000 | 170,788 rows/s | 1.46s | 62,340 rows/s | 12 MB (±6) | 4.01s | 10 MB |
+| 500,000 | 171,361 rows/s | 2.92s | 83,525 rows/s | 20 MB (±18) | 5.99s | 20 MB |
+| 750,000 | 168,742 rows/s | 4.44s | 93,753 rows/s | 30 MB (±26) | 8.00s | 30 MB |
+| 1,000,000 | 161,250 rows/s | 6.20s | 95,070 rows/s | 40 MB (±38) | 10.52s | 40 MB |
+| 1,500,000 | 168,616 rows/s | 8.90s | 103,311 rows/s | 60 MB (±58) | 14.52s | 60 MB |
+| 2,000,000 | 166,369 rows/s | 12.02s | 95,629 rows/s | 79 MB (±77) | 20.91s | 79 MB |
+| 3,000,000 | – | – | 105,291 rows/s | 119 MB (±117) | 28.49s | 119 MB |
+| 4,000,000 | – | – | 106,815 rows/s | 158 MB (±156) | 37.45s | 158 MB |
+| 4,500,000 | – | – | 106,715 rows/s | 178 MB (±178) | 42.17s | 178 MB |
+
+#### What changed since v1.x
+
+- **S3 throughput is up roughly 2–3×** for any workload above 50K rows
+  (1M: 95K rows/s vs 43K, 4.5M: 107K rows/s vs 46K). Most of the win
+  comes from updated `aws/aws-sdk-php` (3.379+) and a faster network on
+  the measurement machine — the multipart-upload code path itself is
+  unchanged.
+- **Local throughput is ~5–10% lower** than the v1.x numbers — the cost
+  of the v2.0+ per-cell type detection (boolean cells, `DateTimeInterface`
+  → serial date, big-integer-string preservation). It's a deliberate
+  trade-off: v1.x produced silently broken cells for those types.
+- **Memory is unchanged** — local stays at 0–2 MB constant, S3 keeps the
+  same sawtooth pattern as the buffer fills and flushes per part.
+
+### Original Benchmark — v1.x (September 2025)
+
+Kept here for historical context. Different machine and PHP version, so
+direct cell-by-cell deltas reflect environment variance as well as code
+changes.
 
 | Rows | Local Speed | Local Memory | Local Time | S3 Speed | S3 Memory | S3 Time | File Size |
 |------|-------------|--------------|------------|----------|-----------|---------|-----------|
@@ -45,9 +90,9 @@ Most PHP Excel libraries (PHPSpreadsheet, Spout, Laravel Excel) have critical li
 | 1,000,000 | 182,693 rows/s | 0 MB | 5.47s | 43,215 rows/s | 40 MB (±38) | 23.14s | 40 MB |
 | 1,500,000 | 180,578 rows/s | 0 MB | 8.31s | 36,733 rows/s | 60 MB (±58) | 40.84s | 60 MB |
 | 2,000,000 | 177,012 rows/s | 0 MB | 11.30s | 51,323 rows/s | 79 MB (±77) | 38.97s | 79 MB |
-| 3,000,000 | - | - | - | 39,150 rows/s | 117 MB (±117) | 76.63s | 119 MB |
-| 4,000,000 | - | - | - | 42,500 rows/s | 160 MB (±156) | 94.12s | 158 MB |
-| 4,500,000 | - | - | - | 46,462 rows/s | 178 MB (±178) | 96.85s | 178 MB |
+| 3,000,000 | – | – | – | 39,150 rows/s | 117 MB (±117) | 76.63s | 119 MB |
+| 4,000,000 | – | – | – | 42,500 rows/s | 160 MB (±156) | 94.12s | 158 MB |
+| 4,500,000 | – | – | – | 46,462 rows/s | 178 MB (±178) | 96.85s | 178 MB |
 
 *Note: Tests with 1M+ rows automatically create multiple sheets (Excel limit: 1,048,576 rows per sheet)*  
 *Note: ± values in S3 Memory column indicate memory fluctuation during streaming due to periodic part uploads*
@@ -77,11 +122,11 @@ The ± values in S3 memory represent **normal memory fluctuation** during stream
    - Pattern: Memory oscillates between ~2MB (after upload) and ~78MB (before upload)
    - This is **completely normal** and expected behavior
 
-### Performance Highlights
+### Performance Highlights *(v2.2, May 2026)*
 
-- **Local File System**: ~180,000 rows/second with true O(1) memory
-- **S3 Streaming**: 30,000-50,000 rows/second with periodic memory fluctuation
-- **Memory Efficiency**: Local uses <2MB, S3 averages 40MB per million rows
+- **Local File System**: ~160,000–175,000 rows/second with true O(1) memory
+- **S3 Streaming**: 90,000–110,000 rows/second above 1M rows (2–3× the v1.x baseline)
+- **Memory Efficiency**: Local uses <2 MB, S3 averages 40 MB per million rows
 - **Multi-sheet Support**: Automatic sheet creation at Excel's 1,048,576 row limit
 - **Production Ready**: Successfully tested with 4.5 million rows
 
@@ -92,8 +137,8 @@ The ± values in S3 memory represent **normal memory fluctuation** during stream
 | PHPSpreadsheet | ❌ Crashes | ~8GB | Full file | Indirect |
 | Spout | ~60 sec | ~100MB+ | Full file | Indirect |
 | Laravel Excel | ~90 sec | ~500MB+ | Full file | Indirect |
-| **Kolay XLSX Stream (Local)** | ✅ **5.5 sec** | ✅ **0 MB** | ✅ **Zero** | N/A |
-| **Kolay XLSX Stream (S3)** | ✅ **23 sec** | ✅ **40MB avg** | ✅ **Zero** | ✅ **Direct** |
+| **Kolay XLSX Stream (Local)** | ✅ **6.2 sec** | ✅ **0 MB** | ✅ **Zero** | N/A |
+| **Kolay XLSX Stream (S3)** | ✅ **10.5 sec** | ✅ **40MB avg** | ✅ **Zero** | ✅ **Direct** |
 
 ## Requirements
 
@@ -389,6 +434,85 @@ $writer->writeRow([
     '+90 555 123 4567',                 // phone preserved as text
 ]);
 ```
+
+### Header & Column Styling *(v2.2+)*
+
+A small set of opt-in styling APIs that costs ~2-3% throughput and adds
+~3% to the file size. Skip them and the writer takes the v1.x-equivalent
+hot path.
+
+```php
+$writer = new SinkableXlsxWriter($sink);
+
+$writer
+    // Bold white text on dark blue, applied to the header row
+    ->setHeaderStyle([
+        'bold'  => true,
+        'fill'  => '#4F81BD',
+        'color' => '#FFFFFF',
+        'size'  => 12,
+    ])
+    // Native Excel number formats per column (1-based index)
+    ->setColumnFormat(1, 'integer')        // 12,345
+    ->setColumnFormat(5, 'currency_try')   // ₺99,999.00
+    ->setColumnFormat(6, 'percent')        // 12.50%
+    ->setColumnFormat(7, 'date')           // 2026-01-15
+    ->setColumnFormat(8, 'datetime')       // 2026-01-15 10:30:00
+    ->setColumnFormat(9, '0.000000')       // raw Excel format code
+    // Pin the header row, add filter dropdowns, auto-size columns
+    ->freezeFirstRow()
+    ->enableAutoFilter()
+    ->setAutoColumnWidth();                // header-text + format-aware
+
+$writer->startFile([
+    'Order ID', 'Customer', 'Product', 'Region',
+    'Price', 'Discount', 'Order Date', 'Created At', 'Score',
+]);
+```
+
+Available format presets: `date`, `datetime`, `datetime_iso`, `time`,
+`integer`, `decimal`, `percent`, `currency_try`, `currency_usd`,
+`currency_eur`, `currency_gbp`. Pass any other string to use a raw Excel
+format code (e.g. `0.000`, `#,##0.00 "kg"`).
+
+`setAutoColumnWidth()` derives a width from the header text length but
+also respects a per-format minimum so a `currency_try` column with the
+header `Salary` won't render as `####`. Override per column with
+`setColumnWidths([1 => 8, 2 => 30])` when you want exact control.
+
+### Manual Multi-Sheet Workbooks *(v2.2+)*
+
+`newSheet($name, $headers = null)` carves a workbook into named domain
+sheets — orthogonal to the auto-split fallback at 1,048,576 rows.
+
+```php
+$writer = new SinkableXlsxWriter($sink);
+
+$writer->setHeaderStyle(['bold' => true, 'fill' => '#4F81BD', 'color' => '#FFFFFF']);
+$writer->startFile(['ID', 'Name', 'Email']);
+
+foreach ($users->lazy() as $user) {
+    $writer->writeRow([$user->id, $user->name, $user->email]);
+}
+
+// Different header style + different columns for the next sheet
+$writer
+    ->clearColumnFormats()
+    ->setHeaderStyle(['bold' => true, 'fill' => '#9BBB59', 'color' => '#FFFFFF'])
+    ->setColumnFormat(3, 'currency_try')
+    ->newSheet('Orders', ['Order ID', 'Customer', 'Total']);
+
+foreach ($orders->lazy() as $order) {
+    $writer->writeRow([$order->id, $order->customer_id, $order->total]);
+}
+
+$stats = $writer->finishFile();
+// $stats['sheet_details'] → [['name' => 'Report', ...], ['name' => 'Orders', ...]]
+```
+
+`clearColumnFormats()` is the convenient way to drop the previous sheet's
+per-column registrations before starting a new one with a different
+column layout.
 
 ### Multi-Sheet Support (Automatic)
 
