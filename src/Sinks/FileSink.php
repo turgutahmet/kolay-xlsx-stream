@@ -117,12 +117,19 @@ class FileSink implements Sink
     }
     
     /**
-     * Destructor - ensure file is closed
+     * Destructor - ensure file is closed.
+     *
+     * Wraps fclose in a Throwable guard because destructors that propagate
+     * errors will crash the PHP process during shutdown.
      */
     public function __destruct()
     {
-        if (!$this->closed && $this->handle) {
-            fclose($this->handle);
+        if (!$this->closed && is_resource($this->handle)) {
+            try {
+                fclose($this->handle);
+            } catch (\Throwable) {
+                // Cannot recover from destructor.
+            }
         }
     }
 }

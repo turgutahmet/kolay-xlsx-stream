@@ -182,37 +182,47 @@ class S3MultipartSink implements Sink
             $this->closed = true;
             
         } catch (AwsException $e) {
-            // Try to abort on failure
             try {
                 $this->abort();
-            } catch (\Exception $abortException) {
-                // Silently fail
+            } catch (\Throwable) {
+                // abort() already logs orphan upload details
             }
-            
+
             throw S3Exception::multipartCompleteFailed($e->getMessage());
         }
     }
     
     /**
-     * Abort the multipart upload
+     * Abort the multipart upload.
+     *
+     * If S3 rejects the abort the upload becomes orphaned and S3 will keep
+     * billing for its parts until a lifecycle rule cleans it up — so we log
+     * a warning identifying the bucket/key/uploadId. Configure a bucket
+     * lifecycle rule on `AbortIncompleteMultipartUpload` to bound exposure.
      */
     public function abort(): void
     {
         if ($this->closed || empty($this->uploadId)) {
             return;
         }
-        
+
         try {
             $this->s3->abortMultipartUpload([
                 'Bucket' => $this->bucket,
                 'Key' => $this->key,
                 'UploadId' => $this->uploadId,
             ]);
-            
+
             $this->closed = true;
-            
         } catch (AwsException $e) {
-            // Silently fail abort
+            $this->closed = true;
+            error_log(sprintf(
+                '[kolay/xlsx-stream] Failed to abort multipart upload — orphan upload may incur S3 charges. bucket=%s key=%s uploadId=%s error=%s',
+                $this->bucket,
+                $this->key,
+                $this->uploadId,
+                $e->getMessage()
+            ));
         }
     }
     
@@ -225,15 +235,18 @@ class S3MultipartSink implements Sink
     }
     
     /**
-     * Destructor - ensure cleanup
+     * Destructor - ensure cleanup.
+     *
+     * Catches \Throwable (not just \Exception) because Errors thrown from
+     * destructors crash the PHP process.
      */
     public function __destruct()
     {
         if (!$this->closed && !empty($this->uploadId)) {
             try {
                 $this->abort();
-            } catch (\Exception $e) {
-                // Silently fail in destructor
+            } catch (\Throwable) {
+                // Last-resort: cannot recover from destructor.
             }
         }
     }

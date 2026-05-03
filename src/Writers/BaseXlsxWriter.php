@@ -33,12 +33,21 @@ abstract class BaseXlsxWriter
     // Excel limits
     const MAX_ROWS_PER_SHEET = 1048576; // Excel's hard limit
     const ROWS_PER_SHEET = 1048575; // MAX - 1 for header safety
-    
+    const MAX_COLUMNS = 16384; // Excel column limit (XFD)
+
+    // Style ids registered in getStylesXml() cellXfs
+    const STYLE_DEFAULT = 0;
+    const STYLE_DATETIME = 1;
+
+    // Excel epoch: serial 1 = 1900-01-01, but Excel mistakenly treats 1900 as a leap year.
+    // Using 1899-12-30 as base so Unix timestamps map correctly for all post-1900 dates.
+    const EXCEL_EPOCH_TIMESTAMP = -2209161600; // 1899-12-30 00:00:00 UTC
+
     // Sheet management
     protected array $sheets = [];
     protected int $currentSheetIndex = 0;
     protected array $columns = [];
-    
+
     // Current sheet streaming variables
     protected $deflateCtx = null;
     protected $crcContext = null;
@@ -48,13 +57,17 @@ abstract class BaseXlsxWriter
     protected int $sheetOffset = 0;
     protected int $currentSheetRow = 0;
     protected int $totalRows = 0;
-    
+
+    // Writer state
+    protected bool $started = false;
+    protected bool $closed = false;
+
     // Performance optimizations
     protected int $bufferFlushInterval = 1000;
     protected string $rowBuffer = '';
     protected int $rowBufferCount = 0;
     protected int $deflateLevel = 6;
-    
+
     // Column letter cache for performance
     protected array $colLetterCache = [];
     
@@ -117,18 +130,39 @@ abstract class BaseXlsxWriter
      */
     public function startFile(array $headers): void
     {
+        if ($this->started) {
+            throw XlsxStreamException::alreadyStarted();
+        }
+        if ($this->closed) {
+            throw XlsxStreamException::writerAlreadyClosed();
+        }
+        if (count($headers) > self::MAX_COLUMNS) {
+            throw XlsxStreamException::tooManyColumns(count($headers), self::MAX_COLUMNS);
+        }
+
         $this->columns = $headers;
-        
+        $this->started = true;
+
         // Write only static files that don't depend on sheet count
         $this->writeStaticFile('_rels/.rels', $this->getRelsXml());
         $this->writeStaticFile('xl/styles.xml', $this->getStylesXml());
     }
-    
+
     /**
      * Write a single row (handles multi-sheet automatically)
      */
     public function writeRow(array $row): void
     {
+        if (!$this->started) {
+            throw XlsxStreamException::headersNotSet();
+        }
+        if ($this->closed) {
+            throw XlsxStreamException::writerAlreadyClosed();
+        }
+        if (count($row) > self::MAX_COLUMNS) {
+            throw XlsxStreamException::tooManyColumns(count($row), self::MAX_COLUMNS);
+        }
+
         // Check if we need to start a new sheet
         if ($this->currentSheetRow === 0 || $this->currentSheetRow >= self::ROWS_PER_SHEET) {
             if ($this->currentSheetRow > 0) {
@@ -138,14 +172,14 @@ abstract class BaseXlsxWriter
             $this->currentSheetIndex++;
             $this->startNewSheet();
         }
-        
+
         $this->currentSheetRow++;
         $this->totalRows++;
-        
+
         // Build row XML and add to buffer
         $this->rowBuffer .= $this->buildRowXml($this->currentSheetRow, $row);
         $this->rowBufferCount++;
-        
+
         // Flush buffer periodically for better streaming
         if ($this->rowBufferCount >= $this->bufferFlushInterval) {
             $this->flushRowBuffer();
@@ -324,33 +358,93 @@ abstract class BaseXlsxWriter
     {
         $cells = [];
         $colIndex = 1;
-        
+
         foreach ($data as $value) {
             $cellRef = $this->getColumnLetter($colIndex) . $rowIndex;
             $colIndex++;
-            
+
+            // Null / empty string -> empty cell
             if ($value === null || $value === '') {
                 $cells[] = '<c r="' . $cellRef . '"/>';
-            } elseif (is_numeric($value)) {
-                if (is_string($value) && strlen($value) > 1 && $value[0] === '0' && $value[1] !== '.') {
+                continue;
+            }
+
+            // Boolean -> native Excel boolean cell
+            if (is_bool($value)) {
+                $cells[] = '<c r="' . $cellRef . '" t="b"><v>' . ($value ? 1 : 0) . '</v></c>';
+                continue;
+            }
+
+            // DateTimeInterface -> Excel serial date with datetime style
+            if ($value instanceof \DateTimeInterface) {
+                $serial = ($value->getTimestamp() - self::EXCEL_EPOCH_TIMESTAMP) / 86400;
+                $cells[] = '<c r="' . $cellRef . '" s="' . self::STYLE_DATETIME . '" t="n"><v>' . $serial . '</v></c>';
+                continue;
+            }
+
+            // Numeric values
+            if (is_int($value) || is_float($value)) {
+                $cells[] = '<c r="' . $cellRef . '" t="n"><v>' . $value . '</v></c>';
+                continue;
+            }
+
+            // Numeric strings: preserve as string when precision/format would be lost
+            if (is_string($value) && is_numeric($value)) {
+                if ($this->shouldPreserveNumericString($value)) {
                     $escaped = $this->fastXmlEscape($value);
                     $cells[] = '<c r="' . $cellRef . '" t="inlineStr"><is><t>' . $escaped . '</t></is></c>';
                 } else {
                     $cells[] = '<c r="' . $cellRef . '" t="n"><v>' . (0 + $value) . '</v></c>';
                 }
+                continue;
+            }
+
+            // String / Stringable / other -> inlineStr
+            $escaped = $this->fastXmlEscape((string)$value);
+
+            if ($escaped !== '' && ($escaped[0] === ' ' || $escaped[0] === "\t" ||
+                $escaped[strlen($escaped) - 1] === ' ' || $escaped[strlen($escaped) - 1] === "\t")) {
+                $cells[] = '<c r="' . $cellRef . '" t="inlineStr"><is><t xml:space="preserve">' . $escaped . '</t></is></c>';
             } else {
-                $escaped = $this->fastXmlEscape((string)$value);
-                
-                if ($escaped !== '' && ($escaped[0] === ' ' || $escaped[0] === "\t" || 
-                    $escaped[strlen($escaped) - 1] === ' ' || $escaped[strlen($escaped) - 1] === "\t")) {
-                    $cells[] = '<c r="' . $cellRef . '" t="inlineStr"><is><t xml:space="preserve">' . $escaped . '</t></is></c>';
-                } else {
-                    $cells[] = '<c r="' . $cellRef . '" t="inlineStr"><is><t>' . $escaped . '</t></is></c>';
-                }
+                $cells[] = '<c r="' . $cellRef . '" t="inlineStr"><is><t>' . $escaped . '</t></is></c>';
             }
         }
-        
+
         return '<row r="' . $rowIndex . '">' . implode('', $cells) . '</row>';
+    }
+
+    /**
+     * Decide whether a numeric string should be preserved as a string cell.
+     *
+     * Preserve when casting to float would lose precision or strip formatting:
+     * - Leading zero (e.g. "0123" — phone numbers, codes)
+     * - Plus sign prefix (e.g. "+90123")
+     * - Integer string longer than 15 significant digits (PHP float precision limit)
+     */
+    protected function shouldPreserveNumericString(string $value): bool
+    {
+        $len = strlen($value);
+        if ($len < 2) {
+            return false;
+        }
+
+        // Leading zero on non-decimal: "0123" yes, "0.5" no
+        if ($value[0] === '0' && $value[1] !== '.') {
+            return true;
+        }
+
+        // Plus sign prefix: "+0123", "+12345"
+        if ($value[0] === '+') {
+            return true;
+        }
+
+        // Big integer: > 15 digits (with optional leading minus) and no decimal/exponent
+        $check = $value[0] === '-' ? substr($value, 1) : $value;
+        if (strlen($check) > 15 && ctype_digit($check)) {
+            return true;
+        }
+
+        return false;
     }
     
     /**
@@ -484,17 +578,26 @@ abstract class BaseXlsxWriter
      */
     public function finishFile(): array
     {
+        if ($this->closed) {
+            throw XlsxStreamException::writerAlreadyClosed();
+        }
+        if (!$this->started) {
+            throw XlsxStreamException::headersNotSet();
+        }
+
         if ($this->currentSheetRow > 0) {
             $this->flushRowBuffer();
             $this->finishCurrentSheet();
         }
-        
+
         $this->writeStaticFile('xl/_rels/workbook.xml.rels', $this->getWorkbookRelsXml());
         $this->writeStaticFile('xl/workbook.xml', $this->getWorkbookXml());
         $this->writeStaticFile('[Content_Types].xml', $this->getContentTypesXml());
-        
+
         $this->writeCentralDirectory();
-        
+
+        $this->closed = true;
+
         return [
             'bytes' => $this->currentOffset,
             'rows' => $this->totalRows,
@@ -570,8 +673,13 @@ abstract class BaseXlsxWriter
     
     protected function getStylesXml(): string
     {
+        // Custom numFmt 164 = ISO datetime; 14 (built-in) = m/d/yy date.
+        // cellXfs index 0 = default, index 1 = STYLE_DATETIME (numFmtId 164).
         return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+    <numFmts count="1">
+        <numFmt numFmtId="164" formatCode="yyyy-mm-dd hh:mm:ss"/>
+    </numFmts>
     <fonts count="1">
         <font><sz val="11"/><name val="Calibri"/></font>
     </fonts>
@@ -582,8 +690,9 @@ abstract class BaseXlsxWriter
     <borders count="1">
         <border><left/><right/><top/><bottom/><diagonal/></border>
     </borders>
-    <cellXfs count="1">
-        <xf fontId="0" fillId="0" borderId="0"/>
+    <cellXfs count="2">
+        <xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
+        <xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>
     </cellXfs>
 </styleSheet>';
     }

@@ -54,4 +54,20 @@ class XlsxStreamException extends \Exception
     {
         return new self("Headers must be set before writing rows. Call startFile() first.");
     }
+
+    /**
+     * Create exception for startFile called more than once
+     */
+    public static function alreadyStarted(): self
+    {
+        return new self("Writer has already been started. startFile() can only be called once.");
+    }
+
+    /**
+     * Create exception for column count exceeding Excel's limit
+     */
+    public static function tooManyColumns(int $given, int $max): self
+    {
+        return new self("Column count {$given} exceeds Excel's maximum of {$max} columns per sheet.");
+    }
 }
