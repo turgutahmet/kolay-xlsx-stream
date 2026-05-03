@@ -88,6 +88,10 @@ abstract class BaseXlsxWriter
     protected int $freezeColumns = 0;
     protected bool $autoFilterEnabled = false;
 
+    /** @var array<int, float> 1-based column index => width in characters */
+    protected array $columnWidths = [];
+    protected bool $autoColumnWidth = false;
+
     public function __construct()
     {
         $this->styles = new StyleRegistry();
@@ -213,6 +217,54 @@ abstract class BaseXlsxWriter
         }
         $this->freezeRows = $rows;
         $this->freezeColumns = $columns;
+
+        return $this;
+    }
+
+    /**
+     * Set explicit column widths in Excel character units.
+     *
+     *   $writer->setColumnWidths([1 => 8, 2 => 30, 3 => 15]);
+     *
+     * Keys are 1-based column indexes. Columns omitted from the array
+     * fall back to Excel's default width.
+     *
+     * @param array<int, float|int> $widths
+     */
+    public function setColumnWidths(array $widths): self
+    {
+        if ($this->started) {
+            throw new XlsxStreamException('setColumnWidths() must be called before startFile().');
+        }
+        foreach ($widths as $col => $width) {
+            if ($col < 1) {
+                throw new XlsxStreamException("Column index must be >= 1, got {$col}.");
+            }
+            if ($width <= 0) {
+                throw new XlsxStreamException("Column width must be > 0, got {$width}.");
+            }
+            $this->columnWidths[$col] = (float) $width;
+        }
+
+        return $this;
+    }
+
+    /**
+     * Auto-size columns from the header text.
+     *
+     * Heuristic: width = max(8, mb_strlen(header) + 2). Cheap, no
+     * per-row sampling, no streaming impact. Manual setColumnWidths()
+     * entries override the heuristic for the columns they cover.
+     *
+     * For sample-based auto-fit (scanning N rows of data), wait for
+     * a future release.
+     */
+    public function setAutoColumnWidth(bool $enabled = true): self
+    {
+        if ($this->started) {
+            throw new XlsxStreamException('setAutoColumnWidth() must be called before startFile().');
+        }
+        $this->autoColumnWidth = $enabled;
 
         return $this;
     }
@@ -437,6 +489,7 @@ abstract class BaseXlsxWriter
         $sheetHeader = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
         $sheetHeader .= '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">';
         $sheetHeader .= $this->buildSheetViewsXml();
+        $sheetHeader .= $this->buildColsXml();
         $sheetHeader .= '<sheetData>';
 
         if (!empty($this->columns)) {
@@ -500,6 +553,44 @@ abstract class BaseXlsxWriter
         $pane .= ' topLeftCell="'.$topLeftCell.'" activePane="'.$activePane.'" state="frozen"/>';
 
         return '<sheetViews><sheetView workbookViewId="0">'.$pane.'</sheetView></sheetViews>';
+    }
+
+    /**
+     * Build the <cols> block emitted between <sheetViews> and <sheetData>.
+     *
+     * Resolution order (per column):
+     *   1. Explicit width from setColumnWidths()
+     *   2. Heuristic from header text length when setAutoColumnWidth(true)
+     *   3. Excel default (no <col> entry)
+     */
+    protected function buildColsXml(): string
+    {
+        $resolved = [];
+        $columnCount = count($this->columns);
+
+        foreach (range(1, max($columnCount, max(array_keys($this->columnWidths) ?: [0]))) as $col) {
+            if (isset($this->columnWidths[$col])) {
+                $resolved[$col] = $this->columnWidths[$col];
+
+                continue;
+            }
+            if ($this->autoColumnWidth && isset($this->columns[$col - 1])) {
+                $headerLen = mb_strlen((string) $this->columns[$col - 1], 'UTF-8');
+                $resolved[$col] = (float) max(8, $headerLen + 2);
+            }
+        }
+
+        if (empty($resolved)) {
+            return '';
+        }
+
+        $xml = '<cols>';
+        foreach ($resolved as $col => $width) {
+            $xml .= '<col min="'.$col.'" max="'.$col.'" width="'.$width.'" customWidth="1"/>';
+        }
+        $xml .= '</cols>';
+
+        return $xml;
     }
 
     /**
