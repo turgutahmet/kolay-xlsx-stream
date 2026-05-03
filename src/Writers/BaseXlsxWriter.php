@@ -928,7 +928,13 @@ abstract class BaseXlsxWriter
             "'" => '&apos;',
         ];
 
-        if (strpbrk($str, '&<>"\'\x00\x01\x02\x03\x04\x05\x06\x07\x08\x0B\x0C\x0E\x0F\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1A\x1B\x1C\x1D\x1E\x1F') === false) {
+        // Double-quoted needle so \xNN escape sequences resolve to the
+        // actual control bytes (0x00..0x1F minus \t \n \r). The previous
+        // single-quoted form embedded the literal characters \, x, 0..9,
+        // A..F instead, which let pure-lowercase strings with embedded
+        // nulls bypass sanitization entirely — Excel rejects the workbook
+        // because XML 1.0 forbids those bytes.
+        if (strpbrk($str, "&<>\"'\x00\x01\x02\x03\x04\x05\x06\x07\x08\x0B\x0C\x0E\x0F\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1A\x1B\x1C\x1D\x1E\x1F") === false) {
             return $str;
         }
 

@@ -5,6 +5,55 @@ All notable changes to `kolay/xlsx-stream` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.2] — 2026-05-03
+
+### Fixed
+
+- **XML control-byte sanitization bypass** — `fastXmlEscape()` used a
+  single-quoted needle for `strpbrk()`, so `\x00`, `\x01`, … escapes
+  were embedded as the literal characters `\`, `x`, `0`, `1`, …
+  instead of as actual control bytes. Strings whose characters didn't
+  overlap with `&<>"'\x0..9A..F` (e.g. pure-lowercase Latin or
+  multi-byte UTF-8 with embedded nulls) bypassed sanitization entirely
+  and Excel rejected the workbook with `Char 0x0 out of allowed
+  range`. The needle is now a double-quoted string so the escape
+  sequences resolve correctly. Pre-existing bug going back to v1.x.
+
+### Performance (side effect of the fix)
+
+- The buggy needle was a 129-character literal that `strpbrk()` had to
+  compare each input character against on the fast path. The corrected
+  needle is 36 characters (5 special chars + 31 actual control bytes),
+  so the per-cell sanitization check is ~3.5× cheaper. Comprehensive
+  benchmark on the same machine and workload as the v2.2 baseline:
+  - 1M rows local: **210K rows/s** (was 161K in v2.2 / 169K in v2.2.1)
+    — **+30% over v2.2**, **+15% over v1.x baseline**
+  - 4.5M rows S3: **130K rows/s** (was 107K in v2.2) — **+22%**
+  - Memory unchanged — local stays at 0–2 MB constant, S3 sawtooth
+    pattern unchanged.
+
+  The README's "Latest Benchmark" table has been refreshed with the
+  full v2.2.2 numbers and the "What changed since v1.x" notes flipped
+  from "v2.x is ~5–10% slower locally" to "v2.x is now ~15–25% faster
+  locally".
+
+### Documentation
+
+- README's `onProgress` section now notes that `$bytes` only advances
+  when zlib emits compressed output. With small datasets (or large
+  `setBufferFlushInterval()` relative to `setProgressInterval()`),
+  consecutive events may report the same byte count between flushes.
+  The row counter is always exact.
+
+### Tests
+
+- New `tests/XmlSanitizationTest.php` — 6 cases: pure-lowercase with
+  null byte, full-control-byte input across the C0 set, mixed-case
+  with control bytes, headers with control bytes, preservation of
+  `\t` `\n` `\r` (valid XML chars), and the slow-path `&<>"'`
+  escape sanity check. All assertions include a `libxml`-strict parse
+  to match Excel's behavior.
+
 ## [2.2.1] — 2026-05-03
 
 ### Added — polish
@@ -194,6 +243,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Initial release: high-performance XLSX streaming writer with FileSink and
   S3MultipartSink, multi-sheet support, and configurable compression.
 
+[2.2.2]: https://github.com/turgutahmet/kolay-xlsx-stream/compare/v2.2.1...v2.2.2
 [2.2.1]: https://github.com/turgutahmet/kolay-xlsx-stream/compare/v2.2.0...v2.2.1
 [2.2.0]: https://github.com/turgutahmet/kolay-xlsx-stream/compare/v2.1.0...v2.2.0
 [2.1.0]: https://github.com/turgutahmet/kolay-xlsx-stream/compare/v2.0.1...v2.1.0
