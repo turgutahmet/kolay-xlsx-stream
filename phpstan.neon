@@ -1,0 +1,11 @@
+parameters:
+    level: 6
+    paths:
+        - src
+    excludePaths:
+        - vendor
+    treatPhpDocTypesAsCertain: false
+    ignoreErrors:
+        # ZIP binary I/O uses dynamic deflate context resources
+        - '#Property Kolay\\XlsxStream\\Writers\\BaseXlsxWriter::\$deflateCtx#'
+        - '#Property Kolay\\XlsxStream\\Writers\\BaseXlsxWriter::\$crcContext#'

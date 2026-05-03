@@ -1,0 +1,21 @@
+# Files & directories excluded from Composer dist tarballs.
+# Keeps `composer require kolay/xlsx-stream` install lean.
+/.github                       export-ignore
+/tests                         export-ignore
+/examples                      export-ignore
+/.gitattributes                export-ignore
+/.gitignore                    export-ignore
+/.editorconfig                 export-ignore
+/phpunit.xml.dist              export-ignore
+/phpstan.neon                  export-ignore
+/pint.json                     export-ignore
+/benchmark-comprehensive.php   export-ignore
+/CHANGELOG.md                  export-ignore
+/UPGRADE.md                    export-ignore
+
+# Normalize line endings for source files
+*.php                          text eol=lf
+*.json                         text eol=lf
+*.md                           text eol=lf
+*.yml                          text eol=lf
+*.yaml                         text eol=lf
