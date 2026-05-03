@@ -83,6 +83,11 @@ abstract class BaseXlsxWriter
     /** @var array<int, int> 1-based column index => cellXfs style id */
     protected array $columnStyleIds = [];
 
+    // Sheet view options (v2.2+)
+    protected int $freezeRows = 0;
+    protected int $freezeColumns = 0;
+    protected bool $autoFilterEnabled = false;
+
     public function __construct()
     {
         $this->styles = new StyleRegistry();
@@ -179,6 +184,51 @@ abstract class BaseXlsxWriter
             throw new XlsxStreamException('setHeaderStyle() must be called before startFile().');
         }
         $this->headerStyleId = $this->styles->registerHeaderStyle($options);
+
+        return $this;
+    }
+
+    /**
+     * Freeze the first row so it stays visible while scrolling.
+     *
+     * Equivalent to Excel's "View > Freeze Top Row".
+     */
+    public function freezeFirstRow(): self
+    {
+        return $this->freezeRowsAndColumns(1, 0);
+    }
+
+    /**
+     * Freeze a custom number of rows and/or columns.
+     *
+     *   $writer->freezeRowsAndColumns(rows: 1, columns: 2);
+     */
+    public function freezeRowsAndColumns(int $rows = 1, int $columns = 0): self
+    {
+        if ($this->started) {
+            throw new XlsxStreamException('freezeRowsAndColumns() must be called before startFile().');
+        }
+        if ($rows < 0 || $columns < 0) {
+            throw new XlsxStreamException('Freeze rows/columns must be >= 0.');
+        }
+        $this->freezeRows = $rows;
+        $this->freezeColumns = $columns;
+
+        return $this;
+    }
+
+    /**
+     * Add Excel's auto-filter dropdowns to the header row.
+     *
+     * The filter range is computed automatically from the sheet's columns
+     * and final row count when the sheet is closed.
+     */
+    public function enableAutoFilter(): self
+    {
+        if ($this->started) {
+            throw new XlsxStreamException('enableAutoFilter() must be called before startFile().');
+        }
+        $this->autoFilterEnabled = true;
 
         return $this;
     }
@@ -386,6 +436,7 @@ abstract class BaseXlsxWriter
         // Write sheet header
         $sheetHeader = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
         $sheetHeader .= '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">';
+        $sheetHeader .= $this->buildSheetViewsXml();
         $sheetHeader .= '<sheetData>';
 
         if (!empty($this->columns)) {
@@ -420,13 +471,61 @@ abstract class BaseXlsxWriter
     }
 
     /**
+     * Build the <sheetViews> block when freeze panes are configured.
+     * Must appear BEFORE <sheetData> per OOXML schema order.
+     */
+    protected function buildSheetViewsXml(): string
+    {
+        if ($this->freezeRows === 0 && $this->freezeColumns === 0) {
+            return '';
+        }
+
+        $topLeftCol = $this->getColumnLetter($this->freezeColumns + 1);
+        $topLeftRow = $this->freezeRows + 1;
+        $topLeftCell = $topLeftCol.$topLeftRow;
+
+        $activePane = match (true) {
+            $this->freezeRows > 0 && $this->freezeColumns > 0 => 'bottomRight',
+            $this->freezeRows > 0 => 'bottomLeft',
+            default => 'topRight',
+        };
+
+        $pane = '<pane';
+        if ($this->freezeColumns > 0) {
+            $pane .= ' xSplit="'.$this->freezeColumns.'"';
+        }
+        if ($this->freezeRows > 0) {
+            $pane .= ' ySplit="'.$this->freezeRows.'"';
+        }
+        $pane .= ' topLeftCell="'.$topLeftCell.'" activePane="'.$activePane.'" state="frozen"/>';
+
+        return '<sheetViews><sheetView workbookViewId="0">'.$pane.'</sheetView></sheetViews>';
+    }
+
+    /**
+     * Build the <autoFilter> element written AFTER </sheetData>.
+     * Range covers all populated rows and the configured column count.
+     */
+    protected function buildAutoFilterXml(): string
+    {
+        if (! $this->autoFilterEnabled || empty($this->columns) || $this->currentSheetRow < 1) {
+            return '';
+        }
+
+        $lastCol = $this->getColumnLetter(count($this->columns));
+        $range = 'A1:'.$lastCol.$this->currentSheetRow;
+
+        return '<autoFilter ref="'.$range.'"/>';
+    }
+
+    /**
      * Finish current sheet
      */
     protected function finishCurrentSheet(): void
     {
         $this->flushRowBuffer();
 
-        $sheetFooter = '</sheetData></worksheet>';
+        $sheetFooter = '</sheetData>'.$this->buildAutoFilterXml().'</worksheet>';
 
         hash_update($this->crcContext, $sheetFooter);
         $this->sheetUncompressedSize += strlen($sheetFooter);
