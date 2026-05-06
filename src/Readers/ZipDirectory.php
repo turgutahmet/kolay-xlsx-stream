@@ -178,4 +178,47 @@ class ZipDirectory
 
         return $entry['offset'] + 30 + $lfh['fnameLen'] + $lfh['extraLen'];
     }
+
+    /**
+     * Read and inflate a single entry's full payload into a string.
+     *
+     * Intended for small metadata parts — workbook.xml, the .rels files,
+     * styles.xml, sharedStrings.xml when chosen for Strategy 1 RAM-load.
+     * Do NOT use for sheet data; that is what StreamingSheetReader is for.
+     *
+     * Supports DEFLATE (method 8) and STORED (method 0); other methods
+     * are not part of the OOXML spec and trigger a clear error.
+     */
+    public function readEntry(Source $source, string $name): string
+    {
+        $entry = $this->entry($name);
+        if ($entry === null) {
+            throw XlsxReadException::entryNotFound($name);
+        }
+
+        $offset = $this->dataOffset($source, $name);
+        $compressed = $source->range($offset, $entry['compressed_size']);
+
+        if ($entry['method'] === 0) {
+            return $compressed;
+        }
+
+        if ($entry['method'] !== 8) {
+            throw XlsxReadException::inflateFailed(
+                "entry {$name} uses unsupported ZIP compression method {$entry['method']}"
+            );
+        }
+
+        $ctx = inflate_init(ZLIB_ENCODING_RAW);
+        if ($ctx === false) {
+            throw XlsxReadException::inflateFailed("inflate_init failed for {$name}");
+        }
+
+        $inflated = inflate_add($ctx, $compressed, ZLIB_FINISH);
+        if ($inflated === false) {
+            throw XlsxReadException::inflateFailed("inflate_add failed for {$name}");
+        }
+
+        return $inflated;
+    }
 }
