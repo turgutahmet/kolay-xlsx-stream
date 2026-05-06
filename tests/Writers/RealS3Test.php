@@ -1,6 +1,8 @@
 <?php
 
-namespace Kolay\XlsxStream\Tests;
+namespace Kolay\XlsxStream\Tests\Writers;
+
+use Kolay\XlsxStream\Tests\TestCase;
 
 use Kolay\XlsxStream\Sinks\S3MultipartSink;
 use Kolay\XlsxStream\Writers\SinkableXlsxWriter;

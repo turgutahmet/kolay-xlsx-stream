@@ -1,6 +1,8 @@
 <?php
 
-namespace Kolay\XlsxStream\Tests;
+namespace Kolay\XlsxStream\Tests\Writers;
+
+use Kolay\XlsxStream\Tests\TestCase;
 
 use Kolay\XlsxStream\Exceptions\XlsxStreamException;
 use Kolay\XlsxStream\Sinks\FileSink;
