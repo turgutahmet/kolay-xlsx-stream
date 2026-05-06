@@ -98,6 +98,21 @@ abstract class BaseXlsxWriter
     // Custom sheet name for the next sheet rotation (set by newSheet()).
     protected ?string $nextSheetName = null;
 
+    // Random-access index (opt-in via withRandomAccessIndex). When enabled,
+    // ZLIB_FULL_FLUSH is injected at row-buffer boundaries roughly every
+    // $indexSyncPeriod rows, and an xl/_kxs/index.bin sidecar is written on
+    // finishFile(). Default off — every previously-written byte is identical.
+    protected bool $randomAccessIndexEnabled = false;
+    protected int $indexSyncPeriod = 10000;
+    protected int $rowsSinceSync = 0;
+
+    /**
+     * Per-sheet sync points keyed by sheet entry path.
+     *
+     * @var array<string, list<array{row: int, comp_offset: int, uncomp_offset: int}>>
+     */
+    protected array $indexSyncPoints = [];
+
     public function __construct()
     {
         $this->styles = new StyleRegistry();
@@ -128,6 +143,34 @@ abstract class BaseXlsxWriter
      * Lower = more responsive streaming
      * Higher = better compression ratio
      */
+    /**
+     * Enable born-indexed output: write xl/_kxs/index.bin sidecar so a
+     * matched reader can do O(1) random-access lookups (rowAt, rowRange,
+     * rowCount). Backward-compatible — Excel, PhpSpreadsheet, OpenSpout
+     * etc. ignore the unreferenced part and read the file normally.
+     *
+     * Approximate cost (per the POC benchmark, 4M rows / 10K period):
+     *   wall time ≈ ölçüm gürültüsü, RAM ≈ +10 KB, file size ≈ +0.04 %.
+     *
+     * Calling this method has no effect once startFile() has been called.
+     */
+    public function withRandomAccessIndex(int $every = 10000): self
+    {
+        if ($this->started) {
+            throw XlsxStreamException::alreadyStarted();
+        }
+        if ($every < 1) {
+            throw new XlsxStreamException(
+                "Index sync period must be at least 1; got {$every}."
+            );
+        }
+
+        $this->randomAccessIndexEnabled = true;
+        $this->indexSyncPeriod = $every;
+
+        return $this;
+    }
+
     public function setBufferFlushInterval(int $rows): self
     {
         if ($rows < 1) {
@@ -497,15 +540,96 @@ abstract class BaseXlsxWriter
     }
 
     /**
-     * Flush row buffer to stream
+     * Flush row buffer to stream. When the random-access index is enabled
+     * and the cumulative rows-since-last-sync threshold is reached,
+     * ZLIB_FULL_FLUSH is attached to the deflate_add call carrying the
+     * buffer — which produces a byte-aligned 0x00 0x00 0xFF 0xFF marker
+     * a downstream reader can resume inflation from with a fresh
+     * inflate_init context (no inflatePrime needed).
+     *
+     * Critical nuance: ZLIB_FULL_FLUSH MUST be passed alongside real
+     * input on the same deflate_add call. PHP's zlib does not drain the
+     * encoder's pending output if the flush flag is on a separate empty
+     * deflate_add('', ZLIB_FULL_FLUSH) — the flush still happens but the
+     * bytes only escape on the next input. Tying it to the row-buffer
+     * call keeps every emitted sync marker between two complete <row>
+     * elements, the alignment invariant the reader's row tokenizer
+     * depends on.
      */
     protected function flushRowBuffer(): void
     {
-        if ($this->rowBuffer !== '') {
+        if ($this->rowBuffer === '') {
+            return;
+        }
+
+        $rowsInBuffer = $this->rowBufferCount;
+        $shouldSync = $this->randomAccessIndexEnabled
+            && ($this->rowsSinceSync + $rowsInBuffer) >= $this->indexSyncPeriod;
+
+        if (! $shouldSync) {
             $this->writeSheetData($this->rowBuffer);
+            if ($this->randomAccessIndexEnabled) {
+                $this->rowsSinceSync += $rowsInBuffer;
+            }
             $this->rowBuffer = '';
             $this->rowBufferCount = 0;
+
+            return;
         }
+
+        // Sync path: replicate writeSheetData but with ZLIB_FULL_FLUSH so
+        // the deflate stream has a byte-aligned resume marker right after
+        // the last row in this buffer.
+        hash_update($this->crcContext, $this->rowBuffer);
+        $this->sheetUncompressedSize += strlen($this->rowBuffer);
+
+        $compressed = deflate_add($this->deflateCtx, $this->rowBuffer, ZLIB_FULL_FLUSH);
+        if ($compressed !== false && strlen($compressed) > 0) {
+            $this->writeToDest($compressed);
+            $this->sheetCompressedSize += strlen($compressed);
+        }
+
+        // Sync point points at the FIRST row of the NEXT batch — that is
+        // the row a reader will encounter after seeking to comp_offset
+        // and starting a fresh inflate context.
+        $entry = $this->currentSheetEntry();
+        $this->indexSyncPoints[$entry][] = [
+            'row' => $this->currentSheetRow + 1,
+            'comp_offset' => $this->sheetCompressedSize,
+            'uncomp_offset' => $this->sheetUncompressedSize,
+        ];
+
+        $this->rowsSinceSync = 0;
+        $this->rowBuffer = '';
+        $this->rowBufferCount = 0;
+    }
+
+    /**
+     * Convenience accessor mirroring the path used in startNewSheet().
+     */
+    protected function currentSheetEntry(): string
+    {
+        return "xl/worksheets/sheet{$this->currentSheetIndex}.xml";
+    }
+
+    /**
+     * Serialize the per-sheet sync points into the binary sidecar payload.
+     * Sheets are written in workbook order so the sidecar's section order
+     * matches the workbook.xml sheet listing.
+     */
+    protected function buildRandomAccessIndexPayload(): string
+    {
+        $sheetSections = [];
+        foreach ($this->sheets as $sheet) {
+            $entry = $sheet['filename'];
+            $sheetSections[] = [
+                'entry' => $entry,
+                'total_rows' => $sheet['rows'],
+                'sync_points' => $this->indexSyncPoints[$entry] ?? [],
+            ];
+        }
+
+        return RandomAccessIndex::encode($this->indexSyncPeriod, $sheetSections);
     }
 
     /**
@@ -589,6 +713,7 @@ abstract class BaseXlsxWriter
         $this->sheetCompressedSize = 0;
         $this->rowBuffer = '';
         $this->rowBufferCount = 0;
+        $this->rowsSinceSync = 0;
 
         // Write sheet header
         $sheetHeader = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
@@ -1051,6 +1176,9 @@ abstract class BaseXlsxWriter
         }
 
         $this->writeStaticFile('xl/styles.xml', $this->getStylesXml());
+        if ($this->randomAccessIndexEnabled) {
+            $this->writeStaticFile(RandomAccessIndex::ENTRY_PATH, $this->buildRandomAccessIndexPayload());
+        }
         $this->writeStaticFile('xl/_rels/workbook.xml.rels', $this->getWorkbookRelsXml());
         $this->writeStaticFile('xl/workbook.xml', $this->getWorkbookXml());
         $this->writeStaticFile('[Content_Types].xml', $this->getContentTypesXml());

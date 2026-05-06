@@ -143,6 +143,12 @@ class SinkableXlsxWriter extends BaseXlsxWriter
             }
 
             $this->writeStaticFile('xl/styles.xml', $this->getStylesXml());
+            if ($this->randomAccessIndexEnabled) {
+                $this->writeStaticFile(
+                    RandomAccessIndex::ENTRY_PATH,
+                    $this->buildRandomAccessIndexPayload()
+                );
+            }
             $this->writeStaticFile('xl/_rels/workbook.xml.rels', $this->getWorkbookRelsXml());
             $this->writeStaticFile('xl/workbook.xml', $this->getWorkbookXml());
             $this->writeStaticFile('[Content_Types].xml', $this->getContentTypesXml());
