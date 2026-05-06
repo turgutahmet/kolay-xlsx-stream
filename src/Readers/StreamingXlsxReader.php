@@ -61,6 +61,8 @@ class StreamingXlsxReader
     private ?array $cachedHeader = null;
     private ?SharedStrings $sst = null;
     private bool $sstResolved = false;
+    private ?RandomAccessIndex $randomAccessIndex = null;
+    private bool $indexResolved = false;
 
     private function __construct(Source $source)
     {
@@ -208,9 +210,109 @@ class StreamingXlsxReader
      * full inflate scan. A future Mode A* implementation will return O(1)
      * when an xl/_kxs/index.bin sidecar is present.
      */
+    /**
+     * Total row count including header. O(1) when the file carries a
+     * matching xl/_kxs/index.bin sidecar (born-indexed); O(N) full
+     * inflate scan otherwise. Both call sites are covered by the same
+     * tests so the result is identical either way.
+     */
     public function rowCount(): int
     {
+        $index = $this->loadRandomAccessIndex();
+        if ($index !== null) {
+            $total = $index->totalRows($this->currentEntry);
+            if ($total !== null) {
+                return $total;
+            }
+        }
+
         return iterator_count($this->openSheetReader()->rows());
+    }
+
+    /**
+     * Return a single row by 1-based row number — row 1 is the header,
+     * row 2 is the first data row. Returns null when $rowNumber is past
+     * the end of the sheet.
+     *
+     * Cost:
+     *   - With xl/_kxs/index.bin → O(period) — fresh inflate from the
+     *     nearest sync point + scan up to $period rows. Effectively
+     *     constant time bounded by the writer-chosen sync period.
+     *   - Without the sidecar → O(N) — full inflate scan from the
+     *     start until the target row is reached.
+     *
+     * @return array<int, mixed>|null
+     */
+    public function rowAt(int $rowNumber): ?array
+    {
+        if ($rowNumber < 1) {
+            return null;
+        }
+
+        [$compOffset, $startingRow] = $this->seekTarget($rowNumber);
+
+        foreach ($this->openSheetReader()->rowsFromOffset($compOffset, $startingRow) as $rn => $row) {
+            if ($rn === $rowNumber) {
+                return $row;
+            }
+            if ($rn > $rowNumber) {
+                return null;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Yield rows by 1-based inclusive range [from, to]. With an index
+     * sidecar the cost is O(period + (to - from)); without, the cost
+     * matches a row-skip O(from) plus the size of the range. Yielded
+     * keys are the 1-based row numbers.
+     *
+     * @return \Generator<int, array<int, mixed>>
+     */
+    public function rowRange(int $from, int $to): \Generator
+    {
+        if ($from < 1) {
+            $from = 1;
+        }
+        if ($to < $from) {
+            return;
+        }
+
+        [$compOffset, $startingRow] = $this->seekTarget($from);
+
+        foreach ($this->openSheetReader()->rowsFromOffset($compOffset, $startingRow) as $rn => $row) {
+            if ($rn < $from) {
+                continue;
+            }
+            if ($rn > $to) {
+                return;
+            }
+            yield $rn => $row;
+        }
+    }
+
+    /**
+     * Resolve a target row to a (compressed-offset, starting-row)
+     * pair the StreamingSheetReader can inflate from. Returns
+     * [null, 1] when no index is present or the target precedes
+     * every recorded sync point.
+     *
+     * @return array{0: int|null, 1: int}
+     */
+    private function seekTarget(int $rowNumber): array
+    {
+        $index = $this->loadRandomAccessIndex();
+        if ($index === null) {
+            return [null, 1];
+        }
+        $sp = $index->findSyncPoint($this->currentEntry, $rowNumber);
+        if ($sp === null) {
+            return [null, 1];
+        }
+
+        return [$sp['comp_offset'], $sp['row']];
     }
 
     public function close(): void
@@ -227,6 +329,28 @@ class StreamingXlsxReader
             65536,
             $this->resolveSharedStrings(),
         );
+    }
+
+    /**
+     * Lazy-load and cache the random-access index sidecar if present.
+     * Files written without withRandomAccessIndex() carry no sidecar;
+     * resolveRandomAccessIndex() returns null in that case and rowAt /
+     * rowRange / rowCount fall back to sequential scans.
+     */
+    private function loadRandomAccessIndex(): ?RandomAccessIndex
+    {
+        if ($this->indexResolved) {
+            return $this->randomAccessIndex;
+        }
+        $this->indexResolved = true;
+
+        if (! $this->cd->has(RandomAccessIndex::ENTRY_PATH)) {
+            return $this->randomAccessIndex = null;
+        }
+
+        $payload = $this->cd->readEntry($this->source, RandomAccessIndex::ENTRY_PATH);
+
+        return $this->randomAccessIndex = RandomAccessIndex::decode($payload);
     }
 
     /**

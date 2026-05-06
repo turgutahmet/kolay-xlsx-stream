@@ -53,15 +53,38 @@ class StreamingSheetReader
      */
     public function rows(): \Generator
     {
+        foreach ($this->rowsFromOffset(null, 1) as $row) {
+            yield $row;
+        }
+    }
+
+    /**
+     * Lower-level row generator with explicit start position. Used by
+     * the public reader for random access via xl/_kxs/index.bin sync
+     * points: seek to the byte offset of the nearest sync point, init
+     * a fresh inflate context (the marker is byte-aligned by
+     * construction so no inflatePrime is needed), and resume row
+     * decoding from $startingRowNumber.
+     *
+     * Generator key is the 1-based row number — row numbers match the
+     * file's <row r="N"/> attribute, NOT the PHP zero-indexed array
+     * convention. This gives callers a direct way to filter by row
+     * range without re-deriving position.
+     *
+     * @return \Generator<int, array<int, mixed>>
+     */
+    public function rowsFromOffset(?int $compOffset, int $startingRowNumber): \Generator
+    {
         $entry = $this->cd->entry($this->sheetEntry);
         if ($entry === null) {
             throw XlsxReadException::entryNotFound($this->sheetEntry);
         }
 
         $dataOffset = $this->cd->dataOffset($this->source, $this->sheetEntry);
-        $compRemaining = $entry['compressed_size'];
+        $startOffset = $dataOffset + ($compOffset ?? 0);
+        $compRemaining = $entry['compressed_size'] - ($compOffset ?? 0);
 
-        $stream = $this->source->streamFrom($dataOffset);
+        $stream = $this->source->streamFrom($startOffset);
         $inflate = inflate_init(ZLIB_ENCODING_RAW);
         if ($inflate === false) {
             if (is_resource($stream)) {
@@ -70,6 +93,7 @@ class StreamingSheetReader
             throw XlsxReadException::inflateFailed('inflate_init returned false');
         }
 
+        $rowNumber = $startingRowNumber;
         $buffer = '';
         $finishedFlush = false;
 
@@ -123,7 +147,8 @@ class StreamingSheetReader
                     }
                     $rowXml = substr($buffer, $rowStart, $rowEnd + 6 - $rowStart);
                     $cursor = $rowEnd + 6;
-                    yield CellTokenizer::tokenizeRow($rowXml, $this->sst);
+                    yield $rowNumber => CellTokenizer::tokenizeRow($rowXml, $this->sst);
+                    $rowNumber++;
                 }
 
                 if ($cursor > 0) {
