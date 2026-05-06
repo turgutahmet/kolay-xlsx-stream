@@ -28,39 +28,20 @@ class StreamingSheetReader
     private ZipDirectory $cd;
     private string $sheetEntry;
     private int $chunkSize;
+    private ?SharedStrings $sst;
 
     public function __construct(
         Source $source,
         ZipDirectory $cd,
         string $sheetEntry = 'xl/worksheets/sheet1.xml',
         int $chunkSize = 65536,
+        ?SharedStrings $sst = null,
     ) {
         $this->source = $source;
         $this->cd = $cd;
         $this->sheetEntry = $sheetEntry;
         $this->chunkSize = $chunkSize;
-    }
-
-    /**
-     * Identify the shared-strings handling tier for the current archive.
-     *
-     * STRATEGY_0_INLINE   — no sharedStrings.xml entry. inlineStr fast path.
-     * STRATEGY_1_RAM_LOAD — sst <= 20 MB compressed; load into memory.
-     * STRATEGY_2_TEMP     — sst > 20 MB compressed; index into php://temp.
-     *
-     * Strategy 0 is the steady state for files written by SinkableXlsxWriter,
-     * which never emits a sharedStrings entry (every cell is t="inlineStr").
-     */
-    public function strategy(): string
-    {
-        $sst = $this->cd->entry('xl/sharedStrings.xml');
-        if ($sst === null) {
-            return 'STRATEGY_0_INLINE';
-        }
-
-        return $sst['compressed_size'] <= 20 * 1024 * 1024
-            ? 'STRATEGY_1_RAM_LOAD'
-            : 'STRATEGY_2_TEMP';
+        $this->sst = $sst;
     }
 
     /**
@@ -142,7 +123,7 @@ class StreamingSheetReader
                     }
                     $rowXml = substr($buffer, $rowStart, $rowEnd + 6 - $rowStart);
                     $cursor = $rowEnd + 6;
-                    yield CellTokenizer::tokenizeRow($rowXml);
+                    yield CellTokenizer::tokenizeRow($rowXml, $this->sst);
                 }
 
                 if ($cursor > 0) {

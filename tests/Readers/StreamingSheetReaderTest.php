@@ -51,10 +51,12 @@ class StreamingSheetReaderTest extends TestCase
         $this->assertSame(['3', 'Charlie', 'charlie@example.com'], $rows[3]);
     }
 
-    public function test_strategy_zero_for_writer_output(): void
+    public function test_writer_output_has_no_shared_strings_entry(): void
     {
-        // The package writer uses inlineStr for every cell; the sst entry
-        // is never created. Reader must detect this and choose Strategy 0.
+        // The package writer uses inlineStr for every cell; xl/sharedStrings.xml
+        // is therefore never created. The reader's fast path depends on this
+        // invariant — assert it explicitly so a writer regression that starts
+        // emitting a sst would surface immediately.
         $writer = new SinkableXlsxWriter(new FileSink($this->testFile));
         $writer->startFile(['x']);
         $writer->writeRow(['y']);
@@ -62,9 +64,8 @@ class StreamingSheetReaderTest extends TestCase
 
         $source = new LocalFileSource($this->testFile);
         $cd = ZipDirectory::fromSource($source);
-        $reader = new StreamingSheetReader($source, $cd);
 
-        $this->assertSame('STRATEGY_0_INLINE', $reader->strategy());
+        $this->assertFalse($cd->has('xl/sharedStrings.xml'));
     }
 
     public function test_round_trip_large_dataset_bounded_memory(): void

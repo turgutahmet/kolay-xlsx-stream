@@ -31,7 +31,6 @@ class StreamingXlsxReaderTest extends TestCase
         $reader = StreamingXlsxReader::fromFile($this->testFile);
 
         $this->assertNotEmpty($reader->sheets());
-        $this->assertSame('STRATEGY_0_INLINE', $reader->strategy());
     }
 
     public function test_sheets_lists_every_sheet_in_workbook_order(): void

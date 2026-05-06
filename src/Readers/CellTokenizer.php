@@ -40,9 +40,13 @@ class CellTokenizer
     /**
      * Parse a row XML blob into a 0-indexed dense array.
      *
+     * Pass a SharedStrings lookup to resolve t="s" cells (external XLSX
+     * files written with a deduplicated string table). Files written by
+     * SinkableXlsxWriter never use t="s", so $sst is optional.
+     *
      * @return array<int, mixed>
      */
-    public static function tokenizeRow(string $rowXml): array
+    public static function tokenizeRow(string $rowXml, ?SharedStrings $sst = null): array
     {
         $byIdx = [];
         $maxIdx = -1;
@@ -100,7 +104,7 @@ class CellTokenizer
             $body = substr($rowXml, $bodyStart, $bodyEnd - $bodyStart);
 
             $type = self::extractAttribute($attrs, 't');
-            $byIdx[$idx] = self::parseCellBody($body, $type);
+            $byIdx[$idx] = self::parseCellBody($body, $type, $sst);
 
             $cursor = $bodyEnd + 4;
         }
@@ -148,7 +152,7 @@ class CellTokenizer
     /**
      * Decode the body of a <c>...</c> element into the value to yield.
      */
-    private static function parseCellBody(string $body, ?string $type): mixed
+    private static function parseCellBody(string $body, ?string $type, ?SharedStrings $sst): mixed
     {
         if ($body === '') {
             return '';
@@ -166,7 +170,19 @@ class CellTokenizer
             return $v === '1';
         }
 
-        // numeric (t="n" or absent), sst ref (t="s"), formula cached (t="str"),
+        if ($type === 's') {
+            $v = self::extractInlineV($body);
+            // No sst loaded → return the raw index so a corrupt file degrades
+            // gracefully rather than throwing mid-iteration. The reader
+            // facade is responsible for loading sst when one is present.
+            if ($sst === null || $v === '') {
+                return $v;
+            }
+
+            return $sst->get((int) $v);
+        }
+
+        // numeric (t="n" or absent), formula cached (t="str"),
         // error literal (t="e"): all carry the value in <v>...</v>.
         $v = self::extractInlineV($body);
 

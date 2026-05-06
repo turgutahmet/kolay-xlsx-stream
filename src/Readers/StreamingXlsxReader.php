@@ -26,14 +26,31 @@ use Kolay\XlsxStream\Sources\S3RangeSource;
  *   - rows(skip, limit)          generator over data rows
  *   - chunked(N)                 generator over batches of N rows
  *   - rowCount()                 total rows in selected sheet (full scan)
- *   - strategy()                 sst handling tier ('STRATEGY_0_INLINE' …)
  *
- * RAM is bounded — independent of file size. Each call to rows() / chunked()
- * opens a fresh forward-only inflate stream so the API is replayable from
- * the caller's perspective without memoising the dataset in memory.
+ * RAM is bounded — independent of sheet size. Each call to rows() /
+ * chunked() opens a fresh forward-only inflate stream so the API is
+ * replayable from the caller's perspective without memoising the
+ * dataset in memory.
+ *
+ * Files written by SinkableXlsxWriter use inline strings exclusively
+ * (t="inlineStr") — no sharedStrings.xml is needed. Files written by
+ * other XLSX writers (PhpSpreadsheet, openpyxl, Apache POI, …) typically
+ * deduplicate strings into xl/sharedStrings.xml; the reader detects this
+ * and loads the table into memory transparently. Archives whose
+ * sharedStrings.xml exceeds SST_RAM_THRESHOLD compressed bytes are
+ * refused with a clear error — an on-disk variant for very large tables
+ * is tracked as a future addition.
  */
 class StreamingXlsxReader
 {
+    /**
+     * Compressed-size threshold at which xl/sharedStrings.xml stops
+     * fitting comfortably in RAM. ~99% of real-world XLSX files have a
+     * sst well below this. Files above the threshold get a clear error
+     * pointing at the limitation.
+     */
+    public const SST_RAM_THRESHOLD = 20 * 1024 * 1024;
+
     private Source $source;
     private ZipDirectory $cd;
 
@@ -42,6 +59,8 @@ class StreamingXlsxReader
 
     private string $currentEntry;
     private ?array $cachedHeader = null;
+    private ?SharedStrings $sst = null;
+    private bool $sstResolved = false;
 
     private function __construct(Source $source)
     {
@@ -194,16 +213,6 @@ class StreamingXlsxReader
         return iterator_count($this->openSheetReader()->rows());
     }
 
-    /**
-     * sst handling tier ('STRATEGY_0_INLINE', 'STRATEGY_1_RAM_LOAD',
-     * 'STRATEGY_2_TEMP'). Files written by SinkableXlsxWriter always
-     * report STRATEGY_0_INLINE.
-     */
-    public function strategy(): string
-    {
-        return $this->openSheetReader()->strategy();
-    }
-
     public function close(): void
     {
         $this->source->close();
@@ -211,6 +220,48 @@ class StreamingXlsxReader
 
     private function openSheetReader(): StreamingSheetReader
     {
-        return new StreamingSheetReader($this->source, $this->cd, $this->currentEntry);
+        return new StreamingSheetReader(
+            $this->source,
+            $this->cd,
+            $this->currentEntry,
+            65536,
+            $this->resolveSharedStrings(),
+        );
+    }
+
+    /**
+     * Lazy-load the shared-strings table when first needed. Returns null
+     * for archives that don't carry one (the kolay-xlsx-stream output
+     * shape — every cell uses inlineStr). Throws a clear error for
+     * tables larger than SST_RAM_THRESHOLD so callers know the file is
+     * outside the supported range without their RAM filling up first.
+     */
+    private function resolveSharedStrings(): ?SharedStrings
+    {
+        if ($this->sstResolved) {
+            return $this->sst;
+        }
+
+        $entry = $this->cd->entry('xl/sharedStrings.xml');
+        if ($entry === null) {
+            $this->sstResolved = true;
+
+            return null;
+        }
+
+        if ($entry['compressed_size'] > self::SST_RAM_THRESHOLD) {
+            $sizeMb = number_format($entry['compressed_size'] / 1024 / 1024, 1);
+            throw XlsxReadException::corruptCentralDirectory(
+                "xl/sharedStrings.xml is {$sizeMb} MB compressed — beyond the in-memory threshold ".
+                'this reader supports. An on-disk variant for very large shared-strings tables '.
+                'is tracked for a future release.'
+            );
+        }
+
+        $sstXml = $this->cd->readEntry($this->source, 'xl/sharedStrings.xml');
+        $this->sst = SharedStringsParser::parseInMemory($sstXml);
+        $this->sstResolved = true;
+
+        return $this->sst;
     }
 }
