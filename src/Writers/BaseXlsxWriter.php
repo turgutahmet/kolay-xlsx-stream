@@ -1471,7 +1471,18 @@ abstract class BaseXlsxWriter
 
         $xml .= '
     <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
-    <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+    <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>';
+
+        // ECMA-376 Part 2 §10.1.2.2 requires every package part to have a
+        // content type. The random-access index sidecar uses extension "bin"
+        // which has no Default mapping, so an explicit Override is required.
+        // Without this Excel's strict validator triggers repair mode on open.
+        // application/octet-stream signals "opaque binary, do not interpret".
+        if ($this->randomAccessIndexEnabled) {
+            $xml .= "\n    " . '<Override PartName="/'.RandomAccessIndex::ENTRY_PATH.'" ContentType="application/octet-stream"/>';
+        }
+
+        $xml .= '
 </Types>';
 
         return $xml;

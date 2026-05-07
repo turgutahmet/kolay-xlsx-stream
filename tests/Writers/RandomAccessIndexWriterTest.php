@@ -285,11 +285,13 @@ class RandomAccessIndexWriterTest extends TestCase
 
     public function test_indexed_xlsx_zip_structure_is_ooxml_compliant(): void
     {
-        // Pins the OOXML §10.1.4 "unreferenced parts" contract:
-        // xl/_kxs/index.bin is a real ZIP entry (so we can find it
-        // ourselves) but is NOT listed in [Content_Types].xml — vanilla
-        // OOXML readers (Excel, PhpSpreadsheet, OpenSpout, libreoffice)
-        // therefore ignore it gracefully.
+        // Pins ECMA-376 Part 2 §10.1.2.2: every package part must have a
+        // content type declared in [Content_Types].xml — either via a
+        // Default Extension mapping or an explicit Override. The random-
+        // access index sidecar (xl/_kxs/index.bin) uses the "bin"
+        // extension which has no Default mapping, so it MUST appear as
+        // an Override. Without this Excel's strict validator triggers
+        // repair mode on open even though every other part is valid.
         $writer = new SinkableXlsxWriter(new FileSink($this->testFile));
         $writer->withRandomAccessIndex(every: 100);
         $writer->startFile(['id', 'name']);
@@ -318,11 +320,17 @@ class RandomAccessIndexWriterTest extends TestCase
         // The sidecar must exist as a ZIP entry.
         $this->assertNotFalse($zip->locateName(RandomAccessIndex::ENTRY_PATH));
 
-        // …but must NOT be referenced in [Content_Types].xml — that's
-        // what makes it invisible to vanilla readers.
+        // The sidecar MUST be declared in Content_Types via Override — a
+        // "bin" extension has no Default mapping in our package and OPC
+        // forbids parts without a content type. application/octet-stream
+        // signals opaque binary so unaware readers skip safely.
         $contentTypes = $zip->getFromName('[Content_Types].xml');
-        $this->assertStringNotContainsString('_kxs/index.bin', $contentTypes);
-        $this->assertStringNotContainsString('_kxs', $contentTypes);
+        $this->assertStringContainsString(
+            '<Override PartName="/'.RandomAccessIndex::ENTRY_PATH.'"',
+            $contentTypes,
+            'sidecar Override missing — Excel will trigger repair mode'
+        );
+        $this->assertStringContainsString('application/octet-stream', $contentTypes);
 
         // Header + last row markers prove the sheet still opens.
         $sheetXml = $zip->getFromName('xl/worksheets/sheet1.xml');
