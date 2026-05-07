@@ -283,6 +283,55 @@ class RandomAccessIndexWriterTest extends TestCase
         $this->assertFalse($cd->has(RandomAccessIndex::ENTRY_PATH));
     }
 
+    public function test_indexed_xlsx_zip_structure_is_ooxml_compliant(): void
+    {
+        // Pins the OOXML §10.1.4 "unreferenced parts" contract:
+        // xl/_kxs/index.bin is a real ZIP entry (so we can find it
+        // ourselves) but is NOT listed in [Content_Types].xml — vanilla
+        // OOXML readers (Excel, PhpSpreadsheet, OpenSpout, libreoffice)
+        // therefore ignore it gracefully.
+        $writer = new SinkableXlsxWriter(new FileSink($this->testFile));
+        $writer->withRandomAccessIndex(every: 100);
+        $writer->startFile(['id', 'name']);
+        for ($i = 1; $i <= 500; $i++) {
+            $writer->writeRow([$i, "user-{$i}"]);
+        }
+        $writer->finishFile();
+
+        $zip = new ZipArchive();
+        $this->assertTrue($zip->open($this->testFile) === true);
+
+        // Every part a vanilla OOXML reader will look up.
+        foreach ([
+            '[Content_Types].xml',
+            'xl/workbook.xml',
+            'xl/_rels/workbook.xml.rels',
+            'xl/worksheets/sheet1.xml',
+            'xl/styles.xml',
+        ] as $required) {
+            $this->assertNotFalse(
+                $zip->locateName($required),
+                "missing required OOXML part: {$required}"
+            );
+        }
+
+        // The sidecar must exist as a ZIP entry.
+        $this->assertNotFalse($zip->locateName(RandomAccessIndex::ENTRY_PATH));
+
+        // …but must NOT be referenced in [Content_Types].xml — that's
+        // what makes it invisible to vanilla readers.
+        $contentTypes = $zip->getFromName('[Content_Types].xml');
+        $this->assertStringNotContainsString('_kxs/index.bin', $contentTypes);
+        $this->assertStringNotContainsString('_kxs', $contentTypes);
+
+        // Header + last row markers prove the sheet still opens.
+        $sheetXml = $zip->getFromName('xl/worksheets/sheet1.xml');
+        $this->assertStringContainsString('<row r="1"', $sheetXml);
+        $this->assertStringContainsString('<row r="501"', $sheetXml);
+
+        $zip->close();
+    }
+
     /**
      * Read xl/_kxs/index.bin entry (decompressed) from the test file.
      */
