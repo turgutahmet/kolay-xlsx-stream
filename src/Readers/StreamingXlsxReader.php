@@ -64,6 +64,20 @@ class StreamingXlsxReader
     private ?RandomAccessIndex $randomAccessIndex = null;
     private bool $indexResolved = false;
 
+    /** @var array<int, callable> */
+    private array $columnCasts = [];
+
+    private bool $use1904Epoch = false;
+
+    /**
+     * Excel stores dates as timezone-naive numeric serials. We materialise
+     * them as UTC by default for portability — the same file produces the
+     * same DateTimeImmutable on every server regardless of
+     * date_default_timezone_get(). Callers whose data is authored in a
+     * specific timezone opt in via castTimezone().
+     */
+    private string $castTimezone = 'UTC';
+
     private function __construct(Source $source)
     {
         $this->source = $source;
@@ -171,7 +185,7 @@ class StreamingXlsxReader
 
                 continue;
             }
-            yield $row;
+            yield $this->applyCasts($row);
             $emitted++;
             if ($limit !== null && $emitted >= $limit) {
                 return;
@@ -253,7 +267,7 @@ class StreamingXlsxReader
 
         foreach ($this->openSheetReader()->rowsFromOffset($compOffset, $startingRow) as $rn => $row) {
             if ($rn === $rowNumber) {
-                return $row;
+                return $this->applyCasts($row);
             }
             if ($rn > $rowNumber) {
                 return null;
@@ -289,7 +303,7 @@ class StreamingXlsxReader
             if ($rn > $to) {
                 return;
             }
-            yield $rn => $row;
+            yield $rn => $this->applyCasts($row);
         }
     }
 
@@ -315,9 +329,135 @@ class StreamingXlsxReader
         return [$sp['comp_offset'], $sp['row']];
     }
 
+    /**
+     * Register a cell-value cast for a 0-indexed column. Built-in cast
+     * names: date, datetime, int, float, bool. Pass a callable for
+     * custom transformations.
+     *
+     * Casts are applied lazily as rows() / rowAt() / rowRange() yield —
+     * the underlying tokenization is unchanged, so registering a cast
+     * after iteration began is allowed (subsequent rows will see it).
+     */
+    public function castColumn(int $col, string|callable $cast): self
+    {
+        // String is always interpreted as a built-in cast name (date,
+        // datetime, int, float, bool). is_callable() must NOT win the
+        // dispatch here — "date" is a real PHP function, so a naive
+        // is_callable() check would pass it and silently call date($v).
+        $this->columnCasts[$col] = is_string($cast)
+            ? $this->resolveBuiltinCast($cast)
+            : $cast;
+
+        return $this;
+    }
+
+    /**
+     * Bulk variant of castColumn().
+     *
+     * @param  array<int, string|callable>  $casts
+     */
+    public function castColumns(array $casts): self
+    {
+        foreach ($casts as $col => $cast) {
+            $this->castColumn($col, $cast);
+        }
+
+        return $this;
+    }
+
+    /**
+     * Override the timezone applied to cast dates. Default is UTC.
+     * Validation happens at config time so a typo surfaces immediately
+     * rather than at the first row.
+     */
+    public function castTimezone(string $tz): self
+    {
+        try {
+            new \DateTimeZone($tz);
+        } catch (\Exception) {
+            throw new \InvalidArgumentException("Unknown timezone: {$tz}");
+        }
+        $this->castTimezone = $tz;
+
+        return $this;
+    }
+
+    /**
+     * Switch to the 1904 epoch used by some Mac-origin Excel files.
+     * Default is the 1900 epoch with the leap-year quirk preserved.
+     */
+    public function use1904Epoch(): self
+    {
+        $this->use1904Epoch = true;
+
+        return $this;
+    }
+
     public function close(): void
     {
         $this->source->close();
+    }
+
+    public function __destruct()
+    {
+        $this->close();
+    }
+
+    private function resolveBuiltinCast(string $type): callable
+    {
+        return match ($type) {
+            'date'     => fn ($v) => $this->castDate($v, false),
+            'datetime' => fn ($v) => $this->castDate($v, true),
+            'int'      => fn ($v) => is_numeric($v) ? (int) $v : null,
+            'float'    => fn ($v) => is_numeric($v) ? (float) $v : null,
+            'bool'     => fn ($v) => is_bool($v) ? $v : ($v === '1' || $v === 'true'),
+            default    => throw new \InvalidArgumentException(
+                "Unknown cast type '{$type}'. Use date|datetime|int|float|bool or a callable."
+            ),
+        };
+    }
+
+    private function castDate(mixed $serial, bool $withTime): ?\DateTimeImmutable
+    {
+        if (! is_numeric($serial)) {
+            return null;
+        }
+        $serial = (float) $serial;
+
+        // Canonical formula: ts = epoch + serial * 86400, with anchor
+        // 1899-12-30 (1900 mode) or 1904-01-01 (Mac mode). The 1900
+        // leap-year quirk is *already encoded* in the serial values
+        // Excel writes — applying an extra "-1 if >= 60" subtraction
+        // here would produce off-by-one dates for every serial >= 60,
+        // including the entire post-1900-03-01 range.
+        $epochUnix = $this->use1904Epoch ? -2082844800 : -2209161600;
+
+        $whole = (int) $serial;
+        $frac = $serial - $whole;
+        $secondsOfDay = $withTime ? (int) round($frac * 86400) : 0;
+
+        $ts = $epochUnix + ($whole * 86400) + $secondsOfDay;
+
+        return (new \DateTimeImmutable('@'.$ts))
+            ->setTimezone(new \DateTimeZone($this->castTimezone));
+    }
+
+    /**
+     * @param  array<int, mixed>  $row
+     * @return array<int, mixed>
+     */
+    private function applyCasts(array $row): array
+    {
+        if ($this->columnCasts === []) {
+            return $row;
+        }
+        foreach ($this->columnCasts as $col => $cast) {
+            if (array_key_exists($col, $row)) {
+                $row[$col] = $cast($row[$col]);
+            }
+        }
+
+        return $row;
     }
 
     private function openSheetReader(): StreamingSheetReader
