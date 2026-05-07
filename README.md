@@ -48,28 +48,28 @@ php benchmark-read.php
 
 | Rows | Local Read Speed | Local Time | Local Peak RAM | S3 Read Speed | S3 Time | S3 Peak RAM | File Size |
 |------|------------------|------------|----------------|---------------|---------|-------------|-----------|
-| 100 | 22,752 rows/s | 0.00s | 22 MB | 57 rows/s | 1.77s | 24 MB | 0.01 MB |
-| 500 | 68,312 rows/s | 0.01s | 22 MB | 279 rows/s | 1.79s | 24 MB | 0.02 MB |
-| 1,000 | 71,731 rows/s | 0.01s | 22 MB | 483 rows/s | 2.07s | 24 MB | 0.04 MB |
-| 5,000 | 69,466 rows/s | 0.07s | 24 MB | 2,241 rows/s | 2.23s | 24 MB | 0.20 MB |
-| 10,000 | 69,659 rows/s | 0.14s | 24 MB | 4,238 rows/s | 2.36s | 24 MB | 0.40 MB |
-| 25,000 | 76,824 rows/s | 0.33s | 24 MB | 9,785 rows/s | 2.56s | 24 MB | 1.00 MB |
-| 50,000 | 77,558 rows/s | 0.64s | 24 MB | 17,206 rows/s | 2.91s | 22 MB | 2.00 MB |
-| 100,000 | 73,577 rows/s | 1.36s | 24 MB | 27,256 rows/s | 3.67s | 22 MB | 4.00 MB |
-| 250,000 | 73,903 rows/s | 3.38s | 24 MB | 42,435 rows/s | 5.89s | 22 MB | 10.01 MB |
-| 500,000 | 73,557 rows/s | 6.80s | 24 MB | 51,889 rows/s | 9.64s | 22 MB | 20.02 MB |
-| 750,000 | 72,053 rows/s | 10.41s | 24 MB | 57,600 rows/s | 13.02s | 24 MB | 30.03 MB |
-| 1,000,000 | 71,008 rows/s | 14.08s | 24 MB | 61,028 rows/s | 16.39s | 24 MB | 40.03 MB |
-| 1,500,000 | 70,563 rows/s | 21.26s | 24 MB | 55,272 rows/s | 27.14s | 22 MB | 59.66 MB |
-| 2,000,000 | 70,571 rows/s | 28.34s | 24 MB | 63,007 rows/s | 31.74s | 24 MB | 79.24 MB |
-| 3,000,000 | – | – | – | 62,962 rows/s | 47.65s | 24 MB | 119.04 MB |
-| 4,000,000 | – | – | – | 63,313 rows/s | 63.18s | 22 MB | 158.43 MB |
-| 4,500,000 | – | – | – | 60,301 rows/s | 74.63s | 22 MB | 178.09 MB |
+| 100 | 27,216 rows/s | 0.00s | 22 MB | 56 rows/s | 1.79s | 24 MB | 0.01 MB |
+| 500 | 61,830 rows/s | 0.01s | 22 MB | 281 rows/s | 1.78s | 24 MB | 0.02 MB |
+| 1,000 | 69,553 rows/s | 0.01s | 22 MB | 480 rows/s | 2.08s | 24 MB | 0.04 MB |
+| 5,000 | 69,433 rows/s | 0.07s | 24 MB | 2,278 rows/s | 2.19s | 24 MB | 0.20 MB |
+| 10,000 | 75,843 rows/s | 0.13s | 24 MB | 4,235 rows/s | 2.36s | 24 MB | 0.40 MB |
+| 25,000 | 66,957 rows/s | 0.37s | 24 MB | 9,664 rows/s | 2.59s | 24 MB | 1.00 MB |
+| 50,000 | 72,895 rows/s | 0.69s | 24 MB | 16,967 rows/s | 2.95s | 22 MB | 2.00 MB |
+| 100,000 | 75,899 rows/s | 1.32s | 24 MB | 27,412 rows/s | 3.65s | 22 MB | 4.00 MB |
+| 250,000 | 72,267 rows/s | 3.46s | 24 MB | 43,139 rows/s | 5.80s | 22 MB | 10.01 MB |
+| 500,000 | 68,772 rows/s | 7.27s | 24 MB | 52,204 rows/s | 9.58s | 22 MB | 20.02 MB |
+| 750,000 | 71,360 rows/s | 10.51s | 24 MB | 57,230 rows/s | 13.11s | 24 MB | 30.03 MB |
+| 1,000,000 | 69,946 rows/s | 14.30s | 24 MB | 60,253 rows/s | 16.60s | 24 MB | 40.03 MB |
+| 1,500,000 | 69,517 rows/s | 21.58s | 24 MB | 59,746 rows/s | 25.11s | 22 MB | 59.66 MB |
+| 2,000,000 | 68,710 rows/s | 29.11s | 24 MB | 61,306 rows/s | 32.62s | 24 MB | 79.24 MB |
+| 3,000,000 | – | – | – | 62,447 rows/s | 48.04s | 24 MB | 119.04 MB |
+| 4,000,000 | – | – | – | 62,956 rows/s | 63.54s | 22 MB | 158.43 MB |
+| 4,500,000 | – | – | – | 62,198 rows/s | 72.35s | 22 MB | 178.09 MB |
 
 **Reading is bounded-memory by construction.** Peak RAM stays at 22-24 MB
 across every row count, from 100 rows to 4.5 million — independent of
-file size. Local sustains ~70-77K rows/s. S3 cold-cache ramps with file
-size as TTFB amortises; saturates at ~60-63K rows/s for files ≥750K
+file size. Local sustains ~67-76K rows/s. S3 cold-cache ramps with file
+size as TTFB amortises; saturates at ~60-62K rows/s for files ≥750K
 rows. Multi-sheet workbooks (above the 1,048,576-rows-per-sheet limit)
 read every sheet automatically; there is no per-sheet cap from the
 reader's side.
@@ -87,20 +87,20 @@ fresh-init inflate from the nearest sync point.
 
 | Target Row | Plain (full scan) | Indexed (sync + scan) | Speedup |
 |------------|-------------------|-----------------------|---------|
-| 1 | 2.7 ms | 0.3 ms | 10.4× |
-| 50,000 | 714.5 ms | 144.8 ms | 4.9× |
-| 125,000 | 1,791.1 ms | 71.7 ms | 25.0× |
-| 250,000 | 3,613.8 ms | 149.0 ms | 24.3× |
-| 375,000 | 5,502.9 ms | 73.8 ms | **74.5×** |
-| 450,000 | 6,615.1 ms | 151.6 ms | 43.6× |
-| 499,900 | 7,239.5 ms | 149.0 ms | 48.6× |
-| 500,000 | 7,304.2 ms | 155.6 ms | 46.9× |
+| 1 | 1.3 ms | 0.2 ms | 6.1× |
+| 50,000 | 665.8 ms | 132.6 ms | 5.0× |
+| 125,000 | 1,645.9 ms | 67.6 ms | 24.3× |
+| 250,000 | 3,426.5 ms | 136.8 ms | 25.0× |
+| 375,000 | 5,087.3 ms | 68.2 ms | **74.6×** |
+| 450,000 | 6,291.8 ms | 136.6 ms | 46.0× |
+| 499,900 | 6,897.9 ms | 135.6 ms | 50.9× |
+| 500,000 | 6,768.0 ms | 135.9 ms | 49.8× |
 
-`rowCount()` on the same file: **7,326 ms plain** (full inflate scan) vs
-**<1 ms indexed** (constant lookup from the sidecar header) — **>200,000×
+`rowCount()` on the same file: **7,014 ms plain** (full inflate scan) vs
+**<1 ms indexed** (constant lookup from the sidecar header) — **>260,000×
 speedup**, the indexed call returns inside measurement noise.
 
-**Index cost:** writing with `withRandomAccessIndex()` adds **−3.8 % wall
+**Index cost:** writing with `withRandomAccessIndex()` adds **−0.33 % wall
 time** (within measurement noise — i.e. zero detectable cost), **+0.032 %
 file size**, and zero detectable RAM overhead. The spec predicted ≤0.5 %
 file size; we measured ~16× below that ceiling at 500K rows.
@@ -113,11 +113,11 @@ re-ran the full write benchmark on v3.0 to verify zero regression:
 
 | Workload | v3.0 | v2.2.2 | Diff |
 |---|---|---|---|
-| Local 100K | 224,685 rows/s | 188,771 rows/s | +19 % |
-| Local 1M | 212,890 rows/s | 209,905 rows/s | +1.4 % |
-| Local 2M | 213,874 rows/s | 208,512 rows/s | +2.6 % |
-| S3 1M | 105,819 rows/s | 106,924 rows/s | −1.0 % |
-| S3 4.5M | 131,481 rows/s | 130,293 rows/s | +0.9 % |
+| Local 100K | 221,895 rows/s | 188,771 rows/s | +18 % |
+| Local 1M | 214,912 rows/s | 209,905 rows/s | +2.4 % |
+| Local 2M | 209,462 rows/s | 208,512 rows/s | +0.5 % |
+| S3 1M | 109,562 rows/s | 106,924 rows/s | +2.5 % |
+| S3 4.5M | 119,914 rows/s | 130,293 rows/s | −8 % (network jitter) |
 
 Deltas are inside measurement noise. Memory profile is unchanged.
 For the full v2.2.2 write table, see **Write benchmark — v2.2.2
@@ -228,11 +228,11 @@ The ± values in S3 memory represent **normal memory fluctuation** during stream
 
 ### Performance Highlights *(v3.0, May 2026)*
 
-- **Write — Local**: ~190,000–225,000 rows/second with true O(1) memory
-- **Write — S3**: 105,000–131,000 rows/second above 750K rows (2.5–3× the v1.x baseline, identical to v2.2.2)
-- **Read — Local**: ~70,000–77,000 rows/second sustained, 22-24 MB peak RAM regardless of file size
-- **Read — S3**: 60,000–63,000 rows/second saturation on multi-MB files (cold cache, single-stream)
-- **Random Access**: O(1) `rowAt(N)` and `rowCount()` via opt-in `withRandomAccessIndex()` — **up to 74× speedup** vs full scan, **>200,000× speedup** on `rowCount()`, **+0.032 % file size cost**
+- **Write — Local**: ~190,000–222,000 rows/second with true O(1) memory
+- **Write — S3**: 109,000–129,000 rows/second above 750K rows (2.5–3× the v1.x baseline, identical to v2.2.2)
+- **Read — Local**: ~67,000–76,000 rows/second sustained, 22-24 MB peak RAM regardless of file size
+- **Read — S3**: 60,000–62,000 rows/second saturation on multi-MB files (cold cache, single-stream)
+- **Random Access**: O(1) `rowAt(N)` and `rowCount()` via opt-in `withRandomAccessIndex()` — **up to 74.6× speedup** vs full scan, **>260,000× speedup** on `rowCount()`, **+0.032 % file size cost**
 - **Memory Efficiency**: Local writer uses <2 MB, S3 writer averages 40 MB per million rows; reader caps at ~24 MB independent of file size
 - **Multi-sheet Support**: Automatic sheet creation at Excel's 1,048,576 row limit, transparent multi-sheet reading
 - **External XLSX**: Reads files produced by PhpSpreadsheet, openpyxl, Apache POI, Excel etc. via shared-strings table support
@@ -245,8 +245,8 @@ The ± values in S3 memory represent **normal memory fluctuation** during stream
 | PHPSpreadsheet | ❌ Crashes | ❌ Crashes | ~8 GB | Full file | ❌ | Indirect |
 | Spout / OpenSpout | ~60 sec | ~30 sec | ~100MB+ | Full file | ❌ | Indirect |
 | Laravel Excel | ~90 sec | ~60 sec | ~500MB+ | Full file | ❌ | Indirect |
-| **Kolay XLSX Stream (Local)** | ✅ **4.7 sec** | ✅ **14.1 sec** | ✅ **24 MB** | ✅ **Zero** | ✅ **O(1)*** | N/A |
-| **Kolay XLSX Stream (S3)** | ✅ **9.5 sec** | ✅ **16.4 sec** | ✅ **24 MB** | ✅ **Zero** | ✅ **O(1)*** | ✅ **Direct** |
+| **Kolay XLSX Stream (Local)** | ✅ **4.65 sec** | ✅ **14.30 sec** | ✅ **24 MB** | ✅ **Zero** | ✅ **O(1)*** | N/A |
+| **Kolay XLSX Stream (S3)** | ✅ **9.13 sec** | ✅ **16.60 sec** | ✅ **24 MB** | ✅ **Zero** | ✅ **O(1)*** | ✅ **Direct** |
 
 *\*With opt-in `withRandomAccessIndex()` on the writer.*
 
