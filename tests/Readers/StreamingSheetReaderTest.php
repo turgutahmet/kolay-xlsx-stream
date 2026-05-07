@@ -2,6 +2,8 @@
 
 namespace Kolay\XlsxStream\Tests\Readers;
 
+use Kolay\XlsxStream\Contracts\Source;
+use Kolay\XlsxStream\Exceptions\XlsxReadException;
 use Kolay\XlsxStream\Readers\StreamingSheetReader;
 use Kolay\XlsxStream\Readers\ZipDirectory;
 use Kolay\XlsxStream\Sinks\FileSink;
@@ -247,6 +249,49 @@ class StreamingSheetReaderTest extends TestCase
         $this->assertSame(5, $count);
     }
 
+    public function test_recovers_after_50_consecutive_empty_reads(): void
+    {
+        $writer = new SinkableXlsxWriter(new FileSink($this->testFile));
+        $writer->startFile(['id', 'name']);
+        for ($i = 1; $i <= 50; $i++) {
+            $writer->writeRow([$i, "row-{$i}"]);
+        }
+        $writer->finishFile();
+
+        // 50 stalled reads at 10ms backoff = ~500ms, then recovers
+        $source = new StallingSource(new LocalFileSource($this->testFile), emptyReadsBefore: 50);
+        $cd = ZipDirectory::fromSource($source);
+        $reader = new StreamingSheetReader($source, $cd);
+
+        $rows = [];
+        foreach ($reader->rows() as $row) {
+            $rows[] = $row;
+        }
+
+        $this->assertCount(51, $rows);
+        $this->assertSame(['id', 'name'], $rows[0]);
+        $this->assertSame(['50', 'row-50'], $rows[50]);
+    }
+
+    public function test_throws_after_100_consecutive_empty_reads(): void
+    {
+        $writer = new SinkableXlsxWriter(new FileSink($this->testFile));
+        $writer->startFile(['id']);
+        $writer->writeRow([1]);
+        $writer->finishFile();
+
+        $source = new StallingSource(new LocalFileSource($this->testFile), emptyReadsBefore: 200);
+        $cd = ZipDirectory::fromSource($source);
+        $reader = new StreamingSheetReader($source, $cd);
+
+        $this->expectException(XlsxReadException::class);
+        $this->expectExceptionMessage('source stream stalled');
+
+        foreach ($reader->rows() as $_) {
+            $this->fail('should have thrown before yielding any row');
+        }
+    }
+
     /**
      * Helper: collect every row of a sheet into a flat array.
      *
@@ -265,4 +310,114 @@ class StreamingSheetReaderTest extends TestCase
 
         return $rows;
     }
+}
+
+/**
+ * Test fixture — wraps a real Source but injects N stalled reads at the
+ * start of streamFrom() to simulate slow-network conditions where
+ * fread() returns "" without feof() being true. Shared via a global
+ * stream wrapper because Source::streamFrom() must hand back a real
+ * resource that fread()/feof() can operate on.
+ */
+class StallingSource implements Source
+{
+    public function __construct(
+        private LocalFileSource $inner,
+        private int $emptyReadsBefore,
+    ) {}
+
+    public function size(): int
+    {
+        return $this->inner->size();
+    }
+
+    public function range(int $offset, int $length): string
+    {
+        return $this->inner->range($offset, $length);
+    }
+
+    public function streamFrom(int $offset)
+    {
+        // Buffer remaining bytes so the stalling wrapper can replay them
+        // after the empty-read streak. Fine for test fixtures.
+        $payload = $this->range($offset, $this->size() - $offset);
+        $url = StallingStreamWrapper::register($payload, $this->emptyReadsBefore);
+
+        return fopen($url, 'r');
+    }
+
+    public function close(): void
+    {
+        $this->inner->close();
+    }
+}
+
+/**
+ * User-space stream wrapper that returns "" for the first N reads (with
+ * feof() reporting false), then replays a buffered payload, then EOF.
+ * Used by StallingSource to drive StreamingSheetReader::rowsFromOffset
+ * down its empty-read backoff/abort path.
+ */
+class StallingStreamWrapper
+{
+    /** @var array<int, array{payload: string, empty_reads: int}> */
+    private static array $instances = [];
+
+    private static int $instanceCounter = 0;
+
+    public $context;
+
+    private string $payload = '';
+
+    private int $pos = 0;
+
+    private int $emptyReadsRemaining = 0;
+
+    public static function register(string $payload, int $emptyReads): string
+    {
+        if (! in_array('kxs-stall', stream_get_wrappers(), true)) {
+            stream_wrapper_register('kxs-stall', self::class);
+        }
+        $id = ++self::$instanceCounter;
+        self::$instances[$id] = ['payload' => $payload, 'empty_reads' => $emptyReads];
+
+        return "kxs-stall://{$id}";
+    }
+
+    public function stream_open(string $path, string $mode, int $options, ?string &$opened_path): bool
+    {
+        $id = (int) substr($path, strlen('kxs-stall://'));
+        if (! isset(self::$instances[$id])) {
+            return false;
+        }
+        $config = self::$instances[$id];
+        $this->payload = $config['payload'];
+        $this->emptyReadsRemaining = $config['empty_reads'];
+        unset(self::$instances[$id]);
+
+        return true;
+    }
+
+    public function stream_read(int $count): string
+    {
+        if ($this->emptyReadsRemaining > 0) {
+            $this->emptyReadsRemaining--;
+
+            return '';
+        }
+        if ($this->pos >= strlen($this->payload)) {
+            return '';
+        }
+        $chunk = substr($this->payload, $this->pos, $count);
+        $this->pos += strlen($chunk);
+
+        return $chunk;
+    }
+
+    public function stream_eof(): bool
+    {
+        return $this->emptyReadsRemaining === 0 && $this->pos >= strlen($this->payload);
+    }
+
+    public function stream_close(): void {}
 }

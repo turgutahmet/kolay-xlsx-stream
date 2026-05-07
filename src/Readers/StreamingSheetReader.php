@@ -96,6 +96,7 @@ class StreamingSheetReader
         $rowNumber = $startingRowNumber;
         $buffer = '';
         $finishedFlush = false;
+        $emptyReads = 0;
 
         try {
             while (true) {
@@ -108,11 +109,16 @@ class StreamingSheetReader
                     if ($n === 0) {
                         if (feof($stream)) {
                             $compRemaining = 0;
+                        } elseif (++$emptyReads >= 100) {
+                            throw XlsxReadException::sourceUnreadable(
+                                'source stream stalled — 100 consecutive empty reads with feof=false'
+                            );
                         } else {
-                            // Source is open but yielded no bytes; loop again.
+                            usleep(10_000); // 10ms backoff before retry
                             continue;
                         }
                     } else {
+                        $emptyReads = 0;
                         $compRemaining -= $n;
                         $flag = $compRemaining === 0 ? ZLIB_FINISH : ZLIB_NO_FLUSH;
                         if ($flag === ZLIB_FINISH) {
