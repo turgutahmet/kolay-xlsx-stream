@@ -41,6 +41,9 @@ class ZipDirectory
      */
     public array $entries = [];
 
+    /** @var array<string, int> */
+    private array $dataOffsetCache = [];
+
     /**
      * @return array{
      *     compressed_size: int,
@@ -156,11 +159,16 @@ class ZipDirectory
 
     /**
      * Returns the absolute byte offset where the entry's compressed data
-     * begins (just past the Local File Header). Reads 30 bytes from the
-     * source on each call; cache results if you need many lookups.
+     * begins (just past the Local File Header). Result is cached per
+     * entry name so repeated random-access reads only pay the 30-byte
+     * range fetch once.
      */
     public function dataOffset(Source $source, string $name): int
     {
+        if (isset($this->dataOffsetCache[$name])) {
+            return $this->dataOffsetCache[$name];
+        }
+
         $entry = $this->entry($name);
         if ($entry === null) {
             throw XlsxReadException::entryNotFound($name);
@@ -176,7 +184,8 @@ class ZipDirectory
             throw XlsxReadException::badLocalFileHeader($name);
         }
 
-        return $entry['offset'] + 30 + $lfh['fnameLen'] + $lfh['extraLen'];
+        return $this->dataOffsetCache[$name] =
+            $entry['offset'] + 30 + $lfh['fnameLen'] + $lfh['extraLen'];
     }
 
     /**

@@ -165,4 +165,75 @@ class ZipDirectoryTest extends TestCase
 
         $this->assertSame('0123456789', $tail);
     }
+
+    public function test_data_offset_is_cached_per_entry(): void
+    {
+        $writer = new SinkableXlsxWriter(new FileSink($this->testFile));
+        $writer->startFile(['x']);
+        $writer->writeRow(['y']);
+        $writer->finishFile();
+
+        $inner = new LocalFileSource($this->testFile);
+        $spy = new RangeCountingSource($inner);
+        $cd = ZipDirectory::fromSource($spy);
+
+        $spy->resetRangeCalls();
+
+        $first = $cd->dataOffset($spy, 'xl/worksheets/sheet1.xml');
+        $this->assertSame(1, $spy->lfhRangeCallCount(), 'first call must hit Source::range for the LFH');
+
+        $second = $cd->dataOffset($spy, 'xl/worksheets/sheet1.xml');
+        $this->assertSame($first, $second);
+        $this->assertSame(
+            1,
+            $spy->lfhRangeCallCount(),
+            'cached offset must be returned without a second LFH range fetch'
+        );
+    }
+}
+
+/**
+ * Counts the number of 30-byte range() calls (the Local File Header
+ * fetch path used by ZipDirectory::dataOffset). Other range sizes are
+ * passed through untouched so EOCD/CD parsing continues to work.
+ */
+class RangeCountingSource implements \Kolay\XlsxStream\Contracts\Source
+{
+    private int $lfhCalls = 0;
+
+    public function __construct(private LocalFileSource $inner) {}
+
+    public function size(): int
+    {
+        return $this->inner->size();
+    }
+
+    public function range(int $offset, int $length): string
+    {
+        if ($length === 30) {
+            $this->lfhCalls++;
+        }
+
+        return $this->inner->range($offset, $length);
+    }
+
+    public function streamFrom(int $offset)
+    {
+        return $this->inner->streamFrom($offset);
+    }
+
+    public function close(): void
+    {
+        $this->inner->close();
+    }
+
+    public function resetRangeCalls(): void
+    {
+        $this->lfhCalls = 0;
+    }
+
+    public function lfhRangeCallCount(): int
+    {
+        return $this->lfhCalls;
+    }
 }
