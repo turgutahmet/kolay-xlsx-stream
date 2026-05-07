@@ -5,6 +5,157 @@ All notable changes to `kolay/xlsx-stream` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.0] — 2026-05-06
+
+The package becomes **bidirectional**: a streaming reader is added
+alongside the existing writer, plus an opt-in random-access primitive
+that turns XLSX into the first PHP-readable spreadsheet format with
+O(1) row lookups. No breaking changes — every v2.x call site keeps
+working untouched.
+
+### Added — Streaming reader
+
+- **`StreamingXlsxReader`** (`src/Readers/StreamingXlsxReader.php`):
+  public facade for reading XLSX files. Factory methods:
+  - `StreamingXlsxReader::fromFile($path)` — local filesystem
+  - `StreamingXlsxReader::fromS3($s3, $bucket, $key)` — direct S3
+    streaming via Range GET, no temp file
+  - `StreamingXlsxReader::from(Source $source)` — bring your own source
+- API:
+  - `sheets()` — list all sheets in workbook order
+  - `onSheet($name)` / `onSheetIndex($i)` — switch active sheet
+  - `header()` — first row, cached
+  - `rows($skip = 0, $limit = null)` — Generator over rows
+  - `chunked($size, $skip = 0)` — Generator over fixed-size batches
+    (designed for bulk DB inserts — amortises round-trip cost)
+  - `rowCount()` — total rows; O(1) when an index sidecar is present,
+    O(N) full scan otherwise
+  - `rowAt(int $rowNumber)` — single row by 1-based row number; O(1)
+    indexed, O(N) plain
+  - `rowRange(int $from, int $to)` — Generator over inclusive row range
+- **Bounded memory by construction** — peak RAM stays at 22-24 MB for
+  every file size from 100 rows to 4.5 million. The reader never loads
+  more than the longest in-progress row XML plus a 256 KB working buffer.
+- **External XLSX support** — files written by PhpSpreadsheet, openpyxl,
+  Apache POI, Excel itself, etc. read correctly. Shared-strings tables
+  (`xl/sharedStrings.xml`) are loaded transparently when present.
+  Tables above 20 MB compressed surface a clear error rather than
+  silently consuming RAM (an on-disk variant is tracked for future).
+- **Zero indirection on self-written files** — files written by
+  `SinkableXlsxWriter` use inline strings exclusively, so the reader's
+  fast path skips the shared-strings load entirely. This is the
+  "born-bidirectional" round-trip pitch: write your data, read it back,
+  same package, ~24 MB RAM, file-size-independent.
+
+### Added — Random-access primitive
+
+- **Writer opt-in: `withRandomAccessIndex(int $every = 10000)`** on
+  `SinkableXlsxWriter` / `BaseXlsxWriter`. When enabled:
+  - Periodic `ZLIB_FULL_FLUSH` is injected at row-buffer boundaries so
+    the deflate stream gets byte-aligned `0x00 0x00 0xFF 0xFF` resume
+    markers a downstream reader can fresh-init inflation from
+    (no `inflatePrime()` needed — PHP's zlib doesn't expose it).
+  - On `finishFile()` an `xl/_kxs/index.bin` ZIP entry is emitted
+    listing each sync point's `(row_number, comp_offset, uncomp_offset)`
+    triple, plus per-sheet total row counts. CRC32-validated.
+  - The sidecar is OOXML-unreferenced — Excel, PhpSpreadsheet, OpenSpout,
+    LibreOffice ignore it and open the file as a normal XLSX. Backward
+    compatibility is total.
+- **Reader auto-detection** — `StreamingXlsxReader` looks for the
+  sidecar at construction; when present, `rowAt()`, `rowRange()` and
+  `rowCount()` use it for O(1) seeks. When absent, the same calls fall
+  back to a sequential scan with identical results.
+- **Cost** (measured against the v3.0 benchmarks at 500K rows, sync
+  period 10K):
+  - Wall time: **+1.0 %** (within measurement noise)
+  - File size: **+0.03 %** — 16× below the spec's 0.5 % ceiling
+  - RAM: zero detectable overhead
+- **Speedup**:
+  - `rowAt(N)` up to **74.5× faster** than full scan at row 375K
+  - `rowCount()` returns inside measurement noise vs **7.08 s** plain
+    scan (effectively unbounded speedup — single CRC-validated header
+    read)
+
+### Added — Reader & writer ergonomics
+
+- **`castColumn(int $col, string|callable $cast)` / `castColumns([])`** on
+  `StreamingXlsxReader`. Built-in casts: `date`, `datetime`, `int`,
+  `float`, `bool`. Pass a callable for custom transformations. Excel's
+  1900 leap-year quirk is handled internally. **Datetimes return UTC by
+  default** so the same file produces the same output on every server;
+  override with `castTimezone($tz)`. Mac-origin 1904 epoch supported via
+  `use1904Epoch()`.
+- **`PhpStreamSink`** (`src/Sinks/PhpStreamSink.php`) — write a workbook
+  directly to any PHP stream resource. Factories: `output()` for
+  `php://output` (HTTP response streaming), `temp()` for `php://temp`,
+  `memory()` for `php://memory`. Pairs with Laravel's `Response::stream()`
+  for zero-temp-file XLSX downloads.
+- **`setColumnFormat(int $col, int $builtinNumFmtId)` overload** —
+  accept Excel's reserved-range built-in numFmtIds (0-49). Constants
+  exposed on `BaseXlsxWriter`: `BUILTIN_NUMFMT_DATE`, `BUILTIN_NUMFMT_DATETIME`,
+  `BUILTIN_NUMFMT_CURRENCY`, etc. Built-in ids render with the reader's
+  locale (e.g. `dd.mm.yyyy` in tr-TR, `mm/dd/yyyy` in en-US) — useful
+  when the same export ships to users in multiple regions.
+- **`setAutoColumnWidth(sample: N, strict: false)`** — opt-in pass that
+  scans the first N data rows and derives per-column width from the
+  widest observed value. Catches columns where data is wider than the
+  header. Lenient mode (`strict: false`, default) catches any internal
+  failure, logs to `error_log`, and falls back to the heuristic — the
+  user's export ships as a valid file with reasonable widths instead of
+  HTTP 500. Strict mode propagates the exception (use during testing).
+- **Slow-network protection in `StreamingSheetReader`** — empty-read
+  retry counter with 10 ms backoff. After 100 consecutive empty reads
+  with `feof === false` the reader throws `XlsxReadException::sourceUnreadable`
+  rather than spinning indefinitely. Catches stalled S3/HTTP streams.
+- **`ZipDirectory::dataOffset()` caching** — repeated random-access
+  reads on the same entry now pay the 30-byte LFH range fetch only once.
+- **`StreamingXlsxReader::__destruct`** — cheap deterministic cleanup
+  for callers who don't explicitly call `close()`.
+
+### Added — Documentation & benchmarks
+
+- README hero refreshed: package described as bidirectional with
+  random-access support, "Latest Benchmark" section now leads with v3.0
+  read + random-access tables. v2.2.2 write benchmark moved down as
+  "Write benchmark — v2.2.2", numbers unchanged. v1.x baseline kept
+  for historical context.
+- Quick Start sections added for **Reading XLSX Files** and
+  **Random-Access Reading**, covering local + S3, header skipping,
+  chunked batches, the writer-side opt-in, and `rowAt`/`rowRange`/
+  `rowCount` usage.
+- Comparison-with-other-libraries table extended with a Read column,
+  Memory (Read) column, and Random Access column. Kolay XLSX Stream is
+  the only package on the list with native read + zero disk + O(1)
+  random access.
+- New canonical benchmark scripts:
+  - `benchmark-comprehensive.php` — write (existing, unchanged)
+  - `benchmark-read.php` — sequential read, local + S3 cold cache
+  - `benchmark-random-access.php` — `rowAt(N)` plain vs indexed, plus
+    `rowCount()` comparison
+- Test layout reorganized — `tests/Writers/` and `tests/Readers/`
+  mirror `src/Writers/` and `src/Readers/`. The shared `TestCase` base
+  stays at `tests/TestCase.php`. Existing v2.x writer tests moved into
+  `tests/Writers/` with no behavioural change.
+
+### Tests
+
+- 95 new tests across the reader suite (foundation, cell tokenizer,
+  streaming sheet reader, facade, multi-sheet resolver, shared strings,
+  external XLSX round-trip, random-access decoder, random-access read).
+- Test suite total: **194 tests, 485 assertions, all green**.
+- Memory profile across the entire reader+writer suite stays at 38 MB
+  peak — no inflation versus v2.2.2.
+
+### Compatibility
+
+- **No breaking changes.** Every public API from v2.x continues to
+  work. Files produced by the v2.x writer are read by the v3.0 reader
+  with zero overhead. Files produced by the v3.0 writer (without
+  `withRandomAccessIndex()`) are byte-identical to v2.2.2 output.
+- PHP 8.1+, Laravel 10/11/12/13 — same matrix as v2.2.2.
+- AWS SDK PHP `^3.300` — same as v2.x. Required only when using
+  `S3MultipartSink` (writer) or `StreamingXlsxReader::fromS3()` (reader).
+
 ## [2.2.2] — 2026-05-03
 
 ### Fixed
