@@ -98,6 +98,54 @@ class ExternalXlsxTest extends TestCase
         $this->assertSame(['second user', 'Pending', '200'], $rows[1]);
     }
 
+    public function test_50_row_phpspreadsheet_style_workbook_round_trips(): void
+    {
+        // Mirrors the layout PhpSpreadsheet / openpyxl produce by default:
+        // multi-column data, a small dedup'd shared-strings table holding
+        // header labels + the few repeated category strings, numeric cells
+        // for IDs and amounts. 50 data rows is a realistic minimum size
+        // for a "category report" export.
+        $sst = ['ID', 'Category', 'Status', 'Amount', 'Active', 'Pending', 'Closed'];
+
+        $rows = [];
+        // Header row — every cell points into the sst (PhpSpreadsheet's typical pattern)
+        $rows[] = [
+            ['t' => 's', 'v' => '0'], // ID
+            ['t' => 's', 'v' => '1'], // Category
+            ['t' => 's', 'v' => '2'], // Status
+            ['t' => 's', 'v' => '3'], // Amount
+        ];
+        // 50 data rows, status string deduped via sst, amount as numeric
+        $statuses = ['4', '5', '6']; // sst indexes for Active, Pending, Closed
+        for ($i = 1; $i <= 50; $i++) {
+            $rows[] = [
+                ['t' => 'n', 'v' => (string) $i],
+                ['t' => 'inlineStr', 'is' => "Category-{$i}"],
+                ['t' => 's', 'v' => $statuses[$i % 3]],
+                ['t' => 'n', 'v' => (string) ($i * 10.5)],
+            ];
+        }
+
+        $this->buildExternalXlsx(sharedStrings: $sst, sheetRows: $rows);
+
+        $reader = StreamingXlsxReader::fromFile($this->testFile);
+        $allRows = iterator_to_array($reader->rows(), false);
+
+        $this->assertCount(51, $allRows);
+        $this->assertSame(['ID', 'Category', 'Status', 'Amount'], $allRows[0]);
+
+        // First data row
+        $this->assertSame(['1', 'Category-1', 'Pending', '10.5'], $allRows[1]);
+        // Last data row — i=50, 50 % 3 = 2 → 'Closed'
+        $this->assertSame(['50', 'Category-50', 'Closed', '525'], $allRows[50]);
+
+        // Sample deduped statuses cycle Pending(1) → Closed(2) → Active(0)
+        $this->assertSame('Active', $allRows[3][2]);  // i=3, 3 % 3 = 0
+        $this->assertSame('Pending', $allRows[4][2]); // i=4, 4 % 3 = 1
+
+        $this->assertSame(50, $reader->rowCount() - 1);
+    }
+
     public function test_chunked_works_on_external_xlsx(): void
     {
         $sst = [];
