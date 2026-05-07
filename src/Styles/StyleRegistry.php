@@ -96,6 +96,24 @@ class StyleRegistry
     }
 
     /**
+     * Register a built-in numFmtId (0-49 reserved range) without
+     * synthesising a <numFmt> entry. Excel resolves the format code
+     * locale-aware on the reader side — `BUILTIN_NUMFMT_DATE = 14`
+     * shows mm-dd-yy in en-US, dd.mm.yyyy in tr-TR, etc.
+     */
+    public function registerBuiltinNumFmt(int $numFmtId): int
+    {
+        return $this->resolveCellXf([
+            'numFmtId' => $numFmtId,
+            'fontId' => 0,
+            'fillId' => 0,
+            'applyNumberFormat' => 1,
+            'applyFont' => 0,
+            'applyFill' => 0,
+        ]);
+    }
+
+    /**
      * Register a header style and return its cellXfs index.
      *
      * Options: bold (bool), color (#RRGGBB), fill (#RRGGBB), size (int),
