@@ -122,6 +122,7 @@ class StreamingXlsxReader
             if ($sheet['name'] === $name) {
                 $this->currentEntry = $sheet['entry'];
                 $this->cachedHeader = null;
+                $this->columnCasts = [];
 
                 return $this;
             }
@@ -137,6 +138,7 @@ class StreamingXlsxReader
         }
         $this->currentEntry = $this->sheets[$index]['entry'];
         $this->cachedHeader = null;
+        $this->columnCasts = [];
 
         return $this;
     }

@@ -232,6 +232,34 @@ class CastColumnTest extends TestCase
         $this->assertNull($rows[3][0]);
     }
 
+    public function test_onSheet_resets_column_casts(): void
+    {
+        // Multi-sheet workbook with different schemas per sheet. Casts
+        // configured for sheet 1 must NOT leak into sheet 2 — different
+        // columns mean different semantics. Workbook-wide settings
+        // (timezone, 1904 epoch) survive the switch.
+        $writer = new SinkableXlsxWriter(new FileSink($this->testFile));
+        $writer->startFile(['id', 'amount']);
+        $writer->writeRow([1, '99.5']);
+        $writer->newSheet('Notes', ['title', 'body']);
+        $writer->writeRow(['Alice', 'free-form text']);
+        $writer->finishFile();
+
+        $reader = StreamingXlsxReader::fromFile($this->testFile);
+
+        // Configure casts for sheet 1
+        $reader->onSheetIndex(0)->castColumns([0 => 'int', 1 => 'float']);
+        $sheet1 = iterator_to_array($reader->rows(skip: 1), false);
+        $this->assertSame(1, $sheet1[0][0]);
+        $this->assertSame(99.5, $sheet1[0][1]);
+
+        // Switch to Notes — cast on column 0 (now "title", a string)
+        // would corrupt the result if it leaked. Switching must reset.
+        $reader->onSheet('Notes');
+        $sheet2 = iterator_to_array($reader->rows(skip: 1), false);
+        $this->assertSame(['Alice', 'free-form text'], $sheet2[0]);
+    }
+
     public function test_castDate_handles_excel_max_date_boundary(): void
     {
         // 2958465 = 9999-12-31, the highest serial Excel renders as a
