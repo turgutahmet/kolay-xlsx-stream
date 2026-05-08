@@ -595,6 +595,23 @@ class StreamingXlsxReader
         }
 
         $sstXml = $this->cd->readEntry($this->source, 'xl/sharedStrings.xml');
+
+        // Defense-in-depth: the metadata guard above trusts the
+        // uncompressed_size value the ZIP central directory carries. A
+        // crafted archive can lie about that field to slip past the
+        // bound while the actual inflate balloons RAM. Once readEntry
+        // returns the real bytes, recheck before passing them to the
+        // parser — this catches forged metadata and keeps the parser's
+        // allocation profile predictable.
+        if (strlen($sstXml) > self::SST_UNCOMPRESSED_THRESHOLD) {
+            $actualMb = number_format(strlen($sstXml) / 1024 / 1024, 1);
+            $declaredMb = number_format($entry['uncompressed_size'] / 1024 / 1024, 1);
+            throw XlsxReadException::corruptCentralDirectory(
+                "xl/sharedStrings.xml inflated to {$actualMb} MB despite a {$declaredMb} MB ".
+                'declared size — ZIP metadata may be corrupt or forged.'
+            );
+        }
+
         $this->sst = SharedStringsParser::parseInMemory($sstXml);
         $this->sstResolved = true;
 

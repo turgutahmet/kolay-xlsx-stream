@@ -131,4 +131,36 @@ class CellTokenizerTest extends TestCase
         $this->assertSame([], CellTokenizer::tokenizeRow('<row r="1"/>'));
         $this->assertSame([], CellTokenizer::tokenizeRow('<row r="1"></row>'));
     }
+
+    public function test_columnLettersToIndex_accepts_excel_xfd_boundary(): void
+    {
+        // XFD = Excel's last column, index 16383 (0-indexed).
+        // The exact boundary must round-trip — no off-by-one rejection.
+        $this->assertSame(16383, CellTokenizer::columnLettersToIndex('XFD'));
+        $this->assertSame(0, CellTokenizer::columnLettersToIndex('A'));
+        $this->assertSame(25, CellTokenizer::columnLettersToIndex('Z'));
+        $this->assertSame(26, CellTokenizer::columnLettersToIndex('AA'));
+    }
+
+    public function test_columnLettersToIndex_rejects_indices_past_xfd(): void
+    {
+        // ZZZZZZ resolves to ~321 million columns. Without the guard the
+        // parser would allocate a dense row array of that size when it
+        // saw <c r="ZZZZZZ1"/> — the canonical memory-DoS surface this
+        // check closes.
+        $this->expectException(\Kolay\XlsxStream\Exceptions\XlsxReadException::class);
+        $this->expectExceptionMessageMatches('/past Excel.+XFD maximum/');
+        CellTokenizer::columnLettersToIndex('ZZZZZZ');
+    }
+
+    public function test_tokenize_rejects_row_with_out_of_range_cell_ref(): void
+    {
+        // End-to-end: malicious sheet bytes carrying a single <c r="..."/>
+        // beyond XFD. tokenizeRow propagates the columnLettersToIndex
+        // rejection so callers (StreamingSheetReader) get a clean
+        // exception instead of an OOM crash.
+        $row = '<row r="1"><c r="ZZZZZZ1" t="inlineStr"><is><t>x</t></is></c></row>';
+        $this->expectException(\Kolay\XlsxStream\Exceptions\XlsxReadException::class);
+        CellTokenizer::tokenizeRow($row);
+    }
 }

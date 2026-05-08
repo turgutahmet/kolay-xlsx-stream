@@ -60,6 +60,17 @@ class RandomAccessIndex
 
     public static function decode(string $payload): self
     {
+        // Sync points are encoded as uint64 (`P` format). On 32-bit PHP
+        // unpack silently truncates them into garbage offsets that
+        // would seek the inflater to wrong file positions and yield
+        // arbitrary rows. Loud rejection beats silent corruption.
+        if (PHP_INT_SIZE < 8) {
+            throw XlsxReadException::corruptCentralDirectory(
+                'random-access index requires 64-bit PHP — detected '.PHP_INT_SIZE.'-byte int. '.
+                'Upgrade PHP or use a 64-bit build.'
+            );
+        }
+
         if (strlen($payload) < self::HEADER_SIZE) {
             throw XlsxReadException::corruptCentralDirectory(
                 'random-access index too short to contain a header'

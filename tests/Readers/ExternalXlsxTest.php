@@ -229,6 +229,51 @@ class ExternalXlsxTest extends TestCase
         $this->assertSame(['2', 'Bob'], $rows[2]);
     }
 
+    public function test_sst_post_inflate_strlen_catches_forged_metadata(): void
+    {
+        // Defense-in-depth scenario: the ZIP central directory claims a
+        // small uncompressed_size for xl/sharedStrings.xml so the metadata
+        // guard passes, but the entry actually inflates to 110 MB. The
+        // post-inflate strlen() check must catch the lie before the
+        // parser allocates.
+        ini_set('memory_limit', '512M');
+
+        $sstXml = $this->buildHighRatioSstXml(targetUncompressedBytes: 110 * 1024 * 1024);
+        $actualUncompressed = strlen($sstXml);
+
+        $zip = new \ZipArchive();
+        $this->assertTrue($zip->open($this->testFile, \ZipArchive::CREATE | \ZipArchive::OVERWRITE) === true);
+        $zip->addFromString('[Content_Types].xml', $this->contentTypes());
+        $zip->addFromString('_rels/.rels', $this->packageRels());
+        $zip->addFromString('xl/workbook.xml', $this->workbookXml());
+        $zip->addFromString('xl/_rels/workbook.xml.rels', $this->workbookRels());
+        $zip->addFromString('xl/sharedStrings.xml', $sstXml);
+        $zip->addFromString('xl/worksheets/sheet1.xml', $this->buildSheetXml([[['t' => 's', 'v' => '0']]]));
+        $zip->close();
+        unset($sstXml);
+        gc_collect_cycles();
+
+        // Patch the CD entry's uncompressed_size field down to 1 MB —
+        // far below the actual 110 MB and well under the threshold so
+        // the metadata-trust path no longer rejects it.
+        $bytes = file_get_contents($this->testFile);
+        $bytes = $this->patchCdUncompressedSize($bytes, 'xl/sharedStrings.xml', 1024 * 1024);
+        file_put_contents($this->testFile, $bytes);
+        unset($bytes);
+
+        $reader = StreamingXlsxReader::fromFile($this->testFile);
+
+        $this->expectException(\Kolay\XlsxStream\Exceptions\XlsxReadException::class);
+        $this->expectExceptionMessageMatches('/inflated to .+ MB.+may be corrupt or forged/');
+
+        iterator_to_array($reader->rows());
+
+        // Sanity: confirm the fixture really did inflate large despite
+        // the patched declaration. Catches the test losing its premise
+        // if a future refactor changes the deflate ratio.
+        $this->assertGreaterThan(100 * 1024 * 1024, $actualUncompressed);
+    }
+
     public function test_reader_rejects_pathological_row_xml_exceeding_16mb(): void
     {
         // Synthetic worksheet: open a <row> tag and never close it,
@@ -417,6 +462,30 @@ class ExternalXlsxTest extends TestCase
         }
 
         return $letters;
+    }
+
+    /**
+     * Patch the uncompressed-size field (offset 24-27 of every CD
+     * entry) for the entry with the given name. Lets the test forge a
+     * mismatch between declared and actual inflated size so the
+     * post-inflate strlen guard can be exercised directly.
+     */
+    private function patchCdUncompressedSize(string $bytes, string $name, int $newSize): string
+    {
+        $signature = "PK\x01\x02";
+        $cursor = 0;
+        while (($pos = strpos($bytes, $signature, $cursor)) !== false) {
+            $fnameLen = unpack('v', substr($bytes, $pos + 28, 2))[1];
+            $extraLen = unpack('v', substr($bytes, $pos + 30, 2))[1];
+            $commentLen = unpack('v', substr($bytes, $pos + 32, 2))[1];
+            $entryName = substr($bytes, $pos + 46, $fnameLen);
+            if ($entryName === $name) {
+                return substr($bytes, 0, $pos + 24).pack('V', $newSize).substr($bytes, $pos + 28);
+            }
+            $cursor = $pos + 46 + $fnameLen + $extraLen + $commentLen;
+        }
+
+        throw new \RuntimeException("CD entry not found in patchCdUncompressedSize: {$name}");
     }
 
     /**

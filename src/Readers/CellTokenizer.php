@@ -2,6 +2,8 @@
 
 namespace Kolay\XlsxStream\Readers;
 
+use Kolay\XlsxStream\Exceptions\XlsxReadException;
+
 /**
  * @internal
  *
@@ -307,7 +309,21 @@ class CellTokenizer
     }
 
     /**
+     * Excel's hard maximum addressable column. The XFD reference
+     * resolves to column 16384 (1-indexed) — index 16383 (0-indexed).
+     * Cell references beyond this are spec violations and would push
+     * the dense row array allocation past any sensible bound.
+     */
+    public const MAX_COLUMN_INDEX = 16383;
+
+    /**
      * "A" => 0, "Z" => 25, "AA" => 26, "AB" => 27, ...
+     *
+     * Crafted cell refs like "ZZZZZZ1" resolve to ~12 million columns
+     * which would in turn drive parseRow() to allocate a dense array
+     * of that size — a memory DoS surface on adversarial input.
+     * Indices past Excel's XFD limit are rejected here so the parser
+     * never sees them.
      */
     public static function columnLettersToIndex(string $letters): int
     {
@@ -317,7 +333,16 @@ class CellTokenizer
             $n = $n * 26 + (ord($letters[$i]) - 64);
         }
 
-        return $n - 1;
+        $idx = $n - 1;
+
+        if ($idx > self::MAX_COLUMN_INDEX) {
+            throw XlsxReadException::corruptCentralDirectory(
+                "cell reference '{$letters}' resolves to column {$idx}, ".
+                'past Excel\'s XFD maximum (16383)'
+            );
+        }
+
+        return $idx;
     }
 
     private static function xmlDecode(string $s): string

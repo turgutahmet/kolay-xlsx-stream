@@ -24,7 +24,7 @@ Most PHP Excel libraries (PHPSpreadsheet, Spout, Laravel Excel) have critical li
 - **Zero Disk I/O**: Direct streaming to S3 using multipart upload
 - **Constant Memory**: O(1) memory for the writer (32 MB part buffer) and ~24 MB for the reader regardless of file size
 - **Bidirectional**: Write *and* read XLSX files through the same package — including files produced by other writers (PhpSpreadsheet, openpyxl, …) via shared-strings support
-- **Random Access**: Optional `xl/_kxs/index.bin` sidecar lets `rowAt(N)`, `rowRange(a, b)`, and `rowCount()` skip ahead in **O(1)** instead of full-scanning. Backward-compatible — Excel and every other reader ignore the sidecar. (Per-lookup work is bounded by the writer-chosen sync period, default 100 rows ≈ milliseconds; independent of file size.)
+- **Random Access**: Optional `xl/_kxs/index.bin` sidecar lets `rowAt(N)`, `rowRange(a, b)`, and `rowCount()` skip ahead in **O(1)** instead of full-scanning. Backward-compatible — Excel and every other reader ignore the sidecar. (Per-lookup work is bounded by the writer-chosen sync period, default 10,000 rows; independent of file size.)
 - **Blazing Fast**: 2-3× faster than alternatives on writes; ~70K rows/s sustained reads with constant RAM
 - **Production Tested**: Successfully exported and re-read 4.5 million rows (500MB+ files)
 
@@ -289,9 +289,11 @@ fine; level 9 only helps if you're storing the file long-term.
 | **Kolay XLSX Stream (S3)** | ✅ **9.13 sec** | ✅ **16.60 sec** | ✅ **24 MB** | ✅ **Zero** | ✅ **O(1)\*** | ✅ **Direct** |
 
 *\*With opt-in `withRandomAccessIndex()` on the writer. Per-lookup
-work is bounded by the writer-chosen sync period (default 100 rows
-≈ milliseconds), independent of file size. `rowCount()` is constant
-straight from the index header.*
+work is bounded by the writer-chosen sync period (default 10,000
+rows), independent of file size. `rowCount()` is constant straight
+from the index header. Tune for latency-sensitive seeks with
+`withRandomAccessIndex(every: 1000)` or `every: 100` for very dense
+random reads (file size grows ~1% per 10× density).*
 
 ### When to use this package vs alternatives
 
@@ -570,6 +572,12 @@ foreach ($reader->rowRange(100_000, 100_500) as $rowNumber => $row) {
 `rowAt()` and `rowRange()` work even on files **without** an index — they
 fall back to a sequential O(N) scan from the first row. Only the cost
 differs; the API contract is identical.
+
+> **Performance tip:** When you need many adjacent rows, prefer
+> `rowRange($from, $to)` over a loop of `rowAt()` calls. `rowRange()`
+> seeks once and reuses a single inflate stream; repeated `rowAt()`
+> re-seeks on every call. For 1000 nearby rows the difference is
+> ~1000× — a single ~ms seek versus 1000 × ms per call.
 
 ### Laravel Job Example
 
