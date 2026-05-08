@@ -232,6 +232,31 @@ class CastColumnTest extends TestCase
         $this->assertNull($rows[3][0]);
     }
 
+    public function test_header_returns_raw_strings_while_rows_apply_casts(): void
+    {
+        // The recommended pattern when using casts: call header() to
+        // grab column names cast-free, then iterate rows(skip: 1) for
+        // typed data. Pins the contract that header() never runs casts
+        // — otherwise a cast like 'int' would null out string headers
+        // like "id".
+        $writer = new SinkableXlsxWriter(new FileSink($this->testFile));
+        $writer->startFile(['id', 'amount']);
+        $writer->writeRow(['1', '99.5']);
+        $writer->writeRow(['2', '147.25']);
+        $writer->finishFile();
+
+        $reader = StreamingXlsxReader::fromFile($this->testFile);
+        $reader->castColumns([0 => 'int', 1 => 'float']);
+
+        $header = $reader->header();
+        $this->assertSame(['id', 'amount'], $header, 'header must come back as raw strings');
+
+        $dataRows = iterator_to_array($reader->rows(skip: 1), false);
+        $this->assertCount(2, $dataRows);
+        $this->assertSame([1, 99.5], $dataRows[0]);
+        $this->assertSame([2, 147.25], $dataRows[1]);
+    }
+
     public function test_onSheet_resets_column_casts(): void
     {
         // Multi-sheet workbook with different schemas per sheet. Casts

@@ -10,20 +10,30 @@ use Kolay\XlsxStream\Exceptions\XlsxReadException;
  *
  * Pipeline:
  *
- *     compressed bytes ──► inflate_add (chunked) ──► inflated buffer
- *                                                   │
- *                                                   ▼
- *                                          drain complete <row>...</row>
- *                                                   │
- *                                                   ▼
- *                                      CellTokenizer::tokenizeRow → yield
+ *     ZIP entry bytes ──► (inflate or pass-through) ──► inflated buffer
+ *                                                      │
+ *                                                      ▼
+ *                                             drain complete <row>...</row>
+ *                                                      │
+ *                                                      ▼
+ *                                         CellTokenizer::tokenizeRow → yield
+ *
+ * Compression methods supported:
+ *   - DEFLATE (method 8) — typical XLSX worksheet path
+ *   - STORED  (method 0) — raw uncompressed XML; some editors choose
+ *     this for very small worksheets so they don't pay deflate setup
+ *     cost on a few hundred bytes
  *
  * RAM is bounded: buffer holds at most one in-progress row plus a
- * compressed-chunk worth of inflated output (256 KB tunable). The
- * generator yields O(1) per row; callers control accumulation.
+ * read-chunk worth of bytes (64 KB compressed → up to ~256 KB inflated
+ * with default zlib settings). The generator yields O(1) per row;
+ * callers control accumulation.
  */
 class StreamingSheetReader
 {
+    private const METHOD_STORED = 0;
+    private const METHOD_DEFLATE = 8;
+
     private Source $source;
     private ZipDirectory $cd;
     private string $sheetEntry;
@@ -80,22 +90,36 @@ class StreamingSheetReader
             throw XlsxReadException::entryNotFound($this->sheetEntry);
         }
 
+        $method = $entry['method'];
+        if ($method !== self::METHOD_DEFLATE && $method !== self::METHOD_STORED) {
+            throw XlsxReadException::corruptCentralDirectory(
+                "worksheet '{$this->sheetEntry}' uses unsupported ZIP compression method {$method} ".
+                '(only STORED and DEFLATE are supported)'
+            );
+        }
+
         $dataOffset = $this->cd->dataOffset($this->source, $this->sheetEntry);
         $startOffset = $dataOffset + ($compOffset ?? 0);
         $compRemaining = $entry['compressed_size'] - ($compOffset ?? 0);
 
         $stream = $this->source->streamFrom($startOffset);
-        $inflate = inflate_init(ZLIB_ENCODING_RAW);
-        if ($inflate === false) {
-            if (is_resource($stream)) {
-                fclose($stream);
+
+        $inflate = null;
+        if ($method === self::METHOD_DEFLATE) {
+            $inflate = inflate_init(ZLIB_ENCODING_RAW);
+            if ($inflate === false) {
+                if (is_resource($stream)) {
+                    fclose($stream);
+                }
+                throw XlsxReadException::inflateFailed('inflate_init returned false');
             }
-            throw XlsxReadException::inflateFailed('inflate_init returned false');
         }
 
         $rowNumber = $startingRowNumber;
         $buffer = '';
-        $finishedFlush = false;
+        // STORED has no deflate state to flush — treat the FINISH step
+        // as already done so the loop exits cleanly when input runs out.
+        $finishedFlush = $method === self::METHOD_STORED;
         $emptyReads = 0;
 
         try {
@@ -120,13 +144,19 @@ class StreamingSheetReader
                     } else {
                         $emptyReads = 0;
                         $compRemaining -= $n;
-                        $flag = $compRemaining === 0 ? ZLIB_FINISH : ZLIB_NO_FLUSH;
-                        if ($flag === ZLIB_FINISH) {
-                            $finishedFlush = true;
-                        }
-                        $inflated = inflate_add($inflate, $compressed, $flag);
-                        if ($inflated === false) {
-                            throw XlsxReadException::inflateFailed('mid-stream inflate_add returned false');
+
+                        if ($method === self::METHOD_DEFLATE) {
+                            $flag = $compRemaining === 0 ? ZLIB_FINISH : ZLIB_NO_FLUSH;
+                            if ($flag === ZLIB_FINISH) {
+                                $finishedFlush = true;
+                            }
+                            $inflated = inflate_add($inflate, $compressed, $flag);
+                            if ($inflated === false) {
+                                throw XlsxReadException::inflateFailed('mid-stream inflate_add returned false');
+                            }
+                        } else {
+                            // STORED: raw bytes are the "inflated" output.
+                            $inflated = $compressed;
                         }
                     }
                 } elseif (! $finishedFlush) {

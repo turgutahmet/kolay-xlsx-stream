@@ -450,6 +450,12 @@ foreach ($reader->rows(skip: 1) as $row) {
 }
 ```
 
+> **Always use `rows(skip: 1)` with casts.** Casts run on every row
+> the generator yields, including row 1 (the header). A header
+> string like `"id"` cast as `'int'` returns `null` because
+> `is_numeric("id")` is false. Read the header separately via
+> `$reader->header()` (cast-free) and skip it on data iteration.
+
 > **Timezone:** Excel serials are timezone-naive. The reader returns
 > datetimes in **UTC by default** so the same file produces the same
 > result on every server regardless of `date_default_timezone_get()`.

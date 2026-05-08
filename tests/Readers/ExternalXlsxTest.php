@@ -146,6 +146,120 @@ class ExternalXlsxTest extends TestCase
         $this->assertSame(50, $reader->rowCount() - 1);
     }
 
+    public function test_sst_with_extreme_deflate_ratio_is_rejected_via_uncompressed_guard(): void
+    {
+        // Builds a synthetic XLSX whose xl/sharedStrings.xml fits well
+        // under the 20 MB compressed threshold but would inflate to
+        // ~110 MB — pathological deflate ratio that adversarial inputs
+        // (and some accidental exports) can produce. The new
+        // uncompressed-size guard must reject it before any inflation
+        // happens, preserving the bounded-RAM contract.
+        //
+        // Fixture creation needs ~250 MB transiently (raw sst string +
+        // ZipArchive deflate buffer). The bumped limit is left in place
+        // for the rest of the test process — restoring it would race
+        // with the still-allocated reader/zip data and itself fail.
+        // The follow-up ExternalXlsxTest cases don't need extra memory.
+        ini_set('memory_limit', '512M');
+
+        $sstXml = $this->buildHighRatioSstXml(targetUncompressedBytes: 110 * 1024 * 1024);
+
+        $zip = new \ZipArchive();
+        $this->assertTrue($zip->open($this->testFile, \ZipArchive::CREATE | \ZipArchive::OVERWRITE) === true);
+        $zip->addFromString('[Content_Types].xml', $this->contentTypes());
+        $zip->addFromString('_rels/.rels', $this->packageRels());
+        $zip->addFromString('xl/workbook.xml', $this->workbookXml());
+        $zip->addFromString('xl/_rels/workbook.xml.rels', $this->workbookRels());
+        $zip->addFromString('xl/sharedStrings.xml', $sstXml);
+        $zip->addFromString('xl/worksheets/sheet1.xml', $this->buildSheetXml([[['t' => 's', 'v' => '0']]]));
+        $zip->close();
+
+        unset($sstXml, $zip);
+        gc_collect_cycles();
+
+        // SST load is lazy — triggered the first time row data needs a
+        // shared-string lookup. fromFile() alone won't reach the guard.
+        $reader = StreamingXlsxReader::fromFile($this->testFile);
+
+        $this->expectException(\Kolay\XlsxStream\Exceptions\XlsxReadException::class);
+        $this->expectExceptionMessageMatches('/inflates to .+ MB/');
+
+        iterator_to_array($reader->rows());
+    }
+
+    public function test_reader_handles_stored_worksheet_method_zero(): void
+    {
+        // Some editors choose STORED (no compression) for very small
+        // worksheets to skip deflate setup cost. The reader must
+        // tokenize the raw XML directly instead of feeding it through
+        // inflate_add — which would otherwise produce garbage or an
+        // inflate error. This test pins parity with ZipDirectory's
+        // metadata-read path, which already supports both methods.
+        $sheetXml = '<?xml version="1.0" encoding="UTF-8"?>'.
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'.
+            '<sheetData>'.
+            '<row r="1"><c r="A1" t="inlineStr"><is><t>id</t></is></c><c r="B1" t="inlineStr"><is><t>name</t></is></c></row>'.
+            '<row r="2"><c r="A2" t="n"><v>1</v></c><c r="B2" t="inlineStr"><is><t>Alice</t></is></c></row>'.
+            '<row r="3"><c r="A3" t="n"><v>2</v></c><c r="B3" t="inlineStr"><is><t>Bob</t></is></c></row>'.
+            '</sheetData></worksheet>';
+
+        $zip = new \ZipArchive();
+        $this->assertTrue($zip->open($this->testFile, \ZipArchive::CREATE | \ZipArchive::OVERWRITE) === true);
+        $zip->addFromString('[Content_Types].xml', $this->contentTypesNoSst());
+        $zip->addFromString('_rels/.rels', $this->packageRels());
+        $zip->addFromString('xl/workbook.xml', $this->workbookXml());
+        $zip->addFromString('xl/_rels/workbook.xml.rels', $this->workbookRelsNoSst());
+        $zip->addFromString('xl/worksheets/sheet1.xml', $sheetXml);
+        $zip->setCompressionName('xl/worksheets/sheet1.xml', \ZipArchive::CM_STORE);
+        $zip->close();
+
+        // Verify CD actually carries STORED method — fixture invariant
+        $verify = new \ZipArchive();
+        $verify->open($this->testFile);
+        $stat = $verify->statName('xl/worksheets/sheet1.xml');
+        $verify->close();
+        $this->assertSame(\ZipArchive::CM_STORE, $stat['comp_method'], 'fixture must use STORED method');
+
+        $reader = StreamingXlsxReader::fromFile($this->testFile);
+        $rows = iterator_to_array($reader->rows(), false);
+
+        $this->assertCount(3, $rows);
+        $this->assertSame(['id', 'name'], $rows[0]);
+        $this->assertSame(['1', 'Alice'], $rows[1]);
+        $this->assertSame(['2', 'Bob'], $rows[2]);
+    }
+
+    public function test_reader_rejects_unsupported_compression_method(): void
+    {
+        // Synthesize a CD with an arbitrary unsupported method (e.g. 12 = BZIP2).
+        // ZipArchive only emits 0 and 8; we have to write the bytes by hand.
+        $stub = '<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'.
+            '<sheetData><row r="1"/></sheetData></worksheet>';
+
+        $zip = new \ZipArchive();
+        $zip->open($this->testFile, \ZipArchive::CREATE | \ZipArchive::OVERWRITE);
+        $zip->addFromString('[Content_Types].xml', $this->contentTypesNoSst());
+        $zip->addFromString('_rels/.rels', $this->packageRels());
+        $zip->addFromString('xl/workbook.xml', $this->workbookXml());
+        $zip->addFromString('xl/_rels/workbook.xml.rels', $this->workbookRelsNoSst());
+        $zip->addFromString('xl/worksheets/sheet1.xml', $stub);
+        $zip->close();
+
+        // Patch the central directory: change the compression method byte
+        // for the sheet entry from 8 (DEFLATE) to 12 (BZIP2). We don't
+        // need the ZIP to be inflatable — only the CD-time guard fires.
+        $bytes = file_get_contents($this->testFile);
+        $bytes = $this->patchCdMethod($bytes, 'xl/worksheets/sheet1.xml', 12);
+        file_put_contents($this->testFile, $bytes);
+
+        $reader = StreamingXlsxReader::fromFile($this->testFile);
+
+        $this->expectException(\Kolay\XlsxStream\Exceptions\XlsxReadException::class);
+        $this->expectExceptionMessageMatches('/unsupported ZIP compression method 12/');
+
+        iterator_to_array($reader->rows());
+    }
+
     public function test_chunked_works_on_external_xlsx(): void
     {
         $sst = [];
@@ -188,6 +302,28 @@ class ExternalXlsxTest extends TestCase
         $zip->addFromString('xl/worksheets/sheet1.xml', $this->buildSheetXml($sheetRows));
 
         $zip->close();
+    }
+
+    /**
+     * Stream-style construct a shared-strings XML whose uncompressed
+     * size approximates $targetUncompressedBytes, using a single
+     * repeated <si> entry. The output deflate-compresses to a tiny
+     * fraction of its raw size, exercising the threshold mismatch
+     * between the compressed and uncompressed sst guards.
+     */
+    private function buildHighRatioSstXml(int $targetUncompressedBytes): string
+    {
+        $header = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'.
+            '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">';
+        $entry = '<si><t>repeated content for deflate ratio testing</t></si>';
+        $footer = '</sst>';
+
+        $copies = (int) ceil(($targetUncompressedBytes - strlen($header) - strlen($footer)) / strlen($entry));
+        if ($copies < 1) {
+            $copies = 1;
+        }
+
+        return $header.str_repeat($entry, $copies).$footer;
     }
 
     /**
@@ -246,6 +382,54 @@ class ExternalXlsxTest extends TestCase
         }
 
         return $letters;
+    }
+
+    /**
+     * Patch the compression-method byte (offset 10-11 of every CD
+     * entry) for the entry with the given name. Used to fabricate
+     * archives carrying a method ZipArchive itself never emits — lets
+     * us exercise the reader's "unsupported method" rejection path
+     * without writing a full ZIP encoder.
+     */
+    private function patchCdMethod(string $bytes, string $name, int $newMethod): string
+    {
+        // Locate the CD entry signature for the named file.
+        $signature = "PK\x01\x02";
+        $cursor = 0;
+        while (($pos = strpos($bytes, $signature, $cursor)) !== false) {
+            $fnameLen = unpack('v', substr($bytes, $pos + 28, 2))[1];
+            $extraLen = unpack('v', substr($bytes, $pos + 30, 2))[1];
+            $commentLen = unpack('v', substr($bytes, $pos + 32, 2))[1];
+            $entryName = substr($bytes, $pos + 46, $fnameLen);
+            if ($entryName === $name) {
+                // Method field is at offset +10..+11 of the CD entry.
+                $patched = substr($bytes, 0, $pos + 10).pack('v', $newMethod).substr($bytes, $pos + 12);
+
+                return $patched;
+            }
+            $cursor = $pos + 46 + $fnameLen + $extraLen + $commentLen;
+        }
+
+        throw new \RuntimeException("CD entry not found in patchCdMethod: {$name}");
+    }
+
+    private function contentTypesNoSst(): string
+    {
+        return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'.
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'.
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'.
+            '<Default Extension="xml" ContentType="application/xml"/>'.
+            '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'.
+            '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'.
+            '</Types>';
+    }
+
+    private function workbookRelsNoSst(): string
+    {
+        return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'.
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'.
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'.
+            '</Relationships>';
     }
 
     private function contentTypes(): string

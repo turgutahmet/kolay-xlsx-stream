@@ -614,7 +614,18 @@ abstract class BaseXlsxWriter
     {
         foreach ($row as $i => $cell) {
             $col = $i + 1;
-            $len = mb_strlen((string) $cell);
+
+            // DateTime objects can't be cast to string and would crash a
+            // naive (string) coercion. buildRowXml renders them as Excel
+            // serial numbers — the user-visible width in Excel is bounded
+            // by "yyyy-mm-dd hh:mm:ss" (19 characters), so use that as a
+            // conservative upper bound without invoking the formatter.
+            if ($cell instanceof \DateTimeInterface) {
+                $len = 19;
+            } else {
+                $len = mb_strlen((string) $cell);
+            }
+
             if (! isset($this->autoWidthMaxLengths[$col]) || $len > $this->autoWidthMaxLengths[$col]) {
                 $this->autoWidthMaxLengths[$col] = $len;
             }

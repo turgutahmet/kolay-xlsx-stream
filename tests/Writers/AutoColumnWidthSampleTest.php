@@ -137,6 +137,35 @@ class AutoColumnWidthSampleTest extends TestCase
         $writer->setAutoColumnWidth(sample: -1);
     }
 
+    public function test_sample_mode_handles_datetime_cells_in_strict_mode(): void
+    {
+        // DateTime objects can't be coerced via (string) cast — a naive
+        // sample tracker would throw mid-write and, in strict mode,
+        // surface a cryptic Error to the caller. Sample tracking must
+        // mirror buildRowXml's instanceof DateTimeInterface treatment so
+        // a real-world workload (id + date column with sample mode on)
+        // round-trips cleanly under strict.
+        $writer = new SinkableXlsxWriter(new FileSink($this->testFile));
+        $writer->setAutoColumnWidth(sample: 5, strict: true);
+        $writer->startFile(['id', 'created_at']);
+        $writer->writeRow([1, new \DateTimeImmutable('2026-05-08 14:30:00', new \DateTimeZone('UTC'))]);
+        $writer->writeRow([2, new \DateTimeImmutable('2026-05-09 09:15:00', new \DateTimeZone('UTC'))]);
+        $writer->writeRow([3, new \DateTimeImmutable('2026-05-10 18:45:00', new \DateTimeZone('UTC'))]);
+        $writer->finishFile();
+
+        $bytes = file_get_contents($this->testFile);
+        $this->assertSame('PK', substr($bytes, 0, 2), 'must produce a valid ZIP under strict sample mode');
+
+        // The DateTime column's width should reflect the 19-char
+        // conservative bound, not collapse to the heuristic floor.
+        $cols = $this->extractColsXml();
+        $this->assertMatchesRegularExpression(
+            '/<col min="2" max="2" width="21"/',  // 19 chars + 2 padding
+            $cols,
+            'datetime column width should reflect "yyyy-mm-dd hh:mm:ss" envelope'
+        );
+    }
+
     public function test_strict_mode_propagates_internal_failure(): void
     {
         $writer = new class(new FileSink($this->testFile)) extends SinkableXlsxWriter

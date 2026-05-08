@@ -51,6 +51,16 @@ class StreamingXlsxReader
      */
     public const SST_RAM_THRESHOLD = 20 * 1024 * 1024;
 
+    /**
+     * Upper bound on the *uncompressed* shared-strings size we will
+     * inflate into RAM. Highly repetitive XML (a single repeated <si>
+     * entry, common in adversarial inputs and accidentally in some
+     * exports) compresses 50:1 or higher, so a 20 MB compressed payload
+     * can balloon to 1 GB+. This second guard keeps the bounded-RAM
+     * contract intact even when the deflate ratio is pathological.
+     */
+    public const SST_UNCOMPRESSED_THRESHOLD = 100 * 1024 * 1024;
+
     private Source $source;
     private ZipDirectory $cd;
 
@@ -551,6 +561,16 @@ class StreamingXlsxReader
             throw XlsxReadException::corruptCentralDirectory(
                 "xl/sharedStrings.xml is {$sizeMb} MB compressed — beyond the in-memory threshold ".
                 'this reader supports. On-disk shared-strings tables are not yet implemented.'
+            );
+        }
+
+        if ($entry['uncompressed_size'] > self::SST_UNCOMPRESSED_THRESHOLD) {
+            $uncMb = number_format($entry['uncompressed_size'] / 1024 / 1024, 1);
+            $compMb = number_format($entry['compressed_size'] / 1024 / 1024, 1);
+            throw XlsxReadException::corruptCentralDirectory(
+                "xl/sharedStrings.xml inflates to {$uncMb} MB ({$compMb} MB compressed) — ".
+                'beyond the in-memory threshold. Highly repetitive XML can have extreme deflate '.
+                'ratios; on-disk shared-strings tables are not yet implemented.'
             );
         }
 
