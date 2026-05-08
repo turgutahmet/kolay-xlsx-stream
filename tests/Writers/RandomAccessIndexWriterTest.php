@@ -209,9 +209,9 @@ class RandomAccessIndexWriterTest extends TestCase
                 iterator_to_array($readerB->rows(), false)
             );
 
-            // File size penalty stays under 1 % at this scale (the spec
-            // predicts +0.13 % for 4M rows; tiny files have proportionally
-            // higher overhead because of the fixed-cost header bytes).
+            // File size penalty stays under 1 % at this scale. Index
+            // overhead is dominated by the fixed-cost header bytes for
+            // small files; large files settle around +0.13 %.
             $sizePlain = filesize($plain);
             $sizeIndexed = filesize($indexed);
             $deltaPercent = ($sizeIndexed - $sizePlain) / $sizePlain * 100;
@@ -285,13 +285,13 @@ class RandomAccessIndexWriterTest extends TestCase
 
     public function test_indexed_xlsx_zip_structure_is_ooxml_compliant(): void
     {
-        // Pins ECMA-376 Part 2 §10.1.2.2: every package part must have a
-        // content type declared in [Content_Types].xml — either via a
-        // Default Extension mapping or an explicit Override. The random-
-        // access index sidecar (xl/_kxs/index.bin) uses the "bin"
-        // extension which has no Default mapping, so it MUST appear as
-        // an Override. Without this Excel's strict validator triggers
-        // repair mode on open even though every other part is valid.
+        // Every package part must have a content type declared in
+        // [Content_Types].xml — either via a Default Extension mapping or
+        // an explicit Override. The random-access index sidecar
+        // (xl/_kxs/index.bin) uses the "bin" extension which has no
+        // Default mapping, so it MUST appear as an Override. Without this
+        // Excel's strict validator triggers repair mode on open even
+        // though every other part is valid.
         $writer = new SinkableXlsxWriter(new FileSink($this->testFile));
         $writer->withRandomAccessIndex(every: 100);
         $writer->startFile(['id', 'name']);

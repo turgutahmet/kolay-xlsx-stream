@@ -102,8 +102,9 @@ speedup**, the indexed call returns inside measurement noise.
 
 **Index cost:** writing with `withRandomAccessIndex()` adds **−0.33 % wall
 time** (within measurement noise — i.e. zero detectable cost), **+0.032 %
-file size**, and zero detectable RAM overhead. The spec predicted ≤0.5 %
-file size; we measured ~16× below that ceiling at 500K rows.
+file size**, and zero detectable RAM overhead. The original design budget
+allowed up to 0.5 % file size; we measured ~16× below that ceiling at
+500K rows.
 
 #### Write benchmark — v3.0 vs v2.2.2
 

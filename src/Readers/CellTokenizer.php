@@ -9,8 +9,8 @@ namespace Kolay\XlsxStream\Readers;
  *
  * Why hand-written and not regex / expat:
  *   - regex with `.*?` non-greedy patterns has catastrophic backtracking
- *     potential on adversarial input — DoS surface we will not accept on
- *     a network-facing reader (§3.4 of the spec).
+ *     potential on adversarial input — DoS surface unacceptable on a
+ *     network-facing reader.
  *   - expat works but its push-callback model fights with the parser's
  *     overall row-boundary streaming structure. A 100-line state machine
  *     here is faster, simpler, and bounded by construction (every step
@@ -31,9 +31,9 @@ namespace Kolay\XlsxStream\Readers;
  *   <c r="A1" t="e"><v>#N/A</v></c>                   (error literal)
  *
  * Sparse rows: column position is taken from the r="A1" attribute, not
- * ordinal sibling order — the writer may skip a cell entirely (§17.3 of
- * the spec). Gaps are filled with '' so callers always see a dense row
- * up to the rightmost populated column.
+ * ordinal sibling order — a writer may skip a cell entirely. Gaps are
+ * filled with '' so callers always see a dense row up to the rightmost
+ * populated column.
  */
 class CellTokenizer
 {

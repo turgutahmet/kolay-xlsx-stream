@@ -8,7 +8,7 @@ use Kolay\XlsxStream\Exceptions\XlsxReadException;
 /**
  * Streams a single sheet's <row>...</row> sequence.
  *
- * Pipeline (§3.3 / §3.5 of the spec):
+ * Pipeline:
  *
  *     compressed bytes ──► inflate_add (chunked) ──► inflated buffer
  *                                                   │

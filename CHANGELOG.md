@@ -68,7 +68,7 @@ working untouched.
 - **Cost** (measured against the v3.0 benchmarks at 500K rows, sync
   period 10K):
   - Wall time: **+1.0 %** (within measurement noise)
-  - File size: **+0.03 %** — 16× below the spec's 0.5 % ceiling
+  - File size: **+0.03 %** — 16× below the 0.5 % design budget
   - RAM: zero detectable overhead
 - **Speedup**:
   - `rowAt(N)` up to **74.5× faster** than full scan at row 375K

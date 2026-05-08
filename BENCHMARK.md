@@ -114,7 +114,7 @@ The v3.0 writer's default code path is unchanged from v2.2.2 — the only writer
 
 ## 2. Read benchmark — new in v3.0
 
-`php benchmark-read.php`. For each row size, the script writes a temp XLSX (via the same writer used in §1) then reads it back through `StreamingXlsxReader::fromFile()` or `::fromS3()`. Multi-sheet workbooks (above the per-sheet 1,048,576 limit) are read in full across every sheet.
+`php benchmark-read.php`. For each row size, the script writes a temp XLSX (via the same writer used in Section 1) then reads it back through `StreamingXlsxReader::fromFile()` or `::fromS3()`. Multi-sheet workbooks (above the per-sheet 1,048,576 limit) are read in full across every sheet.
 
 ### 2.1 Wall time + throughput + memory
 
@@ -195,7 +195,7 @@ Numbers for OpenSpout / PhpSpreadsheet are characteristic ranges from public ben
 | File size | 20.02 MB | 20.03 MB | **+0.032 %** |
 | Sync points emitted | – | 50 | every 10,000 rows |
 
-Spec §13.3 / §16.6 predicted ≤0.5 % file-size penalty and ≤0.06 % wall-time penalty. Measured penalty is **16× below** the file-size ceiling and below the noise floor on wall time. **Indexing is essentially free at write time.**
+Original design predicted ≤0.5 % file-size penalty and ≤0.06 % wall-time penalty. Measured penalty is **16× below** the file-size ceiling and below the noise floor on wall time. **Indexing is essentially free at write time.**
 
 ### 3.2 Sequential read transparency
 
@@ -295,17 +295,17 @@ Identical to the v1.x and v2.2.2 baselines so cross-version comparisons stay cle
 - S3 numbers are cold-cache (fresh GET) for reads. Warm-cache reads land 30–50 % faster but are not part of the canonical methodology.
 - Multi-sheet workbooks (above 1,048,576 rows per sheet) read every sheet automatically. Throughput in that range reflects two or more sequential sheet streams.
 
-### Spec claims status
+### Design claims — empirical verification
 
-| Claim | Source | Empirical result |
-|---|---|---|
-| Bounded RAM independent of file size | spec §1 | 22–24 MB peak across 100–4.5M rows ✓ |
-| Strategy 0 fingerprint hits on all self-written files | spec §16.10 | confirmed across every fixture ✓ |
-| Indexed file size penalty ≤ 0.5 % | spec §16.6 | measured **+0.032 %** (16× under) ✓ |
-| Indexed wall-time penalty ≤ 0.06 % | spec §13.3 | measurement noise (−0.33 % in this run) ✓ |
-| `rowAt(N)` random access via Z_FULL_FLUSH + fresh inflate | spec §12.2 | confirmed, **74.6× speedup** at 75 % depth ✓ |
-| Sequential read transparency on indexed files | spec §17.1 | confirmed, identical row count and content ✓ |
-| Backward compat — vanilla XLSX readers ignore sidecar | spec §13.4 | confirmed structurally (`xl/_kxs/index.bin` not in `[Content_Types].xml`); cross-tool CI test tracked for tag-day |
+| Claim | Empirical result |
+|---|---|
+| Bounded RAM independent of file size | 22–24 MB peak across 100–4.5M rows ✓ |
+| Inline-string fast path on all self-written files | confirmed across every fixture ✓ |
+| Indexed file size penalty ≤ 0.5 % | measured **+0.032 %** (16× under) ✓ |
+| Indexed wall-time penalty ≤ 0.06 % | measurement noise (−0.33 % in this run) ✓ |
+| `rowAt(N)` random access via Z_FULL_FLUSH + fresh inflate | confirmed, **74.6× speedup** at 75 % depth ✓ |
+| Sequential read transparency on indexed files | confirmed, identical row count and content ✓ |
+| Backward compat — vanilla XLSX readers ignore sidecar | confirmed structurally (`xl/_kxs/index.bin` not in `[Content_Types].xml`); cross-tool CI roundtrip tracked for tag-day |
 
 ---
 

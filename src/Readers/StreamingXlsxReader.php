@@ -517,8 +517,7 @@ class StreamingXlsxReader
             $sizeMb = number_format($entry['compressed_size'] / 1024 / 1024, 1);
             throw XlsxReadException::corruptCentralDirectory(
                 "xl/sharedStrings.xml is {$sizeMb} MB compressed — beyond the in-memory threshold ".
-                'this reader supports. An on-disk variant for very large shared-strings tables '.
-                'is tracked for a future release.'
+                'this reader supports. On-disk shared-strings tables are not yet implemented.'
             );
         }
 
