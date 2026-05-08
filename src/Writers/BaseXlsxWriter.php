@@ -825,6 +825,7 @@ abstract class BaseXlsxWriter
             $sheetSections[] = [
                 'entry' => $entry,
                 'total_rows' => $sheet['rows'],
+                'sheet_crc32' => $sheet['crc32'] ?? 0,
                 'sync_points' => $this->indexSyncPoints[$entry] ?? [],
             ];
         }
@@ -1165,6 +1166,11 @@ abstract class BaseXlsxWriter
         ];
 
         $this->sheets[count($this->sheets) - 1]['rows'] = $this->currentSheetRow;
+        // Mirror the ZIP-CD CRC into the sheet record so the random-access
+        // index payload can pin the sheet content. Reader compares this
+        // with the live CD CRC at open time and silently invalidates the
+        // index when an external editor rewrote the sheet.
+        $this->sheets[count($this->sheets) - 1]['crc32'] = $this->sheetCrc;
     }
 
     /**

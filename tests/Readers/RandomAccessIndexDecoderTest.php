@@ -28,6 +28,7 @@ class RandomAccessIndexDecoderTest extends TestCase
         $payload = WriterIndex::encode(100, [[
             'entry' => 'xl/worksheets/sheet1.xml',
             'total_rows' => 1_001,
+            'sheet_crc32' => 0xDEADBEEF,
             'sync_points' => $points,
         ]]);
 
@@ -44,6 +45,7 @@ class RandomAccessIndexDecoderTest extends TestCase
         $payload = WriterIndex::encode(100, [[
             'entry' => 'xl/worksheets/sheet1.xml',
             'total_rows' => 1_002,
+            'sheet_crc32' => 0,
             'sync_points' => [
                 ['row' => 102, 'comp_offset' => 1_000, 'uncomp_offset' => 10_000],
                 ['row' => 502, 'comp_offset' => 5_000, 'uncomp_offset' => 50_000],
@@ -78,11 +80,13 @@ class RandomAccessIndexDecoderTest extends TestCase
             [
                 'entry' => 'xl/worksheets/sheet1.xml',
                 'total_rows' => 100,
+                'sheet_crc32' => 0,
                 'sync_points' => [['row' => 52, 'comp_offset' => 5, 'uncomp_offset' => 50]],
             ],
             [
                 'entry' => 'xl/worksheets/sheet2.xml',
                 'total_rows' => 200,
+                'sheet_crc32' => 0,
                 'sync_points' => [
                     ['row' => 52, 'comp_offset' => 6, 'uncomp_offset' => 60],
                     ['row' => 102, 'comp_offset' => 12, 'uncomp_offset' => 120],
@@ -103,6 +107,7 @@ class RandomAccessIndexDecoderTest extends TestCase
         $payload = WriterIndex::encode(10_000, [[
             'entry' => 'xl/worksheets/sheet1.xml',
             'total_rows' => 50, // shorter than sync period — no points emitted
+            'sheet_crc32' => 0,
             'sync_points' => [],
         ]]);
 
@@ -144,6 +149,7 @@ class RandomAccessIndexDecoderTest extends TestCase
         $payload = WriterIndex::encode(100, [[
             'entry' => 'xl/worksheets/sheet1.xml',
             'total_rows' => 10,
+            'sheet_crc32' => 0,
             'sync_points' => [],
         ]]);
 
@@ -160,6 +166,7 @@ class RandomAccessIndexDecoderTest extends TestCase
         $payload = WriterIndex::encode(100, [[
             'entry' => 'xl/worksheets/sheet1.xml',
             'total_rows' => 10,
+            'sheet_crc32' => 0,
             'sync_points' => [
                 ['row' => 1, 'comp_offset' => 0, 'uncomp_offset' => 0],
             ],

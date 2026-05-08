@@ -218,6 +218,35 @@ class CastColumnTest extends TestCase
         $this->assertArrayNotHasKey(5, $rows[1]);
     }
 
+    public function test_castDate_returns_null_for_negative_serial(): void
+    {
+        // Negative serial is meaningless for Excel dates. Common cause:
+        // an upstream tool exporting -1 / -100 from a numeric formula
+        // and labelling the column "date" anyway.
+        $this->writeNumericRows([-1, -100, -2958466]);
+        $reader = StreamingXlsxReader::fromFile($this->testFile)->castColumn(0, 'date');
+
+        $rows = iterator_to_array($reader->rows(), false);
+        $this->assertNull($rows[1][0]);
+        $this->assertNull($rows[2][0]);
+        $this->assertNull($rows[3][0]);
+    }
+
+    public function test_castDate_handles_excel_max_date_boundary(): void
+    {
+        // 2958465 = 9999-12-31, the highest serial Excel renders as a
+        // date. One above it is out of range — null guards callers
+        // against time travel into year 12345.
+        $this->writeNumericRows([2958465, 2958466, 1e10]);
+        $reader = StreamingXlsxReader::fromFile($this->testFile)->castColumn(0, 'date');
+
+        $rows = iterator_to_array($reader->rows(), false);
+        $this->assertInstanceOf(\DateTimeImmutable::class, $rows[1][0]);
+        $this->assertSame('9999-12-31', $rows[1][0]->format('Y-m-d'));
+        $this->assertNull($rows[2][0]);
+        $this->assertNull($rows[3][0]);
+    }
+
     /**
      * Helper: write a single-column XLSX where each row has one numeric value.
      *

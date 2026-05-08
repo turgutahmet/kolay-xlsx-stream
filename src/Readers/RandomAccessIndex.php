@@ -24,7 +24,7 @@ use Kolay\XlsxStream\Exceptions\XlsxReadException;
 class RandomAccessIndex
 {
     public const MAGIC = "KXSI";
-    public const VERSION = 1;
+    public const VERSION = 2;
     public const ENTRY_PATH = 'xl/_kxs/index.bin';
 
     private const HEADER_SIZE = 16;
@@ -34,13 +34,17 @@ class RandomAccessIndex
     /** @var array<string, int> entry path => total rows */
     private array $totalRowsByEntry = [];
 
+    /** @var array<string, int> entry path => sheet content CRC32 */
+    private array $sheetCrc32ByEntry = [];
+
     /** @var array<string, list<array{row: int, comp_offset: int, uncomp_offset: int}>> */
     private array $syncPointsByEntry = [];
 
-    private function __construct(int $syncPeriod, array $totals, array $syncs)
+    private function __construct(int $syncPeriod, array $totals, array $crcs, array $syncs)
     {
         $this->syncPeriod = $syncPeriod;
         $this->totalRowsByEntry = $totals;
+        $this->sheetCrc32ByEntry = $crcs;
         $this->syncPointsByEntry = $syncs;
     }
 
@@ -77,6 +81,7 @@ class RandomAccessIndex
         }
 
         $totals = [];
+        $crcs = [];
         $syncs = [];
         $cursor = 0;
         $bodyLen = strlen($body);
@@ -88,13 +93,15 @@ class RandomAccessIndex
             $pathLen = unpack('v', substr($body, $cursor, 2))[1];
             $cursor += 2;
 
-            if ($cursor + $pathLen + 8 > $bodyLen) {
+            if ($cursor + $pathLen + 12 > $bodyLen) {
                 throw XlsxReadException::corruptCentralDirectory('truncated sheet section payload');
             }
             $entry = substr($body, $cursor, $pathLen);
             $cursor += $pathLen;
 
             $totalRows = unpack('V', substr($body, $cursor, 4))[1];
+            $cursor += 4;
+            $sheetCrc32 = unpack('V', substr($body, $cursor, 4))[1];
             $cursor += 4;
             $syncCount = unpack('V', substr($body, $cursor, 4))[1];
             $cursor += 4;
@@ -116,10 +123,23 @@ class RandomAccessIndex
             }
 
             $totals[$entry] = $totalRows;
+            $crcs[$entry] = $sheetCrc32;
             $syncs[$entry] = $points;
         }
 
-        return new self($syncPeriod, $totals, $syncs);
+        return new self($syncPeriod, $totals, $crcs, $syncs);
+    }
+
+    /**
+     * Sheet content CRC32 captured at write time. Reader compares this
+     * against the live ZIP CD CRC for the same entry; mismatch means the
+     * sheet was rewritten by a tool that didn't update the sidecar
+     * (typical Excel/LibreOffice save), so the sidecar is stale and must
+     * not be trusted for random access.
+     */
+    public function sheetCrc32(string $sheetEntry): ?int
+    {
+        return $this->sheetCrc32ByEntry[$sheetEntry] ?? null;
     }
 
     public function syncPeriod(): int

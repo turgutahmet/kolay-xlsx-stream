@@ -27,7 +27,7 @@ class RandomAccessIndexTest extends TestCase
         $payloadCrc = unpack('V', substr($payload, 12, 4))[1];
 
         $this->assertSame('KXSI', $magic);
-        $this->assertSame(1, $version);
+        $this->assertSame(2, $version);
         $this->assertSame(0, $flags);
         $this->assertSame(1, $sheetCount);
         $this->assertSame(10000, $syncPeriod);
@@ -51,11 +51,14 @@ class RandomAccessIndexTest extends TestCase
         $cursor += $pathLen;
         $totalRows = unpack('V', substr($body, $cursor, 4))[1];
         $cursor += 4;
+        $sheetCrc32 = unpack('V', substr($body, $cursor, 4))[1];
+        $cursor += 4;
         $syncCount = unpack('V', substr($body, $cursor, 4))[1];
         $cursor += 4;
 
         $this->assertSame('xl/worksheets/sheet1.xml', $path);
         $this->assertSame(50, $totalRows);
+        $this->assertSame(0, $sheetCrc32);
         $this->assertSame(0, $syncCount);
         $this->assertSame(strlen($body), $cursor);
     }
@@ -75,7 +78,7 @@ class RandomAccessIndexTest extends TestCase
         // Walk to the sync points block.
         $body = substr($payload, 16);
         $pathLen = unpack('v', substr($body, 0, 2))[1];
-        $offset = 2 + $pathLen + 4 + 4; // path + total_rows + sync_count
+        $offset = 2 + $pathLen + 4 + 4 + 4; // path + total_rows + sheet_crc32 + sync_count
 
         $decoded = [];
         for ($i = 0; $i < count($points); $i++) {
@@ -110,7 +113,7 @@ class RandomAccessIndexTest extends TestCase
             $pathLen = unpack('v', substr($body, $cursor, 2))[1];
             $cursor += 2;
             $names[] = substr($body, $cursor, $pathLen);
-            $cursor += $pathLen + 4; // skip total_rows
+            $cursor += $pathLen + 4 + 4; // skip total_rows + sheet_crc32
             $syncCount = unpack('V', substr($body, $cursor, 4))[1];
             $cursor += 4 + 24 * $syncCount;
         }
@@ -146,11 +149,12 @@ class RandomAccessIndexTest extends TestCase
     /**
      * @param  list<array{row: int, comp_offset: int, uncomp_offset: int}>  $points
      */
-    private function sheetSection(string $entry, int $totalRows, array $points): array
+    private function sheetSection(string $entry, int $totalRows, array $points, int $sheetCrc32 = 0): array
     {
         return [
             'entry' => $entry,
             'total_rows' => $totalRows,
+            'sheet_crc32' => $sheetCrc32,
             'sync_points' => $points,
         ];
     }

@@ -424,6 +424,17 @@ class StreamingXlsxReader
         }
         $serial = (float) $serial;
 
+        // Sanity bound: Excel's date range is roughly [0, 2958465] —
+        // serial 0 is 1899-12-30, 2958465 is 9999-12-31. Values outside
+        // this band almost always indicate a parse error in the source
+        // (empty cell read as 0 by an upstream tool, integer ID column
+        // mistakenly cast as a date, etc.). Returning null lets callers
+        // detect the bad data instead of silently surfacing a date in
+        // the year 12345 or before the Gregorian reform.
+        if ($serial < 0 || $serial > 2958465) {
+            return null;
+        }
+
         // Canonical formula: ts = epoch + serial * 86400, with anchor
         // 1899-12-30 (1900 mode) or 1904-01-01 (Mac mode). The 1900
         // leap-year quirk is *already encoded* in the serial values
@@ -489,8 +500,28 @@ class StreamingXlsxReader
         }
 
         $payload = $this->cd->readEntry($this->source, RandomAccessIndex::ENTRY_PATH);
+        $index = RandomAccessIndex::decode($payload);
 
-        return $this->randomAccessIndex = RandomAccessIndex::decode($payload);
+        // Stale-index detection: if the workbook was rewritten by Excel
+        // or another OOXML editor between our write and this read, the
+        // sheet bytes have changed and the cached comp_offset values now
+        // point at arbitrary positions in the new deflate stream. The
+        // ZIP CD already carries the live sheet CRC32 — comparing it
+        // with the value the writer captured into the sidecar catches
+        // the divergence with an O(1) lookup. Mismatch silently falls
+        // back to a non-indexed scan rather than yielding garbage rows.
+        foreach ($this->sheets as $sheet) {
+            $expected = $index->sheetCrc32($sheet['entry']);
+            if ($expected === null) {
+                continue;
+            }
+            $cdEntry = $this->cd->entry($sheet['entry']);
+            if ($cdEntry === null || $cdEntry['crc32'] !== $expected) {
+                return $this->randomAccessIndex = null;
+            }
+        }
+
+        return $this->randomAccessIndex = $index;
     }
 
     /**

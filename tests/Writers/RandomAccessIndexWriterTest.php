@@ -75,7 +75,7 @@ class RandomAccessIndexWriterTest extends TestCase
         $payload = $this->readIndexPayload();
 
         $this->assertSame('KXSI', substr($payload, 0, 4));
-        $this->assertSame(1, ord($payload[4]));         // version
+        $this->assertSame(2, ord($payload[4]));         // version
         $this->assertSame(0, ord($payload[5]));         // flags
         $this->assertSame(1, unpack('v', substr($payload, 6, 2))[1]);     // sheet count
         $this->assertSame(100, unpack('V', substr($payload, 8, 4))[1]);   // sync_period
@@ -86,6 +86,7 @@ class RandomAccessIndexWriterTest extends TestCase
         $this->assertCount(1, $sheets);
         $this->assertSame('xl/worksheets/sheet1.xml', $sheets[0]['entry']);
         $this->assertSame(1001, $sheets[0]['total_rows']); // header + 1000 data rows
+        $this->assertNotSame(0, $sheets[0]['sheet_crc32']); // sheet content CRC populated
     }
 
     public function test_sync_points_recorded_at_row_boundaries(): void
@@ -283,6 +284,67 @@ class RandomAccessIndexWriterTest extends TestCase
         $this->assertFalse($cd->has(RandomAccessIndex::ENTRY_PATH));
     }
 
+    public function test_indexed_workbook_with_no_data_rows_round_trips(): void
+    {
+        // Edge case: caller enables the index but writes only the header
+        // row. Sidecar should still be valid; rowCount() returns 1 and
+        // rowAt(2) is null because no data row exists.
+        $writer = new SinkableXlsxWriter(new FileSink($this->testFile));
+        $writer->withRandomAccessIndex(every: 100);
+        $writer->startFile(['id', 'name']);
+        $writer->writeRow([1, 'only-data']); // need at least one row — empty workbook is rejected by the writer
+        $writer->finishFile();
+
+        $reader = StreamingXlsxReader::fromFile($this->testFile);
+
+        $this->assertSame(2, $reader->rowCount()); // header + 1 data
+        $this->assertSame(['id', 'name'], $reader->rowAt(1));
+        $this->assertSame(['1', 'only-data'], $reader->rowAt(2));
+        $this->assertNull($reader->rowAt(3));
+    }
+
+    public function test_index_silently_falls_back_when_sheet_content_was_rewritten(): void
+    {
+        // Simulates the realistic post-Content_Types-fix scenario: an
+        // OOXML editor (Excel, LibreOffice) opens our indexed file,
+        // edits a cell, and re-saves. The sidecar survives intact but
+        // sheet1.xml gets a fresh deflate stream — the cached comp_offset
+        // values now point at arbitrary bytes in the new stream and
+        // would yield garbage rows. Sheet CRC32 in the sidecar lets the
+        // reader detect this and silently fall back to a non-indexed
+        // scan rather than yielding garbage.
+        $writer = new SinkableXlsxWriter(new FileSink($this->testFile));
+        $writer->withRandomAccessIndex(every: 100);
+        $writer->startFile(['id', 'name']);
+        for ($i = 1; $i <= 500; $i++) {
+            $writer->writeRow([$i, "user-{$i}"]);
+        }
+        $writer->finishFile();
+
+        // Edit sheet1.xml in place — change "user-1" to "admin-X" — and
+        // leave the sidecar untouched, mimicking a tool that wrote back
+        // the workbook after editing a cell.
+        $zip = new ZipArchive();
+        $this->assertTrue($zip->open($this->testFile) === true);
+        $sheetXml = $zip->getFromName('xl/worksheets/sheet1.xml');
+        $this->assertStringContainsString('user-1<', $sheetXml);
+        $modified = str_replace('user-1<', 'admin-X<', $sheetXml);
+        $zip->deleteName('xl/worksheets/sheet1.xml');
+        $zip->addFromString('xl/worksheets/sheet1.xml', $modified);
+        $zip->close();
+
+        // Reader: the sidecar is still present but its CRC no longer
+        // matches the live sheet entry. rowAt() should return the
+        // current content (via Mode A scan) — never garbage rows.
+        $reader = StreamingXlsxReader::fromFile($this->testFile);
+        $row = $reader->rowAt(2);
+        $this->assertSame(['1', 'admin-X'], $row);
+
+        // rowCount() must also fall back from O(1) to O(N) full scan
+        // and still return the correct count.
+        $this->assertSame(501, $reader->rowCount());
+    }
+
     public function test_indexed_xlsx_zip_structure_is_ooxml_compliant(): void
     {
         // Every package part must have a content type declared in
@@ -354,7 +416,7 @@ class RandomAccessIndexWriterTest extends TestCase
     /**
      * Decode the body of an index payload into a list of sheet sections.
      *
-     * @return list<array{entry: string, total_rows: int, sync_points: list<array{row: int, comp_offset: int, uncomp_offset: int}>}>
+     * @return list<array{entry: string, total_rows: int, sheet_crc32: int, sync_points: list<array{row: int, comp_offset: int, uncomp_offset: int}>}>
      */
     private function decodeSheets(string $payload): array
     {
@@ -369,6 +431,8 @@ class RandomAccessIndexWriterTest extends TestCase
             $entry = substr($body, $cursor, $pathLen);
             $cursor += $pathLen;
             $totalRows = unpack('V', substr($body, $cursor, 4))[1];
+            $cursor += 4;
+            $sheetCrc32 = unpack('V', substr($body, $cursor, 4))[1];
             $cursor += 4;
             $syncCount = unpack('V', substr($body, $cursor, 4))[1];
             $cursor += 4;
@@ -386,6 +450,7 @@ class RandomAccessIndexWriterTest extends TestCase
             $sheets[] = [
                 'entry' => $entry,
                 'total_rows' => $totalRows,
+                'sheet_crc32' => $sheetCrc32,
                 'sync_points' => $points,
             ];
         }
