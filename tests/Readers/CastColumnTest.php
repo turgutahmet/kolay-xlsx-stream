@@ -191,6 +191,50 @@ class CastColumnTest extends TestCase
         $reader->castColumn(0, 'octopus');
     }
 
+    public function test_workbook_pr_date1904_auto_detected_from_xml(): void
+    {
+        // Mac-origin XLSX declares <workbookPr date1904="1"/>. Reader
+        // must honour that flag on construction so castDate uses the
+        // 1904 epoch — without auto-detect, dates silently shift four
+        // years and a day. Synthesised file mirrors what Excel-for-Mac
+        // emits on a workbook saved with the 1904 date system.
+        $this->buildWorkbookWithDate1904Pr(true);
+
+        $reader = StreamingXlsxReader::fromFile($this->testFile);
+        $reader->castColumn(0, 'date');
+
+        $rows = iterator_to_array($reader->rows(), false);
+        // Serial 0 is the epoch anchor — 1904-01-01 in 1904 mode,
+        // 1899-12-30 in 1900 mode. Auto-detection forces 1904.
+        $this->assertSame('1904-01-01', $rows[1][0]->format('Y-m-d'));
+    }
+
+    public function test_workbook_pr_date1904_false_keeps_1900_epoch(): void
+    {
+        $this->buildWorkbookWithDate1904Pr(false);
+
+        $reader = StreamingXlsxReader::fromFile($this->testFile);
+        $reader->castColumn(0, 'date');
+
+        $rows = iterator_to_array($reader->rows(), false);
+        $this->assertSame('1899-12-30', $rows[1][0]->format('Y-m-d'));
+    }
+
+    public function test_manual_use1904Epoch_overrides_auto_detect(): void
+    {
+        // Workbook declares 1900 mode but caller manually opts into
+        // 1904 — the explicit method call wins over the auto-detected
+        // default, preserving caller intent.
+        $this->buildWorkbookWithDate1904Pr(false);
+
+        $reader = StreamingXlsxReader::fromFile($this->testFile)
+            ->use1904Epoch()
+            ->castColumn(0, 'date');
+
+        $rows = iterator_to_array($reader->rows(), false);
+        $this->assertSame('1904-01-01', $rows[1][0]->format('Y-m-d'));
+    }
+
     public function test_use1904Epoch_shifts_serial_origin(): void
     {
         // Serial 0 in 1904 epoch = 1904-01-01
@@ -298,6 +342,59 @@ class CastColumnTest extends TestCase
         $this->assertSame('9999-12-31', $rows[1][0]->format('Y-m-d'));
         $this->assertNull($rows[2][0]);
         $this->assertNull($rows[3][0]);
+    }
+
+    /**
+     * Build a synthetic XLSX whose workbook.xml carries an explicit
+     * <workbookPr date1904="1|0"/> attribute. Used to drive the reader's
+     * auto-detection path without depending on a binary fixture file
+     * shipped in the repo.
+     */
+    private function buildWorkbookWithDate1904Pr(bool $date1904): void
+    {
+        $flag = $date1904 ? '1' : '0';
+        $workbookXml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'.
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'.
+            ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'.
+            '<workbookPr date1904="'.$flag.'"/>'.
+            '<sheets>'.
+            '<sheet name="Sheet1" sheetId="1" r:id="rId1"/>'.
+            '</sheets>'.
+            '</workbook>';
+
+        $sheetXml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'.
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'.
+            '<sheetData>'.
+            '<row r="1"><c r="A1" t="inlineStr"><is><t>serial</t></is></c></row>'.
+            '<row r="2"><c r="A2" t="n"><v>0</v></c></row>'.
+            '</sheetData></worksheet>';
+
+        $contentTypes = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'.
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'.
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'.
+            '<Default Extension="xml" ContentType="application/xml"/>'.
+            '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'.
+            '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'.
+            '</Types>';
+
+        $packageRels = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'.
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'.
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'.
+            '</Relationships>';
+
+        $workbookRels = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'.
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'.
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'.
+            '</Relationships>';
+
+        $zip = new \ZipArchive();
+        $this->assertTrue($zip->open($this->testFile, \ZipArchive::CREATE | \ZipArchive::OVERWRITE) === true);
+        $zip->addFromString('[Content_Types].xml', $contentTypes);
+        $zip->addFromString('_rels/.rels', $packageRels);
+        $zip->addFromString('xl/workbook.xml', $workbookXml);
+        $zip->addFromString('xl/_rels/workbook.xml.rels', $workbookRels);
+        $zip->addFromString('xl/worksheets/sheet1.xml', $sheetXml);
+        $zip->close();
     }
 
     /**

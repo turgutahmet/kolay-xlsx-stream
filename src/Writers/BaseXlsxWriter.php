@@ -36,6 +36,12 @@ abstract class BaseXlsxWriter
     public const ROWS_PER_SHEET = 1048575; // MAX - 1 for header safety
     public const MAX_COLUMNS = 16384; // Excel column limit (XFD)
 
+    // ZIP32 container limits — exceeding any of these requires ZIP64,
+    // which the writer does not yet emit. Guarded calls turn silent
+    // 32-bit truncation into a loud, actionable exception.
+    private const ZIP32_MAX_SIZE = 0xFFFFFFFF;   // 4 GB - 1
+    private const ZIP32_MAX_ENTRIES = 0xFFFF;    // 65535
+
     // Style ids registered in getStylesXml() cellXfs
     public const STYLE_DEFAULT = 0;
     public const STYLE_DATETIME = 1;
@@ -118,6 +124,16 @@ abstract class BaseXlsxWriter
     protected bool $autoWidthStrict = false;
     /** @var list<string> Buffered row XML strings while sampling */
     protected array $autoWidthSampleBuffer = [];
+    protected int $autoWidthSampleBufferBytes = 0;
+
+    /**
+     * Hard cap on accumulated sample-buffer byte size. A misconfigured
+     * sample (very wide rows × large sample size) can otherwise hold
+     * 100+ MB in memory. When this ceiling is hit we force-finalize
+     * early — the sample is "good enough" by then and emitting the
+     * preamble lets writeRow exit sample mode and stream normally.
+     */
+    private const SAMPLE_MAX_BUFFER_BYTES = 8 * 1024 * 1024;
     /** @var array<int, int> 1-based col index => max char length seen */
     protected array $autoWidthMaxLengths = [];
     protected bool $autoWidthFinalized = false;
@@ -554,7 +570,14 @@ abstract class BaseXlsxWriter
         // finishFile() drains a partial sample.
         if ($this->inSampleMode && ! $this->autoWidthFinalized) {
             $this->trackSampledRow($row, $rowXml);
-            if (count($this->autoWidthSampleBuffer) >= $this->autoWidthSampleSize) {
+            // Two finalize triggers — sample-count target reached, or
+            // accumulated XML bytes hit the safety cap. The byte cap
+            // protects against a misconfigured wide-row × large-sample
+            // combo that would otherwise hold tens of MB in memory.
+            if (
+                count($this->autoWidthSampleBuffer) >= $this->autoWidthSampleSize
+                || $this->autoWidthSampleBufferBytes >= self::SAMPLE_MAX_BUFFER_BYTES
+            ) {
                 $this->finalizeAutoWidthSample();
             }
             if ($this->progressCallback !== null && $this->totalRows % $this->progressInterval === 0) {
@@ -591,6 +614,7 @@ abstract class BaseXlsxWriter
         try {
             $this->updateAutoWidthMaxLengths($row);
             $this->autoWidthSampleBuffer[] = $rowXml;
+            $this->autoWidthSampleBufferBytes += strlen($rowXml);
         } catch (\Throwable $e) {
             if ($this->autoWidthStrict) {
                 throw $e;
@@ -601,6 +625,7 @@ abstract class BaseXlsxWriter
                 $e->getMessage()
             ));
             $this->autoWidthSampleBuffer[] = $rowXml;
+            $this->autoWidthSampleBufferBytes += strlen($rowXml);
             $this->bailFromSampleMode();
         }
     }
@@ -657,6 +682,7 @@ abstract class BaseXlsxWriter
             $this->rowBufferCount++;
         }
         $this->autoWidthSampleBuffer = [];
+        $this->autoWidthSampleBufferBytes = 0;
 
         if ($this->rowBufferCount >= $this->bufferFlushInterval) {
             $this->flushRowBuffer();
@@ -682,6 +708,7 @@ abstract class BaseXlsxWriter
             $this->rowBufferCount++;
         }
         $this->autoWidthSampleBuffer = [];
+        $this->autoWidthSampleBufferBytes = 0;
 
         if ($this->rowBufferCount >= $this->bufferFlushInterval) {
             $this->flushRowBuffer();
@@ -937,6 +964,7 @@ abstract class BaseXlsxWriter
         }
         $this->sampleAutoSetWidthCols = [];
         $this->autoWidthSampleBuffer = [];
+        $this->autoWidthSampleBufferBytes = 0;
         $this->autoWidthMaxLengths = [];
         $this->autoWidthFinalized = false;
 
@@ -1155,6 +1183,11 @@ abstract class BaseXlsxWriter
             $this->sheetCompressedSize += strlen($compressed);
         }
 
+        $sheetInfo = end($this->sheets);
+        $this->assertZip32Compatible($this->sheetCompressedSize, "sheet '{$sheetInfo['filename']}' compressed size");
+        $this->assertZip32Compatible($this->sheetUncompressedSize, "sheet '{$sheetInfo['filename']}' uncompressed size");
+        $this->assertZip32Compatible($this->currentOffset, 'cumulative archive offset at end of sheet');
+
         // Write data descriptor
         $descriptor = pack('V', self::DATA_DESCRIPTOR_SIGNATURE);
         $descriptor .= pack('V', $this->sheetCrc);
@@ -1343,12 +1376,31 @@ abstract class BaseXlsxWriter
     /**
      * Write static ZIP entry
      */
+    /**
+     * Reject writes that would push a 32-bit size or offset field past
+     * its limit. The ZIP local-file-header and central-directory layouts
+     * pack these fields with 'V' (uint32); silently truncating them
+     * produces an archive that opens but lies about every byte position
+     * after the truncation. Caller gets a clear exception instead.
+     */
+    private function assertZip32Compatible(int $value, string $context): void
+    {
+        if ($value > self::ZIP32_MAX_SIZE) {
+            $mb = number_format($value / 1024 / 1024, 1);
+            throw XlsxStreamException::zip32LimitExceeded("{$context} would be {$mb} MB which exceeds the 4 GB ZIP32 limit");
+        }
+    }
+
     protected function writeStaticFile(string $filename, string $content): void
     {
         $uncompressedSize = strlen($content);
         $compressedContent = gzdeflate($content, $this->deflateLevel);
         $compressedSize = strlen($compressedContent);
         $crc32 = crc32($content);
+
+        $this->assertZip32Compatible($uncompressedSize, "static file '{$filename}' uncompressed size");
+        $this->assertZip32Compatible($compressedSize, "static file '{$filename}' compressed size");
+        $this->assertZip32Compatible($this->currentOffset, 'cumulative archive offset before static file');
 
         [$mtime, $mdate] = $this->dosTimeParts(time());
 
@@ -1385,6 +1437,14 @@ abstract class BaseXlsxWriter
      */
     protected function writeCentralDirectory(): void
     {
+        $entryCount = count($this->centralDirectory);
+        if ($entryCount > self::ZIP32_MAX_ENTRIES) {
+            throw XlsxStreamException::zip32LimitExceeded(
+                "central directory would carry {$entryCount} entries, exceeding the 65535 ZIP32 limit"
+            );
+        }
+        $this->assertZip32Compatible($this->currentOffset, 'central directory start offset');
+
         $centralDirStart = $this->currentOffset;
         $centralDirSize = 0;
 

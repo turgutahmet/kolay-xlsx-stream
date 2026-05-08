@@ -36,6 +36,37 @@ class WorkbookResolver
     private const NS_RELATIONSHIPS = 'http://schemas.openxmlformats.org/package/2006/relationships';
 
     /**
+     * Detect the workbook's date epoch from xl/workbook.xml.
+     *
+     * Mac-origin Excel files set <workbookPr date1904="1"/> to anchor
+     * date serials at 1904-01-01 instead of the standard 1899-12-30.
+     * Without auto-detection, dates in those files come back four
+     * years and a day off — silent and impossible to spot in QA. The
+     * reader's StreamingXlsxReader uses this flag to set its date
+     * epoch automatically; manual use1904Epoch() still wins.
+     *
+     * Default false when the attribute is missing or any other value,
+     * matching Excel's behaviour for unspecified workbookPr.
+     */
+    public static function parseDate1904(Source $source, ZipDirectory $cd): bool
+    {
+        if (! $cd->has('xl/workbook.xml')) {
+            return false;
+        }
+
+        $xml = $cd->readEntry($source, 'xl/workbook.xml');
+
+        // Single linear regex — workbookPr usually appears once near
+        // the top of the file. Spec-compliant values are "1" and "true";
+        // anything else (including missing) means 1900 epoch.
+        if (preg_match('/<workbookPr\b[^>]*\bdate1904="([^"]*)"/', $xml, $m)) {
+            return $m[1] === '1' || strcasecmp($m[1], 'true') === 0;
+        }
+
+        return false;
+    }
+
+    /**
      * @return list<array{name: string, sheetId: int, entry: string}>
      */
     public static function resolve(Source $source, ZipDirectory $cd): array

@@ -34,6 +34,16 @@ class StreamingSheetReader
     private const METHOD_STORED = 0;
     private const METHOD_DEFLATE = 8;
 
+    /**
+     * Hard ceiling on the in-progress row XML buffer. The reader holds
+     * at most one open <row>...</row> element worth of bytes; if a
+     * sheet never closes a row tag, the buffer would otherwise grow
+     * without bound. 16 MB is far above any plausible legitimate row
+     * (Excel's per-cell text limit is ~32 KB × 16384 columns) and far
+     * below typical PHP memory budgets.
+     */
+    private const MAX_ROW_XML_BYTES = 16 * 1024 * 1024;
+
     private Source $source;
     private ZipDirectory $cd;
     private string $sheetEntry;
@@ -189,6 +199,18 @@ class StreamingSheetReader
 
                 if ($cursor > 0) {
                     $buffer = substr($buffer, $cursor);
+                }
+
+                // After draining every complete row, anything left in
+                // $buffer is one in-progress row's prefix. A pathological
+                // sheet that opens <row> and never closes it would let
+                // the buffer grow to GB scale and OOM the process. Cap
+                // it loudly instead.
+                if (strlen($buffer) > self::MAX_ROW_XML_BYTES) {
+                    throw XlsxReadException::corruptCentralDirectory(
+                        'in-progress row XML exceeds '.(self::MAX_ROW_XML_BYTES / 1024 / 1024).
+                        ' MB without a closing tag — sheet is malformed or malicious'
+                    );
                 }
 
                 if ($compRemaining === 0 && $finishedFlush) {

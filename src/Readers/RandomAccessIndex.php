@@ -29,6 +29,16 @@ class RandomAccessIndex
 
     private const HEADER_SIZE = 16;
 
+    /**
+     * Sane upper bounds enforced during decode. Real workbooks rarely
+     * exceed a handful of sheets; treating anything past 1024 as
+     * structurally invalid catches malformed sidecars that would
+     * otherwise allocate huge intermediate arrays.
+     */
+    private const MAX_SHEETS = 1024;
+
+    private const MAX_PATH_LEN = 256;
+
     private int $syncPeriod;
 
     /** @var array<string, int> entry path => total rows */
@@ -80,6 +90,21 @@ class RandomAccessIndex
             );
         }
 
+        // Semantic guards. CRC32 only catches accidental bit flips and
+        // benign tooling drift — a sidecar can be intentionally crafted
+        // with a valid CRC but nonsense content. Cheap structural checks
+        // here turn "silently wrong rowAt result" into a loud rejection.
+        if ($syncPeriod === 0) {
+            throw XlsxReadException::corruptCentralDirectory(
+                'random-access index syncPeriod must be greater than zero'
+            );
+        }
+        if ($sheetCount > self::MAX_SHEETS) {
+            throw XlsxReadException::corruptCentralDirectory(
+                "random-access index sheet count {$sheetCount} exceeds the supported maximum"
+            );
+        }
+
         $totals = [];
         $crcs = [];
         $syncs = [];
@@ -93,11 +118,23 @@ class RandomAccessIndex
             $pathLen = unpack('v', substr($body, $cursor, 2))[1];
             $cursor += 2;
 
+            if ($pathLen === 0 || $pathLen > self::MAX_PATH_LEN) {
+                throw XlsxReadException::corruptCentralDirectory(
+                    "random-access index sheet path length out of range: {$pathLen}"
+                );
+            }
+
             if ($cursor + $pathLen + 12 > $bodyLen) {
                 throw XlsxReadException::corruptCentralDirectory('truncated sheet section payload');
             }
             $entry = substr($body, $cursor, $pathLen);
             $cursor += $pathLen;
+
+            if (isset($totals[$entry])) {
+                throw XlsxReadException::corruptCentralDirectory(
+                    "random-access index lists sheet '{$entry}' more than once"
+                );
+            }
 
             $totalRows = unpack('V', substr($body, $cursor, 4))[1];
             $cursor += 4;
@@ -113,12 +150,54 @@ class RandomAccessIndex
             }
 
             $points = [];
+            $prevRow = 0;
+            $prevCompOffset = -1;
+            $prevUncompOffset = -1;
             for ($k = 0; $k < $syncCount; $k++) {
+                $row = unpack('P', substr($body, $cursor, 8))[1];
+                $compOffset = unpack('P', substr($body, $cursor + 8, 8))[1];
+                $uncompOffset = unpack('P', substr($body, $cursor + 16, 8))[1];
+
+                // Sync points must increase strictly — a rowAt seek
+                // resolves the largest sync point at-or-before the
+                // target via a forward walk; non-monotonic input
+                // would cause the walk to mis-resolve and inflate
+                // from the wrong byte position.
+                if ($row <= $prevRow) {
+                    throw XlsxReadException::corruptCentralDirectory(
+                        "random-access index sync points not strictly increasing on row for sheet '{$entry}'"
+                    );
+                }
+                if ($compOffset <= $prevCompOffset) {
+                    throw XlsxReadException::corruptCentralDirectory(
+                        "random-access index sync points not strictly increasing on comp_offset for sheet '{$entry}'"
+                    );
+                }
+                if ($uncompOffset <= $prevUncompOffset) {
+                    throw XlsxReadException::corruptCentralDirectory(
+                        "random-access index sync points not strictly increasing on uncomp_offset for sheet '{$entry}'"
+                    );
+                }
+                // Writers capture each sync point at the next-row boundary
+                // — i.e. "after seeking to this comp_offset, the next row
+                // to inflate is row N". The flush triggered at the very
+                // end of the sheet legitimately produces a sync point
+                // with row == totalRows + 1 (the would-be position past
+                // the last row). Anything beyond that is corruption.
+                if ($row > $totalRows + 1) {
+                    throw XlsxReadException::corruptCentralDirectory(
+                        "random-access index sync row {$row} exceeds totalRows {$totalRows} for sheet '{$entry}'"
+                    );
+                }
+
                 $points[] = [
-                    'row' => unpack('P', substr($body, $cursor, 8))[1],
-                    'comp_offset' => unpack('P', substr($body, $cursor + 8, 8))[1],
-                    'uncomp_offset' => unpack('P', substr($body, $cursor + 16, 8))[1],
+                    'row' => $row,
+                    'comp_offset' => $compOffset,
+                    'uncomp_offset' => $uncompOffset,
                 ];
+                $prevRow = $row;
+                $prevCompOffset = $compOffset;
+                $prevUncompOffset = $uncompOffset;
                 $cursor += 24;
             }
 

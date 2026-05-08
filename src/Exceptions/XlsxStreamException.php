@@ -92,4 +92,19 @@ class XlsxStreamException extends \Exception
             'Call setColumnFormat() with an index between 1 and the header count.'
         );
     }
+
+    /**
+     * Raised when an export approaches a 32-bit ZIP container limit.
+     * Loud rejection beats silently truncating size fields and shipping
+     * a corrupt archive — split the export across multiple files until
+     * ZIP64 writer support lands.
+     */
+    public static function zip32LimitExceeded(string $detail): self
+    {
+        return new self(
+            "ZIP32 limit exceeded: {$detail}. ".
+            'Split the export across multiple files or sheets as a workaround. '.
+            'ZIP64 writer support is tracked for a future release.'
+        );
+    }
 }

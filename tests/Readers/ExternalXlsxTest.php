@@ -229,6 +229,41 @@ class ExternalXlsxTest extends TestCase
         $this->assertSame(['2', 'Bob'], $rows[2]);
     }
 
+    public function test_reader_rejects_pathological_row_xml_exceeding_16mb(): void
+    {
+        // Synthetic worksheet: open a <row> tag and never close it,
+        // padded out to 17 MB of inert filler. A naive reader would
+        // accumulate the entire prefix in memory looking for </row>;
+        // the guard caps the buffer and rejects the sheet instead.
+        $payload = '<?xml version="1.0" encoding="UTF-8"?>'.
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'.
+            '<sheetData>'.
+            '<row r="1">'.
+            // Fill with valid-ish content but never close the row.
+            str_repeat('<c r="A1" t="inlineStr"><is><t>x</t></is></c>', 400_000).
+            '</sheetData></worksheet>';
+
+        // Confirm fixture exceeds the guard threshold (16 MB).
+        $this->assertGreaterThan(16 * 1024 * 1024, strlen($payload));
+
+        $zip = new \ZipArchive();
+        $zip->open($this->testFile, \ZipArchive::CREATE | \ZipArchive::OVERWRITE);
+        $zip->addFromString('[Content_Types].xml', $this->contentTypesNoSst());
+        $zip->addFromString('_rels/.rels', $this->packageRels());
+        $zip->addFromString('xl/workbook.xml', $this->workbookXml());
+        $zip->addFromString('xl/_rels/workbook.xml.rels', $this->workbookRelsNoSst());
+        $zip->addFromString('xl/worksheets/sheet1.xml', $payload);
+        $zip->close();
+        unset($payload);
+
+        $reader = StreamingXlsxReader::fromFile($this->testFile);
+
+        $this->expectException(\Kolay\XlsxStream\Exceptions\XlsxReadException::class);
+        $this->expectExceptionMessageMatches('/in-progress row XML exceeds 16 MB/');
+
+        iterator_to_array($reader->rows());
+    }
+
     public function test_reader_rejects_unsupported_compression_method(): void
     {
         // Synthesize a CD with an arbitrary unsupported method (e.g. 12 = BZIP2).

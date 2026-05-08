@@ -98,6 +98,12 @@ class StreamingXlsxReader
             throw XlsxReadException::corruptCentralDirectory('workbook contains no sheets');
         }
 
+        // Honour the workbook's declared date epoch. Mac-origin XLSX
+        // files set workbookPr/@date1904 — without this, every cast
+        // date comes back four years and a day too early. Manual
+        // use1904Epoch() override still works on top of this default.
+        $this->use1904Epoch = WorkbookResolver::parseDate1904($source, $this->cd);
+
         $this->currentEntry = $this->sheets[0]['entry'];
     }
 
@@ -522,6 +528,13 @@ class StreamingXlsxReader
         // with the value the writer captured into the sidecar catches
         // the divergence with an O(1) lookup. Mismatch silently falls
         // back to a non-indexed scan rather than yielding garbage rows.
+        //
+        // Plus a structural bound check: each sync point's comp_offset
+        // must lie inside the sheet's compressed_size as recorded in
+        // the live CD. A crafted sidecar with a CRC-valid but bogus
+        // offset would otherwise drive the inflater past the entry
+        // body into adjacent ZIP bytes. Treating any out-of-range
+        // offset as invalidation also degrades safely to Mode A.
         foreach ($this->sheets as $sheet) {
             $expected = $index->sheetCrc32($sheet['entry']);
             if ($expected === null) {
@@ -530,6 +543,13 @@ class StreamingXlsxReader
             $cdEntry = $this->cd->entry($sheet['entry']);
             if ($cdEntry === null || $cdEntry['crc32'] !== $expected) {
                 return $this->randomAccessIndex = null;
+            }
+
+            $compressedSize = $cdEntry['compressed_size'];
+            foreach ($index->syncPoints($sheet['entry']) as $sp) {
+                if ($sp['comp_offset'] >= $compressedSize) {
+                    return $this->randomAccessIndex = null;
+                }
             }
         }
 

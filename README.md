@@ -24,7 +24,7 @@ Most PHP Excel libraries (PHPSpreadsheet, Spout, Laravel Excel) have critical li
 - **Zero Disk I/O**: Direct streaming to S3 using multipart upload
 - **Constant Memory**: O(1) memory for the writer (32 MB part buffer) and ~24 MB for the reader regardless of file size
 - **Bidirectional**: Write *and* read XLSX files through the same package — including files produced by other writers (PhpSpreadsheet, openpyxl, …) via shared-strings support
-- **Random Access**: Optional `xl/_kxs/index.bin` sidecar lets `rowAt(N)`, `rowRange(a, b)`, and `rowCount()` skip ahead in O(1) instead of full-scanning. Backward-compatible — Excel and every other reader ignore the sidecar.
+- **Random Access**: Optional `xl/_kxs/index.bin` sidecar lets `rowAt(N)`, `rowRange(a, b)`, and `rowCount()` skip ahead in **O(1)** instead of full-scanning. Backward-compatible — Excel and every other reader ignore the sidecar. (Per-lookup work is bounded by the writer-chosen sync period, default 100 rows ≈ milliseconds; independent of file size.)
 - **Blazing Fast**: 2-3× faster than alternatives on writes; ~70K rows/s sustained reads with constant RAM
 - **Production Tested**: Successfully exported and re-read 4.5 million rows (500MB+ files)
 
@@ -204,6 +204,15 @@ changes.
 
 ### Understanding Memory Behavior
 
+> **Reader bounded-RAM contract — when it holds:** Files written by
+> this package use inline strings exclusively, so the reader's bounded
+> 22-24 MB peak RAM applies unconditionally. Files produced by other
+> tools that store text in `xl/sharedStrings.xml` are loaded into
+> memory **provided the table fits** — compressed ≤ 20 MB AND
+> uncompressed ≤ 100 MB. Files exceeding either threshold are rejected
+> with a clear error rather than silently exhausting RAM. On-disk
+> shared-strings table support is tracked for a future release.
+
 #### Local File System
 - **True O(1) Memory**: Constant memory usage regardless of file size
 - **No Growth**: Memory stays at 0-2MB even for millions of rows
@@ -233,11 +242,41 @@ The ± values in S3 memory represent **normal memory fluctuation** during stream
 - **Write — S3**: 109,000–129,000 rows/second above 750K rows (2.5–3× the v1.x baseline, identical to v2.2.2)
 - **Read — Local**: ~67,000–76,000 rows/second sustained, 22-24 MB peak RAM regardless of file size
 - **Read — S3**: 60,000–62,000 rows/second saturation on multi-MB files (cold cache, single-stream)
-- **Random Access**: O(1) `rowAt(N)` and `rowCount()` via opt-in `withRandomAccessIndex()` — **up to 74.6× speedup** vs full scan, **>260,000× speedup** on `rowCount()`, **+0.032 % file size cost**
+- **Random Access**: O(1) `rowAt(N)`, `rowRange(a, b)`, and `rowCount()` via opt-in `withRandomAccessIndex()` — **up to 74.6× speedup** vs full scan, **>260,000× speedup** on `rowCount()`, **+0.032 % file size cost**
 - **Memory Efficiency**: Local writer uses <2 MB, S3 writer averages 40 MB per million rows; reader caps at ~24 MB independent of file size
 - **Multi-sheet Support**: Automatic sheet creation at Excel's 1,048,576 row limit, transparent multi-sheet reading
 - **External XLSX**: Reads files produced by PhpSpreadsheet, openpyxl, Apache POI, Excel etc. via shared-strings table support
 - **Production Ready**: Successfully written and round-tripped 4.5 million rows
+
+### File size limits
+
+The writer emits **ZIP32** archives. Each output is bounded by:
+
+- **4 GB compressed** total archive size
+- **4 GB uncompressed** per ZIP entry (single sheet)
+- **65,535 entries** in the central directory
+
+These ceilings are far above any realistic single-export workload
+(4.5 M rows ≈ 178 MB compressed). If a workload approaches them the
+writer aborts with a clear `ZIP32 limit exceeded` exception instead
+of silently truncating size fields and producing a corrupt file —
+split the export across multiple files or sheets as a workaround.
+ZIP64 writer support is tracked for a future release.
+
+### Compression level
+
+`setCompressionLevel(int $level)` accepts 1–9. The default is 6
+(zlib's standard balance). Pick by use case:
+
+| Use case | Level | Tradeoff |
+|---|---:|---|
+| Queue job, fastest export | 1 | ~30 % faster than default, ~5 % larger file |
+| Balanced default | 6 | zlib default — used unless you set otherwise |
+| Archive, smallest file | 9 | ~15 % slower than default, ~2 % smaller file |
+
+For S3 uploads, level 1 typically wins because compute is the
+bottleneck. For local file output where disk is fast, level 6 is
+fine; level 9 only helps if you're storing the file long-term.
 
 ### Comparison with Other Libraries
 
@@ -246,10 +285,13 @@ The ± values in S3 memory represent **normal memory fluctuation** during stream
 | PHPSpreadsheet | ❌ Crashes | ❌ Crashes | ~8 GB | Full file | ❌ | Indirect |
 | Spout / OpenSpout | ~60 sec | ~30 sec | ~100MB+ | Full file | ❌ | Indirect |
 | Laravel Excel | ~90 sec | ~60 sec | ~500MB+ | Full file | ❌ | Indirect |
-| **Kolay XLSX Stream (Local)** | ✅ **4.65 sec** | ✅ **14.30 sec** | ✅ **24 MB** | ✅ **Zero** | ✅ **O(1)*** | N/A |
-| **Kolay XLSX Stream (S3)** | ✅ **9.13 sec** | ✅ **16.60 sec** | ✅ **24 MB** | ✅ **Zero** | ✅ **O(1)*** | ✅ **Direct** |
+| **Kolay XLSX Stream (Local)** | ✅ **4.65 sec** | ✅ **14.30 sec** | ✅ **24 MB** | ✅ **Zero** | ✅ **O(1)\*** | N/A |
+| **Kolay XLSX Stream (S3)** | ✅ **9.13 sec** | ✅ **16.60 sec** | ✅ **24 MB** | ✅ **Zero** | ✅ **O(1)\*** | ✅ **Direct** |
 
-*\*With opt-in `withRandomAccessIndex()` on the writer.*
+*\*With opt-in `withRandomAccessIndex()` on the writer. Per-lookup
+work is bounded by the writer-chosen sync period (default 100 rows
+≈ milliseconds), independent of file size. `rowCount()` is constant
+straight from the index header.*
 
 ### When to use this package vs alternatives
 

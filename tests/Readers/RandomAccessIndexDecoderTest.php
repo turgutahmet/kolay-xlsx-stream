@@ -161,6 +161,116 @@ class RandomAccessIndexDecoderTest extends TestCase
         ReaderIndex::decode($tampered);
     }
 
+    public function test_rejects_zero_sync_period(): void
+    {
+        // syncPeriod is the cadence at which the writer planted sync
+        // points. A zero value is structurally meaningless — refuse the
+        // sidecar before any seek is attempted.
+        $payload = WriterIndex::encode(0, [[
+            'entry' => 'xl/worksheets/sheet1.xml',
+            'total_rows' => 10,
+            'sheet_crc32' => 0,
+            'sync_points' => [],
+        ]]);
+
+        $this->expectException(XlsxReadException::class);
+        $this->expectExceptionMessageMatches('/syncPeriod must be greater than zero/');
+        ReaderIndex::decode($payload);
+    }
+
+    public function test_rejects_non_monotonic_sync_point_rows(): void
+    {
+        // Sync points must be strictly increasing on row — findSyncPoint
+        // does a forward walk and assumes monotonicity. A descending or
+        // duplicate row would break that contract silently.
+        $payload = WriterIndex::encode(100, [[
+            'entry' => 'xl/worksheets/sheet1.xml',
+            'total_rows' => 1000,
+            'sheet_crc32' => 0,
+            'sync_points' => [
+                ['row' => 100, 'comp_offset' => 1000, 'uncomp_offset' => 5000],
+                ['row' => 50, 'comp_offset' => 2000, 'uncomp_offset' => 10000],
+            ],
+        ]]);
+
+        $this->expectException(XlsxReadException::class);
+        $this->expectExceptionMessageMatches('/not strictly increasing on row/');
+        ReaderIndex::decode($payload);
+    }
+
+    public function test_rejects_non_monotonic_comp_offset(): void
+    {
+        $payload = WriterIndex::encode(100, [[
+            'entry' => 'xl/worksheets/sheet1.xml',
+            'total_rows' => 1000,
+            'sheet_crc32' => 0,
+            'sync_points' => [
+                ['row' => 100, 'comp_offset' => 5000, 'uncomp_offset' => 5000],
+                ['row' => 200, 'comp_offset' => 4000, 'uncomp_offset' => 10000],
+            ],
+        ]]);
+
+        $this->expectException(XlsxReadException::class);
+        $this->expectExceptionMessageMatches('/not strictly increasing on comp_offset/');
+        ReaderIndex::decode($payload);
+    }
+
+    public function test_rejects_sync_row_far_beyond_total_rows(): void
+    {
+        // A sync point past totalRows + 1 (the legitimate EOF marker)
+        // is structurally impossible — the corresponding rows do not
+        // exist in the sheet.
+        $payload = WriterIndex::encode(100, [[
+            'entry' => 'xl/worksheets/sheet1.xml',
+            'total_rows' => 100,
+            'sheet_crc32' => 0,
+            'sync_points' => [
+                ['row' => 5000, 'comp_offset' => 1000, 'uncomp_offset' => 5000],
+            ],
+        ]]);
+
+        $this->expectException(XlsxReadException::class);
+        $this->expectExceptionMessageMatches('/exceeds totalRows/');
+        ReaderIndex::decode($payload);
+    }
+
+    public function test_rejects_duplicate_sheet_path(): void
+    {
+        $payload = WriterIndex::encode(100, [
+            [
+                'entry' => 'xl/worksheets/sheet1.xml',
+                'total_rows' => 100,
+                'sheet_crc32' => 0,
+                'sync_points' => [],
+            ],
+            [
+                'entry' => 'xl/worksheets/sheet1.xml',
+                'total_rows' => 200,
+                'sheet_crc32' => 0,
+                'sync_points' => [],
+            ],
+        ]);
+
+        $this->expectException(XlsxReadException::class);
+        $this->expectExceptionMessageMatches('/lists sheet .+ more than once/');
+        ReaderIndex::decode($payload);
+    }
+
+    public function test_rejects_zero_length_sheet_path(): void
+    {
+        // Hand-craft a body with pathLen=0 (the writer never produces
+        // this; any sidecar in the wild that does is corrupt).
+        $body = pack('v', 0);                 // pathLen
+        $body .= pack('V', 10);               // total_rows
+        $body .= pack('V', 0);                // sheet_crc32
+        $body .= pack('V', 0);                // sync_count
+        $header = WriterIndex::MAGIC.pack('CCv', WriterIndex::VERSION, 0, 1).pack('V', 100).pack('V', crc32($body));
+
+        $this->expectException(XlsxReadException::class);
+        $this->expectExceptionMessageMatches('/sheet path length out of range/');
+        ReaderIndex::decode($header.$body);
+    }
+
     public function test_rejects_truncated_sheet_section(): void
     {
         $payload = WriterIndex::encode(100, [[

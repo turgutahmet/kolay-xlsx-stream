@@ -284,6 +284,50 @@ class RandomAccessIndexWriterTest extends TestCase
         $this->assertFalse($cd->has(RandomAccessIndex::ENTRY_PATH));
     }
 
+    public function test_sample_mode_random_index_multi_sheet_round_trip(): void
+    {
+        // Combines three independently-sensitive mechanisms in one
+        // workload: deferred preamble emission for sample-based auto
+        // widths, periodic ZLIB_FULL_FLUSH for the random-access index,
+        // and per-sheet state reset across newSheet(). Each gates
+        // emission of <cols>/<sheetData> in slightly different ways;
+        // a regression in any one tends to corrupt the sheet bytes
+        // silently. End-to-end round-trip via the indexed reader pins
+        // them together.
+        $writer = new SinkableXlsxWriter(new FileSink($this->testFile));
+        $writer->setAutoColumnWidth(sample: 50);
+        $writer->withRandomAccessIndex(every: 25);
+        $writer->startFile(['id', 'name']);
+        for ($i = 1; $i <= 200; $i++) {
+            $writer->writeRow([$i, "user-{$i}"]);
+        }
+
+        $writer->clearColumnFormats();
+        $writer->newSheet('Second', ['id', 'description']);
+        for ($i = 1; $i <= 200; $i++) {
+            $writer->writeRow([$i, "desc {$i} payload"]);
+        }
+        $writer->finishFile();
+
+        $reader = StreamingXlsxReader::fromFile($this->testFile);
+
+        // Sheet 1 — index path serves random access plus O(1) rowCount
+        $this->assertSame(['id', 'name'], $reader->header());
+        $this->assertSame(201, $reader->rowCount());
+        $this->assertSame(['1', 'user-1'], $reader->rowAt(2));
+        $this->assertSame(['100', 'user-100'], $reader->rowAt(101));
+        $this->assertSame(['200', 'user-200'], $reader->rowAt(201));
+        $this->assertNull($reader->rowAt(202));
+
+        // Sheet 2 — fresh per-sheet state must not leak from sheet 1
+        $reader->onSheet('Second');
+        $this->assertSame(['id', 'description'], $reader->header());
+        $this->assertSame(201, $reader->rowCount());
+        $this->assertSame(['1', 'desc 1 payload'], $reader->rowAt(2));
+        $this->assertSame(['150', 'desc 150 payload'], $reader->rowAt(151));
+        $this->assertSame(['200', 'desc 200 payload'], $reader->rowAt(201));
+    }
+
     public function test_indexed_workbook_with_no_data_rows_round_trips(): void
     {
         // Edge case: caller enables the index but writes only the header
@@ -301,6 +345,36 @@ class RandomAccessIndexWriterTest extends TestCase
         $this->assertSame(['id', 'name'], $reader->rowAt(1));
         $this->assertSame(['1', 'only-data'], $reader->rowAt(2));
         $this->assertNull($reader->rowAt(3));
+    }
+
+    public function test_index_silently_falls_back_when_sync_offset_exceeds_compressed_size(): void
+    {
+        // A sidecar can be intentionally crafted with a valid CRC32 but
+        // a comp_offset that points past the sheet's actual compressed
+        // bytes. Trusting it would seek the inflater into adjacent ZIP
+        // bytes and yield garbage. The reader must cross-validate every
+        // sync point against the live ZIP CD compressed_size and treat
+        // any mismatch as "no usable index" — falling back to Mode A.
+        $writer = new SinkableXlsxWriter(new FileSink($this->testFile));
+        $writer->withRandomAccessIndex(every: 100);
+        $writer->startFile(['id', 'name']);
+        for ($i = 1; $i <= 500; $i++) {
+            $writer->writeRow([$i, "user-{$i}"]);
+        }
+        $writer->finishFile();
+
+        // Tamper with the sidecar: rewrite every comp_offset to a value
+        // far past any plausible sheet size, then refresh the body CRC
+        // so the structural decoder accepts the payload. The cross-CD
+        // check inside the reader is what must reject it.
+        $this->corruptSidecarCompOffsets($this->testFile);
+
+        $reader = StreamingXlsxReader::fromFile($this->testFile);
+
+        $this->assertSame(['id', 'name'], $reader->rowAt(1));
+        $this->assertSame(['1', 'user-1'], $reader->rowAt(2));
+        $this->assertSame(['500', 'user-500'], $reader->rowAt(501));
+        $this->assertSame(501, $reader->rowCount());
     }
 
     public function test_index_silently_falls_back_when_sheet_content_was_rewritten(): void
@@ -411,6 +485,43 @@ class RandomAccessIndexWriterTest extends TestCase
         $cd = ZipDirectory::fromSource($source);
 
         return $cd->readEntry($source, RandomAccessIndex::ENTRY_PATH);
+    }
+
+    /**
+     * Replace every sync point's comp_offset in the sidecar with an
+     * implausibly large value, then refresh the body CRC32 so the
+     * structural decoder still accepts the payload. Used to drive the
+     * reader's CD-aware bound check without changing any other field.
+     */
+    private function corruptSidecarCompOffsets(string $path): void
+    {
+        $original = $this->readIndexPayload();
+
+        $body = substr($original, 16);
+        $cursor = 0;
+        $sheetCount = unpack('v', substr($original, 6, 2))[1];
+        $bogusOffset = 0xFFFFFFFFFF; // 1 TB — way past any realistic sheet
+
+        for ($i = 0; $i < $sheetCount; $i++) {
+            $pathLen = unpack('v', substr($body, $cursor, 2))[1];
+            $cursor += 2 + $pathLen + 4 + 4; // pathLen + path + total_rows + sheet_crc32
+            $syncCount = unpack('V', substr($body, $cursor, 4))[1];
+            $cursor += 4;
+            for ($k = 0; $k < $syncCount; $k++) {
+                $body = substr_replace($body, pack('P', $bogusOffset), $cursor + 8, 8);
+                $cursor += 24;
+            }
+        }
+
+        $newPayload = substr($original, 0, 12).pack('V', crc32($body)).$body;
+
+        // Re-add the sidecar entry to the ZIP (ZipArchive::deleteName
+        // keeps the underlying offsets stable for entries we don't touch).
+        $zip = new \ZipArchive();
+        $zip->open($path);
+        $zip->deleteName(RandomAccessIndex::ENTRY_PATH);
+        $zip->addFromString(RandomAccessIndex::ENTRY_PATH, $newPayload);
+        $zip->close();
     }
 
     /**

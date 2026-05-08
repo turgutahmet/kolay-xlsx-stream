@@ -137,6 +137,36 @@ class AutoColumnWidthSampleTest extends TestCase
         $writer->setAutoColumnWidth(sample: -1);
     }
 
+    public function test_sample_buffer_finalises_early_when_byte_cap_is_hit(): void
+    {
+        // Misconfigured combo — large sample target plus very wide rows
+        // — would otherwise pin tens of MB of row XML in memory waiting
+        // for the count target. The byte cap finalises early, drains
+        // the buffer to disk, and lets writeRow exit sample mode so the
+        // remainder streams normally. End-to-end proof: writer doesn't
+        // OOM, file is valid, header + every row is present.
+        $writer = new SinkableXlsxWriter(new FileSink($this->testFile));
+        $writer->setAutoColumnWidth(sample: 100_000); // unrealistically large target
+        $writer->startFile(['payload']);
+
+        $wide = str_repeat('x', 10_000); // ~10 KB cell — 1000 rows ≈ 10 MB > 8 MB cap
+        for ($i = 1; $i <= 1500; $i++) {
+            $writer->writeRow([$wide]);
+        }
+        $writer->finishFile();
+
+        $this->assertFileExists($this->testFile);
+
+        $zip = new \ZipArchive();
+        $zip->open($this->testFile);
+        $sheet = $zip->getFromName('xl/worksheets/sheet1.xml');
+        $zip->close();
+
+        // Every row must be present despite the early finalize.
+        $this->assertStringContainsString('<row r="1"', $sheet);
+        $this->assertStringContainsString('<row r="1501"', $sheet);
+    }
+
     public function test_sample_mode_handles_datetime_cells_in_strict_mode(): void
     {
         // DateTime objects can't be coerced via (string) cast — a naive
