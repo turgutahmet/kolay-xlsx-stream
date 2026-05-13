@@ -36,9 +36,33 @@ abstract class BaseXlsxWriter
     public const ROWS_PER_SHEET = 1048575; // MAX - 1 for header safety
     public const MAX_COLUMNS = 16384; // Excel column limit (XFD)
 
+    // ZIP32 container limits — exceeding any of these requires ZIP64,
+    // which the writer does not yet emit. Guarded calls turn silent
+    // 32-bit truncation into a loud, actionable exception.
+    private const ZIP32_MAX_SIZE = 0xFFFFFFFF;   // 4 GB - 1
+    private const ZIP32_MAX_ENTRIES = 0xFFFF;    // 65535
+
     // Style ids registered in getStylesXml() cellXfs
     public const STYLE_DEFAULT = 0;
     public const STYLE_DATETIME = 1;
+
+    // Excel built-in numFmtIds (0-49 reserved range, no <numFmt> entry).
+    // Pass these to setColumnFormat() for locale-aware formatting:
+    // BUILTIN_NUMFMT_DATE renders dd.mm.yyyy in tr-TR, mm/dd/yyyy in en-US.
+    public const BUILTIN_NUMFMT_GENERAL = 0;
+    public const BUILTIN_NUMFMT_INTEGER = 1;     // 0
+    public const BUILTIN_NUMFMT_DECIMAL_2 = 2;   // 0.00
+    public const BUILTIN_NUMFMT_THOUSANDS = 3;   // #,##0
+    public const BUILTIN_NUMFMT_CURRENCY = 5;    // $#,##0_);($#,##0)
+    public const BUILTIN_NUMFMT_PERCENT = 9;     // 0%
+    public const BUILTIN_NUMFMT_PERCENT_2 = 10;  // 0.00%
+    public const BUILTIN_NUMFMT_EXPONENT = 11;   // 0.00E+00
+    public const BUILTIN_NUMFMT_FRACTION = 12;   // # ?/?
+    public const BUILTIN_NUMFMT_DATE = 14;       // m/d/yyyy (locale-aware)
+    public const BUILTIN_NUMFMT_DATE_LONG = 15;  // d-mmm-yy
+    public const BUILTIN_NUMFMT_TIME_AMPM = 18;  // h:mm AM/PM
+    public const BUILTIN_NUMFMT_TIME = 20;       // h:mm
+    public const BUILTIN_NUMFMT_DATETIME = 22;   // m/d/yyyy h:mm (locale-aware)
 
     // Excel epoch: serial 1 = 1900-01-01, but Excel mistakenly treats 1900 as a leap year.
     // Using 1899-12-30 as base so Unix timestamps map correctly for all post-1900 dates.
@@ -95,8 +119,51 @@ abstract class BaseXlsxWriter
     protected array $columnWidths = [];
     protected bool $autoColumnWidth = false;
 
+    // Sample-based auto column width (opt-in via setAutoColumnWidth(sample: N))
+    protected ?int $autoWidthSampleSize = null;
+    protected bool $autoWidthStrict = false;
+    /** @var list<string> Buffered row XML strings while sampling */
+    protected array $autoWidthSampleBuffer = [];
+    protected int $autoWidthSampleBufferBytes = 0;
+
+    /**
+     * Hard cap on accumulated sample-buffer byte size. A misconfigured
+     * sample (very wide rows × large sample size) can otherwise hold
+     * 100+ MB in memory. When this ceiling is hit we force-finalize
+     * early — the sample is "good enough" by then and emitting the
+     * preamble lets writeRow exit sample mode and stream normally.
+     */
+    private const SAMPLE_MAX_BUFFER_BYTES = 8 * 1024 * 1024;
+    /** @var array<int, int> 1-based col index => max char length seen */
+    protected array $autoWidthMaxLengths = [];
+    protected bool $autoWidthFinalized = false;
+    protected bool $inSampleMode = false;
+    /**
+     * Cols whose width was last derived by sample finalize. Cleared at
+     * the start of the next sheet so sample widths don't leak between
+     * sheets the way user-explicit setColumnWidths() entries do.
+     *
+     * @var list<int>
+     */
+    protected array $sampleAutoSetWidthCols = [];
+
     // Custom sheet name for the next sheet rotation (set by newSheet()).
     protected ?string $nextSheetName = null;
+
+    // Random-access index (opt-in via withRandomAccessIndex). When enabled,
+    // ZLIB_FULL_FLUSH is injected at row-buffer boundaries roughly every
+    // $indexSyncPeriod rows, and an xl/_kxs/index.bin sidecar is written on
+    // finishFile(). Default off — every previously-written byte is identical.
+    protected bool $randomAccessIndexEnabled = false;
+    protected int $indexSyncPeriod = 10000;
+    protected int $rowsSinceSync = 0;
+
+    /**
+     * Per-sheet sync points keyed by sheet entry path.
+     *
+     * @var array<string, list<array{row: int, comp_offset: int, uncomp_offset: int}>>
+     */
+    protected array $indexSyncPoints = [];
 
     public function __construct()
     {
@@ -128,6 +195,34 @@ abstract class BaseXlsxWriter
      * Lower = more responsive streaming
      * Higher = better compression ratio
      */
+    /**
+     * Enable born-indexed output: write xl/_kxs/index.bin sidecar so a
+     * matched reader can do O(1) random-access lookups (rowAt, rowRange,
+     * rowCount). Backward-compatible — Excel, PhpSpreadsheet, OpenSpout
+     * etc. ignore the unreferenced part and read the file normally.
+     *
+     * Approximate cost (per the POC benchmark, 4M rows / 10K period):
+     *   wall time ≈ ölçüm gürültüsü, RAM ≈ +10 KB, file size ≈ +0.04 %.
+     *
+     * Calling this method has no effect once startFile() has been called.
+     */
+    public function withRandomAccessIndex(int $every = 10000): self
+    {
+        if ($this->started) {
+            throw XlsxStreamException::alreadyStarted();
+        }
+        if ($every < 1) {
+            throw new XlsxStreamException(
+                "Index sync period must be at least 1; got {$every}."
+            );
+        }
+
+        $this->randomAccessIndexEnabled = true;
+        $this->indexSyncPeriod = $every;
+
+        return $this;
+    }
+
     public function setBufferFlushInterval(int $rows): self
     {
         if ($rows < 1) {
@@ -260,21 +355,47 @@ abstract class BaseXlsxWriter
     }
 
     /**
-     * Auto-size columns from the header text.
+     * Auto-size columns.
      *
-     * Heuristic: width = max(8, mb_strlen(header) + 2). Cheap, no
-     * per-row sampling, no streaming impact. Manual setColumnWidths()
-     * entries override the heuristic for the columns they cover.
+     * Two modes — choose based on the precision/cost tradeoff:
      *
-     * For sample-based auto-fit (scanning N rows of data), wait for
-     * a future release.
+     *   Heuristic (default, cost: zero per row):
+     *     $writer->setAutoColumnWidth();
+     *   Width = max(format-min, mb_strlen(header) + 2, 8.43).
+     *
+     *   Sample-based (opt-in, cost: O(sample) bytes RAM):
+     *     $writer->setAutoColumnWidth(sample: 1000);
+     *   Buffers the first N data rows, computes per-column max char
+     *   length, then drains. Catches columns where the data is wider
+     *   than the header — phone numbers, descriptions, IDs.
+     *
+     *   Strict mode for sample (default lenient):
+     *     $writer->setAutoColumnWidth(sample: 1000, strict: true);
+     *   Strict propagates any internal failure during width tracking.
+     *   Lenient (default) catches it, logs to error_log, and falls back
+     *   to the heuristic — no broken file shipped under load.
+     *
+     * Manual setColumnWidths() entries always win over both modes.
      */
-    public function setAutoColumnWidth(bool $enabled = true): self
+    public function setAutoColumnWidth(bool|int $sample = true, bool $strict = false): self
     {
         if ($this->closed) {
             throw XlsxStreamException::writerAlreadyClosed();
         }
-        $this->autoColumnWidth = $enabled;
+
+        if (is_int($sample)) {
+            if ($sample < 0) {
+                throw new XlsxStreamException(
+                    "Auto-column-width sample size must be >= 0, got {$sample}."
+                );
+            }
+            $this->autoColumnWidth = true;
+            $this->autoWidthSampleSize = $sample > 0 ? $sample : null;
+        } else {
+            $this->autoColumnWidth = $sample;
+            $this->autoWidthSampleSize = null;
+        }
+        $this->autoWidthStrict = $strict;
 
         return $this;
     }
@@ -298,17 +419,24 @@ abstract class BaseXlsxWriter
     /**
      * Apply a number format to a column (1-based).
      *
-     * Accepts a preset name (see StyleRegistry::PRESETS) or a raw Excel
-     * format code. Same code reuses the same style id under the hood.
+     * Accepts:
+     *   - Preset name (see StyleRegistry::PRESETS) — `'date'`, `'currency_try'`
+     *   - Raw Excel format code — `'0.000'`, `'#,##0.00'`
+     *   - Built-in numFmtId int (0-49 reserved range) — `BUILTIN_NUMFMT_DATE`
      *
-     *   $writer->setColumnFormat(2, 'date');           // YYYY-MM-DD
-     *   $writer->setColumnFormat(3, 'currency_try');   // #,##0.00 ₺
-     *   $writer->setColumnFormat(4, '0.000');          // custom code
+     * Built-in ids render with the *reader's* locale (e.g. dd.mm.yyyy in
+     * tr-TR, mm/dd/yyyy in en-US) — useful when the same export ships to
+     * users in multiple regions. Custom format codes are locale-stable.
+     *
+     *   $writer->setColumnFormat(2, 'date');                                // YYYY-MM-DD literal
+     *   $writer->setColumnFormat(3, 'currency_try');                        // #,##0.00 ₺
+     *   $writer->setColumnFormat(4, '0.000');                               // raw code
+     *   $writer->setColumnFormat(5, BaseXlsxWriter::BUILTIN_NUMFMT_DATE);   // locale-aware
      *
      * Numeric values in that column are wrapped with the chosen format.
      * String values pass through unchanged.
      */
-    public function setColumnFormat(int $column, string $presetOrCode): self
+    public function setColumnFormat(int $column, string|int $format): self
     {
         if ($this->closed) {
             throw XlsxStreamException::writerAlreadyClosed();
@@ -319,11 +447,27 @@ abstract class BaseXlsxWriter
         // Range validation is deferred to startNewSheet() — at this point the
         // user may be pre-configuring formats for an upcoming newSheet() call
         // whose column count is different from the current sheet's.
-        $this->columnStyleIds[$column] = $this->styles->registerColumnFormat($presetOrCode);
+
+        if (is_int($format)) {
+            if ($format < 0 || $format > 49) {
+                throw new XlsxStreamException(
+                    "Built-in numFmtId must be 0-49 (Excel reserved range); got {$format}. ".
+                    'Pass a string preset or raw format code for custom formats.'
+                );
+            }
+            $this->columnStyleIds[$column] = $this->styles->registerBuiltinNumFmt($format);
+            // Tag the format name so the auto-width heuristic recognises it
+            // as a known formatted column (defaults to the format-min path).
+            $this->columnFormatNames[$column] = 'builtin:'.$format;
+
+            return $this;
+        }
+
+        $this->columnStyleIds[$column] = $this->styles->registerColumnFormat($format);
         // Stored separately so the auto-width heuristic can pick a sensible
         // minimum based on the format (e.g. currency cells need ~14 chars
         // even when the header is shorter).
-        $this->columnFormatNames[$column] = $presetOrCode;
+        $this->columnFormatNames[$column] = $format;
 
         return $this;
     }
@@ -419,18 +563,155 @@ abstract class BaseXlsxWriter
         $this->currentSheetRow++;
         $this->totalRows++;
 
-        // Build row XML and add to buffer
-        $this->rowBuffer .= $this->buildRowXml($this->currentSheetRow, $row);
+        $rowXml = $this->buildRowXml($this->currentSheetRow, $row);
+
+        // Sample-mode width tracking (opt-in). Buffers row XML + records
+        // per-column max char length until the sample size is reached or
+        // finishFile() drains a partial sample.
+        if ($this->inSampleMode && ! $this->autoWidthFinalized) {
+            $this->trackSampledRow($row, $rowXml);
+            // Two finalize triggers — sample-count target reached, or
+            // accumulated XML bytes hit the safety cap. The byte cap
+            // protects against a misconfigured wide-row × large-sample
+            // combo that would otherwise hold tens of MB in memory.
+            if (
+                count($this->autoWidthSampleBuffer) >= $this->autoWidthSampleSize
+                || $this->autoWidthSampleBufferBytes >= self::SAMPLE_MAX_BUFFER_BYTES
+            ) {
+                $this->finalizeAutoWidthSample();
+            }
+            if ($this->progressCallback !== null && $this->totalRows % $this->progressInterval === 0) {
+                ($this->progressCallback)($this->totalRows, $this->currentOffset);
+            }
+
+            return;
+        }
+
+        // Normal path: append to buffer + periodic flush.
+        $this->rowBuffer .= $rowXml;
         $this->rowBufferCount++;
 
-        // Flush buffer periodically for better streaming
         if ($this->rowBufferCount >= $this->bufferFlushInterval) {
             $this->flushRowBuffer();
         }
 
-        // Progress callback (null-check short-circuits when not registered)
         if ($this->progressCallback !== null && $this->totalRows % $this->progressInterval === 0) {
             ($this->progressCallback)($this->totalRows, $this->currentOffset);
+        }
+    }
+
+    /**
+     * Sample-mode width tracker. Records each cell's char length in
+     * autoWidthMaxLengths and buffers the row's XML for later replay.
+     *
+     * Lenient mode (default) catches any internal failure here, logs to
+     * error_log, and bails out of sample mode — preferring a valid file
+     * with heuristic widths over an HTTP 500. Strict mode propagates
+     * the exception so callers see the failure during testing.
+     */
+    protected function trackSampledRow(array $row, string $rowXml): void
+    {
+        try {
+            $this->updateAutoWidthMaxLengths($row);
+            $this->autoWidthSampleBuffer[] = $rowXml;
+            $this->autoWidthSampleBufferBytes += strlen($rowXml);
+        } catch (\Throwable $e) {
+            if ($this->autoWidthStrict) {
+                throw $e;
+            }
+            error_log(sprintf(
+                'kolay-xlsx-stream: auto-width sample failed at row %d (%s) — falling back to heuristic',
+                count($this->autoWidthSampleBuffer),
+                $e->getMessage()
+            ));
+            $this->autoWidthSampleBuffer[] = $rowXml;
+            $this->autoWidthSampleBufferBytes += strlen($rowXml);
+            $this->bailFromSampleMode();
+        }
+    }
+
+    /**
+     * Inner width-tracker. Factored out so subclasses (and tests) can
+     * override the failure surface without re-implementing the
+     * try/catch + bail logic in trackSampledRow().
+     */
+    protected function updateAutoWidthMaxLengths(array $row): void
+    {
+        foreach ($row as $i => $cell) {
+            $col = $i + 1;
+
+            // DateTime objects can't be cast to string and would crash a
+            // naive (string) coercion. buildRowXml renders them as Excel
+            // serial numbers — the user-visible width in Excel is bounded
+            // by "yyyy-mm-dd hh:mm:ss" (19 characters), so use that as a
+            // conservative upper bound without invoking the formatter.
+            if ($cell instanceof \DateTimeInterface) {
+                $len = 19;
+            } else {
+                $len = mb_strlen((string) $cell);
+            }
+
+            if (! isset($this->autoWidthMaxLengths[$col]) || $len > $this->autoWidthMaxLengths[$col]) {
+                $this->autoWidthMaxLengths[$col] = $len;
+            }
+        }
+    }
+
+    /**
+     * Sample size reached — compute widths, emit preamble (now with the
+     * computed <cols>) + header, drain the sample buffer.
+     */
+    protected function finalizeAutoWidthSample(): void
+    {
+        foreach ($this->autoWidthMaxLengths as $col => $maxLen) {
+            // Honour any explicit setColumnWidths() entry the user already set.
+            if (isset($this->columnWidths[$col])) {
+                continue;
+            }
+            $width = min(255.0, max(8.43, (float) ($maxLen + 2)));
+            $this->columnWidths[$col] = $width;
+            $this->sampleAutoSetWidthCols[] = $col;
+        }
+        $this->autoWidthFinalized = true;
+        $this->inSampleMode = false;
+
+        $this->writeSheetData($this->buildSheetPreambleXml());
+
+        foreach ($this->autoWidthSampleBuffer as $bufferedRowXml) {
+            $this->rowBuffer .= $bufferedRowXml;
+            $this->rowBufferCount++;
+        }
+        $this->autoWidthSampleBuffer = [];
+        $this->autoWidthSampleBufferBytes = 0;
+
+        if ($this->rowBufferCount >= $this->bufferFlushInterval) {
+            $this->flushRowBuffer();
+        }
+    }
+
+    /**
+     * Lenient-mode fallback path. Disables sample mode, emits the
+     * preamble using whatever widths the heuristic produces, and drains
+     * any rows already buffered. Triggered by trackSampledRow() when
+     * width recording fails and strict mode is off.
+     */
+    protected function bailFromSampleMode(): void
+    {
+        $this->autoWidthSampleSize = null;
+        $this->autoWidthFinalized = true;
+        $this->inSampleMode = false;
+
+        $this->writeSheetData($this->buildSheetPreambleXml());
+
+        foreach ($this->autoWidthSampleBuffer as $bufferedRowXml) {
+            $this->rowBuffer .= $bufferedRowXml;
+            $this->rowBufferCount++;
+        }
+        $this->autoWidthSampleBuffer = [];
+        $this->autoWidthSampleBufferBytes = 0;
+
+        if ($this->rowBufferCount >= $this->bufferFlushInterval) {
+            $this->flushRowBuffer();
         }
     }
 
@@ -497,15 +778,97 @@ abstract class BaseXlsxWriter
     }
 
     /**
-     * Flush row buffer to stream
+     * Flush row buffer to stream. When the random-access index is enabled
+     * and the cumulative rows-since-last-sync threshold is reached,
+     * ZLIB_FULL_FLUSH is attached to the deflate_add call carrying the
+     * buffer — which produces a byte-aligned 0x00 0x00 0xFF 0xFF marker
+     * a downstream reader can resume inflation from with a fresh
+     * inflate_init context (no inflatePrime needed).
+     *
+     * Critical nuance: ZLIB_FULL_FLUSH MUST be passed alongside real
+     * input on the same deflate_add call. PHP's zlib does not drain the
+     * encoder's pending output if the flush flag is on a separate empty
+     * deflate_add('', ZLIB_FULL_FLUSH) — the flush still happens but the
+     * bytes only escape on the next input. Tying it to the row-buffer
+     * call keeps every emitted sync marker between two complete <row>
+     * elements, the alignment invariant the reader's row tokenizer
+     * depends on.
      */
     protected function flushRowBuffer(): void
     {
-        if ($this->rowBuffer !== '') {
+        if ($this->rowBuffer === '') {
+            return;
+        }
+
+        $rowsInBuffer = $this->rowBufferCount;
+        $shouldSync = $this->randomAccessIndexEnabled
+            && ($this->rowsSinceSync + $rowsInBuffer) >= $this->indexSyncPeriod;
+
+        if (! $shouldSync) {
             $this->writeSheetData($this->rowBuffer);
+            if ($this->randomAccessIndexEnabled) {
+                $this->rowsSinceSync += $rowsInBuffer;
+            }
             $this->rowBuffer = '';
             $this->rowBufferCount = 0;
+
+            return;
         }
+
+        // Sync path: replicate writeSheetData but with ZLIB_FULL_FLUSH so
+        // the deflate stream has a byte-aligned resume marker right after
+        // the last row in this buffer.
+        hash_update($this->crcContext, $this->rowBuffer);
+        $this->sheetUncompressedSize += strlen($this->rowBuffer);
+
+        $compressed = deflate_add($this->deflateCtx, $this->rowBuffer, ZLIB_FULL_FLUSH);
+        if ($compressed !== false && strlen($compressed) > 0) {
+            $this->writeToDest($compressed);
+            $this->sheetCompressedSize += strlen($compressed);
+        }
+
+        // Sync point points at the FIRST row of the NEXT batch — that is
+        // the row a reader will encounter after seeking to comp_offset
+        // and starting a fresh inflate context.
+        $entry = $this->currentSheetEntry();
+        $this->indexSyncPoints[$entry][] = [
+            'row' => $this->currentSheetRow + 1,
+            'comp_offset' => $this->sheetCompressedSize,
+            'uncomp_offset' => $this->sheetUncompressedSize,
+        ];
+
+        $this->rowsSinceSync = 0;
+        $this->rowBuffer = '';
+        $this->rowBufferCount = 0;
+    }
+
+    /**
+     * Convenience accessor mirroring the path used in startNewSheet().
+     */
+    protected function currentSheetEntry(): string
+    {
+        return "xl/worksheets/sheet{$this->currentSheetIndex}.xml";
+    }
+
+    /**
+     * Serialize the per-sheet sync points into the binary sidecar payload.
+     * Sheets are written in workbook order so the sidecar's section order
+     * matches the workbook.xml sheet listing.
+     */
+    protected function buildRandomAccessIndexPayload(): string
+    {
+        $sheetSections = [];
+        foreach ($this->sheets as $sheet) {
+            $entry = $sheet['filename'];
+            $sheetSections[] = [
+                'entry' => $entry,
+                'total_rows' => $sheet['rows'],
+                'sheet_crc32' => $sheet['crc32'] ?? 0,
+                'sync_points' => $this->indexSyncPoints[$entry] ?? [],
+            ];
+        }
+
+        return RandomAccessIndex::encode($this->indexSyncPeriod, $sheetSections);
     }
 
     /**
@@ -589,28 +952,78 @@ abstract class BaseXlsxWriter
         $this->sheetCompressedSize = 0;
         $this->rowBuffer = '';
         $this->rowBufferCount = 0;
+        $this->rowsSinceSync = 0;
 
-        // Write sheet header
-        $sheetHeader = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
-        $sheetHeader .= '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">';
-        $sheetHeader .= $this->buildSheetViewsXml();
-        $sheetHeader .= $this->buildColsXml();
-        $sheetHeader .= '<sheetData>';
+        // Reset per-sheet sample state (multi-sheet workbooks re-sample
+        // because each sheet may have different column widths). Clear
+        // any widths the previous sheet's sample wrote into columnWidths
+        // so this sheet starts from a clean slate — user-explicit widths
+        // (set via setColumnWidths) survive intentionally.
+        foreach ($this->sampleAutoSetWidthCols as $col) {
+            unset($this->columnWidths[$col]);
+        }
+        $this->sampleAutoSetWidthCols = [];
+        $this->autoWidthSampleBuffer = [];
+        $this->autoWidthSampleBufferBytes = 0;
+        $this->autoWidthMaxLengths = [];
+        $this->autoWidthFinalized = false;
 
-        if (!empty($this->columns)) {
+        $sampleMode = $this->autoColumnWidth
+            && $this->autoWidthSampleSize !== null
+            && $this->autoWidthSampleSize > 0;
+
+        if ($sampleMode) {
+            // Sample mode: defer preamble + header emission until we know
+            // the per-column widths. Seed the width tracker with the
+            // header lengths so a long header still influences the result.
+            $this->inSampleMode = true;
+            if (! empty($this->columns)) {
+                foreach ($this->columns as $i => $headerCell) {
+                    $col = $i + 1;
+                    $len = mb_strlen((string) $headerCell);
+                    $this->autoWidthMaxLengths[$col] = $len;
+                }
+                $this->currentSheetRow = 1; // claim row 1 for the eventual header
+            }
+
+            return;
+        }
+
+        // Normal path: emit preamble + header right away.
+        $this->inSampleMode = false;
+        $this->writeSheetData($this->buildSheetPreambleXml());
+        if (! empty($this->columns)) {
+            $this->currentSheetRow = 1;
+        }
+    }
+
+    /**
+     * Build the deferred preamble (xml decl + worksheet open + sheetViews
+     * + cols + sheetData open + header row when present). Used both by
+     * the immediate-emission path in startNewSheet() and by the
+     * sample-mode finalize/bail paths.
+     */
+    protected function buildSheetPreambleXml(): string
+    {
+        $xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
+        $xml .= '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">';
+        $xml .= $this->buildSheetViewsXml();
+        $xml .= $this->buildColsXml();
+        $xml .= '<sheetData>';
+
+        if (! empty($this->columns)) {
             $headerStyleAttr = $this->headerStyleId !== null ? ' s="'.$this->headerStyleId.'"' : '';
             $headerRow = '<row r="1">';
             foreach ($this->columns as $i => $header) {
-                $cellRef = $this->getColumnLetter($i + 1) . '1';
-                $escaped = $this->fastXmlEscape($header);
-                $headerRow .= '<c r="' . $cellRef . '"' . $headerStyleAttr . ' t="inlineStr"><is><t>' . $escaped . '</t></is></c>';
+                $cellRef = $this->getColumnLetter($i + 1).'1';
+                $escaped = $this->fastXmlEscape((string) $header);
+                $headerRow .= '<c r="'.$cellRef.'"'.$headerStyleAttr.' t="inlineStr"><is><t>'.$escaped.'</t></is></c>';
             }
             $headerRow .= '</row>';
-            $sheetHeader .= $headerRow;
-            $this->currentSheetRow = 1;
+            $xml .= $headerRow;
         }
 
-        $this->writeSheetData($sheetHeader);
+        return $xml;
     }
 
     /**
@@ -748,6 +1161,13 @@ abstract class BaseXlsxWriter
      */
     protected function finishCurrentSheet(): void
     {
+        // If a sample is still pending (e.g. fewer rows than the sample
+        // size were ever written), finalize so the deferred preamble +
+        // header still get emitted before we close the sheet.
+        if ($this->inSampleMode && ! $this->autoWidthFinalized) {
+            $this->finalizeAutoWidthSample();
+        }
+
         $this->flushRowBuffer();
 
         $sheetFooter = '</sheetData>'.$this->buildAutoFilterXml().'</worksheet>';
@@ -762,6 +1182,11 @@ abstract class BaseXlsxWriter
             $this->writeToDest($compressed);
             $this->sheetCompressedSize += strlen($compressed);
         }
+
+        $sheetInfo = end($this->sheets);
+        $this->assertZip32Compatible($this->sheetCompressedSize, "sheet '{$sheetInfo['filename']}' compressed size");
+        $this->assertZip32Compatible($this->sheetUncompressedSize, "sheet '{$sheetInfo['filename']}' uncompressed size");
+        $this->assertZip32Compatible($this->currentOffset, 'cumulative archive offset at end of sheet');
 
         // Write data descriptor
         $descriptor = pack('V', self::DATA_DESCRIPTOR_SIGNATURE);
@@ -785,6 +1210,11 @@ abstract class BaseXlsxWriter
         ];
 
         $this->sheets[count($this->sheets) - 1]['rows'] = $this->currentSheetRow;
+        // Mirror the ZIP-CD CRC into the sheet record so the random-access
+        // index payload can pin the sheet content. Reader compares this
+        // with the live CD CRC at open time and silently invalidates the
+        // index when an external editor rewrote the sheet.
+        $this->sheets[count($this->sheets) - 1]['crc32'] = $this->sheetCrc;
     }
 
     /**
@@ -946,12 +1376,31 @@ abstract class BaseXlsxWriter
     /**
      * Write static ZIP entry
      */
+    /**
+     * Reject writes that would push a 32-bit size or offset field past
+     * its limit. The ZIP local-file-header and central-directory layouts
+     * pack these fields with 'V' (uint32); silently truncating them
+     * produces an archive that opens but lies about every byte position
+     * after the truncation. Caller gets a clear exception instead.
+     */
+    private function assertZip32Compatible(int $value, string $context): void
+    {
+        if ($value > self::ZIP32_MAX_SIZE) {
+            $mb = number_format($value / 1024 / 1024, 1);
+            throw XlsxStreamException::zip32LimitExceeded("{$context} would be {$mb} MB which exceeds the 4 GB ZIP32 limit");
+        }
+    }
+
     protected function writeStaticFile(string $filename, string $content): void
     {
         $uncompressedSize = strlen($content);
         $compressedContent = gzdeflate($content, $this->deflateLevel);
         $compressedSize = strlen($compressedContent);
         $crc32 = crc32($content);
+
+        $this->assertZip32Compatible($uncompressedSize, "static file '{$filename}' uncompressed size");
+        $this->assertZip32Compatible($compressedSize, "static file '{$filename}' compressed size");
+        $this->assertZip32Compatible($this->currentOffset, 'cumulative archive offset before static file');
 
         [$mtime, $mdate] = $this->dosTimeParts(time());
 
@@ -988,6 +1437,14 @@ abstract class BaseXlsxWriter
      */
     protected function writeCentralDirectory(): void
     {
+        $entryCount = count($this->centralDirectory);
+        if ($entryCount > self::ZIP32_MAX_ENTRIES) {
+            throw XlsxStreamException::zip32LimitExceeded(
+                "central directory would carry {$entryCount} entries, exceeding the 65535 ZIP32 limit"
+            );
+        }
+        $this->assertZip32Compatible($this->currentOffset, 'central directory start offset');
+
         $centralDirStart = $this->currentOffset;
         $centralDirSize = 0;
 
@@ -1041,6 +1498,12 @@ abstract class BaseXlsxWriter
             throw XlsxStreamException::headersNotSet();
         }
 
+        // Sample never reached its target — finalize with whatever we
+        // collected so the preamble + header still get emitted.
+        if ($this->inSampleMode && ! $this->autoWidthFinalized) {
+            $this->finalizeAutoWidthSample();
+        }
+
         if ($this->currentSheetRow > 0) {
             $this->flushRowBuffer();
             $this->finishCurrentSheet();
@@ -1051,6 +1514,9 @@ abstract class BaseXlsxWriter
         }
 
         $this->writeStaticFile('xl/styles.xml', $this->getStylesXml());
+        if ($this->randomAccessIndexEnabled) {
+            $this->writeStaticFile(RandomAccessIndex::ENTRY_PATH, $this->buildRandomAccessIndexPayload());
+        }
         $this->writeStaticFile('xl/_rels/workbook.xml.rels', $this->getWorkbookRelsXml());
         $this->writeStaticFile('xl/workbook.xml', $this->getWorkbookXml());
         $this->writeStaticFile('[Content_Types].xml', $this->getContentTypesXml());
@@ -1082,7 +1548,18 @@ abstract class BaseXlsxWriter
 
         $xml .= '
     <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
-    <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+    <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>';
+
+        // Every package part must have a declared content type. The
+        // random-access index sidecar uses extension "bin" which has no
+        // Default mapping, so an explicit Override is required — without
+        // it Excel's strict validator triggers repair mode on open.
+        // application/octet-stream signals "opaque binary, do not interpret".
+        if ($this->randomAccessIndexEnabled) {
+            $xml .= "\n    " . '<Override PartName="/'.RandomAccessIndex::ENTRY_PATH.'" ContentType="application/octet-stream"/>';
+        }
+
+        $xml .= '
 </Types>';
 
         return $xml;
