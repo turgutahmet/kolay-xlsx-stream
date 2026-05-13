@@ -239,7 +239,7 @@ class StreamingSheetReader
                 return -1;
             }
             $next = $s[$found + 4] ?? '';
-            if ($next === ' ' || $next === '>' || $next === "\t" || $next === "\n" || $next === "/") {
+            if ($next === ' ' || $next === '>' || $next === "\t" || $next === "\n" || $next === '/') {
                 return $found;
             }
             $pos = $found + 4;

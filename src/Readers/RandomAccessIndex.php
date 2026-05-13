@@ -23,7 +23,7 @@ use Kolay\XlsxStream\Exceptions\XlsxReadException;
  */
 class RandomAccessIndex
 {
-    public const MAGIC = "KXSI";
+    public const MAGIC = 'KXSI';
     public const VERSION = 2;
     public const ENTRY_PATH = 'xl/_kxs/index.bin';
 

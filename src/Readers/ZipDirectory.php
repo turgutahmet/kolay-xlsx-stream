@@ -91,8 +91,9 @@ class ZipDirectory
             throw XlsxReadException::zip64NotSupported();
         }
 
-        $cdAbsOffset = $eocd['cdOffset'];
-        $cdSize = $eocd['cdSize'];
+        $cdAbsOffset = (int) $eocd['cdOffset'];
+        $cdSize = (int) $eocd['cdSize'];
+        $totalEntries = (int) $eocd['totalEntries'];
         $tailFileOffset = $size - $tailLen;
 
         // CD often falls inside the tail prefetch — saves a round-trip.
@@ -102,7 +103,7 @@ class ZipDirectory
             $cdBytes = $source->range($cdAbsOffset, $cdSize);
         }
 
-        return self::parseCentralDirectory($cdBytes, $eocd['totalEntries']);
+        return self::parseCentralDirectory($cdBytes, $totalEntries);
     }
 
     private static function findEocd(string $tail): int

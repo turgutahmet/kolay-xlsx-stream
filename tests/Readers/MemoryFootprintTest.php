@@ -31,6 +31,10 @@ class MemoryFootprintTest extends TestCase
 
     public function test_streaming_read_uses_bounded_memory_delta(): void
     {
+        if (! function_exists('memory_reset_peak_usage')) {
+            $this->markTestSkipped('memory_reset_peak_usage() requires PHP 8.3+');
+        }
+
         $w = new SinkableXlsxWriter(new FileSink($this->testFile));
         $w->startFile(['id', 'value']);
         for ($i = 1; $i <= 100_000; $i++) {
