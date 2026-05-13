@@ -1,17 +1,21 @@
 {
     "name": "kolay/xlsx-stream",
-    "description": "High-performance XLSX streaming writer for Laravel with zero disk I/O and direct S3 support",
+    "description": "Streaming XLSX reader and writer for PHP and Laravel. Constant memory regardless of file size, direct S3 multipart streaming, optional born-indexed random access.",
     "keywords": [
         "laravel",
+        "php",
         "excel",
         "xlsx",
         "streaming",
+        "reader",
+        "writer",
+        "import",
+        "export",
         "s3",
         "aws",
-        "export",
-        "spreadsheet",
-        "performance",
-        "memory-efficient"
+        "random-access",
+        "born-indexed",
+        "ooxml"
     ],
     "homepage": "https://github.com/turgutahmet/kolay-xlsx-stream",
     "license": "MIT",
