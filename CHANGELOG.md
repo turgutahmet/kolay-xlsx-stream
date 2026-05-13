@@ -5,7 +5,7 @@ All notable changes to `kolay/xlsx-stream` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [3.0.0] — 2026-05-06
+## [3.0.0] — 2026-05-13
 
 The package becomes **bidirectional**: a streaming reader is added
 alongside the existing writer, plus an opt-in random-access primitive
@@ -142,9 +142,60 @@ working untouched.
 - 95 new tests across the reader suite (foundation, cell tokenizer,
   streaming sheet reader, facade, multi-sheet resolver, shared strings,
   external XLSX round-trip, random-access decoder, random-access read).
-- Test suite total: **194 tests, 485 assertions, all green**.
-- Memory profile across the entire reader+writer suite stays at 38 MB
+- Plus **74 hardening tests** added during the RC cycle (ZIP32 guards,
+  STORED-method worksheets, forged sst metadata, max-column boundary,
+  stale-index detection, builtin numFmtId overload, sample byte cap,
+  PhpStreamSink, OOXML compliance for indexed XLSX).
+- Test suite total: **268 tests, all green**.
+- Memory profile across the entire reader+writer suite stays under 40 MB
   peak — no inflation versus v2.2.2.
+
+### Pre-RC hardening
+
+Real bugs caught during three external review cycles before the v3.0-rc.1
+tag (2026-05-09) and addressed before the final tag:
+
+- **Stale-index detection** — when an external editor (Excel, OpenSpout)
+  rewrites a sheet, the embedded sheet CRC32 cross-check trips and the
+  reader silently falls back to a sequential scan. Verified by
+  `RandomAccessIndexWriterTest::stale_rewritten_sheet_falls_back`.
+- **Excel repair mode fix** — `[Content_Types].xml` now declares an
+  Override for the `xl/_kxs/index.bin` sidecar
+  (`application/octet-stream`). Without it Excel flagged the file as
+  repairable on first open.
+- **Forged sst metadata defense** — three-stage guard chain on the
+  shared-strings entry: compressed-size limit (20 MB), uncompressed-size
+  limit (100 MB), and a post-inflate `strlen()` check that catches
+  forged CD metadata.
+- **ZIP32 limit guards** — writer rejects archives exceeding 4 GB or
+  65,535 entries with a clear error instead of silent truncation.
+- **Reader max row XML cap** — 16 MB ceiling on any single `<row>`
+  element guards against malicious sparse rows.
+- **Auto-width sample byte cap** — 8 MB buffer ceiling prevents pathological
+  payloads from forcing unbounded sample collection; switches to
+  heuristic when reached.
+- **64-bit PHP guard** — `RandomAccessIndex::decode()` checks `PHP_INT_SIZE`
+  before `unpack('P')` to fail loudly on 32-bit builds.
+- **CellTokenizer max column guard** — column references past Excel's
+  `XFD` (16,383) are rejected at parse time instead of overflowing into
+  silent bad reads.
+- **Random-access index semantic validation** — monotonic sync-point
+  offsets, duplicate-sheet detection, path-length cap, trailing-byte
+  rejection, comp_offset bounded by compressed size from the central
+  directory.
+- **STORED-method worksheets** — reader handles entries with compression
+  method 0 (uncompressed) alongside DEFLATE for tooling
+  (PhpSpreadsheet, certain Java exporters) that doesn't always compress
+  worksheet entries.
+- **`use1904Epoch()` auto-detect** — `xl/workbook.xml`'s
+  `workbookPr/@date1904` attribute is read at workbook open; callers
+  on Mac-origin files no longer need to call the setter manually.
+- **Reader column casts reset** — switching active sheet via `onSheet()`
+  / `onSheetIndex()` clears column casts; the previous behaviour leaked
+  casts across sheets.
+- **Slow-network protection** — reader breaks out of empty-read loops
+  after 100 retries × 10 ms and surfaces `XlsxReadException::sourceUnreadable`
+  instead of spinning.
 
 ### Compatibility
 

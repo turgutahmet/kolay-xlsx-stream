@@ -42,11 +42,84 @@ php benchmark-random-access.php    # rowAt + rowCount, plain vs indexed
 
 ---
 
-## 1. Write benchmark
+## 1. Cross-package comparison — 100K rows (May 2026)
+
+Fresh `composer create-project` of each package, latest stable versions on
+2026-05-13, identical 8-column mixed-type workload (`int, string, string,
+enum, float, date, enum, string`). Single Apple Silicon laptop, PHP 8.2.28,
+no swap pressure, each package runs in its own process. `kolay/xlsx-stream`
+configured with `setCompressionLevel(1)->setBufferFlushInterval(10000)` —
+all other packages at their out-of-the-box defaults.
+
+### 1.1 Write — 100,000 rows
+
+| # | Package | Version | Time | rows/sec | Peak RAM | File |
+|---:|---|---|---:|---:|---:|---:|
+| 1 | **kolay/xlsx-stream** (tuned) | **3.0.0** | **0.65 s** | **153,216** | 11.79 MB | 5.64 MB |
+| 1b | kolay/xlsx-stream (default) | 3.0.0 | 1.26 s | 79,637 | 4 MB | 4.47 MB |
+| 2 | avadim/fast-excel-writer | 6.12.0 | 5.23 s | 19,127 | 4 MB | 4.34 MB |
+| 3 | openspout/openspout | 5.7.0 | 5.77 s | 17,321 | 2 MB | 4.33 MB |
+| 4 | rap2hpoutre/fast-excel | 5.7.0 | 7.30 s | 13,697 | 4 MB | 4.06 MB |
+| 5 | phpoffice/phpspreadsheet | 5.7.0 | 30.62 s | 3,265 | 531 MB | 4.82 MB |
+
+### 1.2 Read — 100,000 rows
+
+Each reader operates on the output of its own writer (apples-to-apples
+round trip rather than testing cross-tool decode).
+
+| # | Package | Version | Time | rows/sec | Peak RAM |
+|---:|---|---|---:|---:|---:|
+| 1 | **kolay/xlsx-stream** | **3.0.0** | **1.75 s** | **57,043** | 4 MB |
+| 2 | avadim/fast-excel-reader | 3.0.1 | 4.60 s | 21,752 | 2 MB |
+| 3 | rap2hpoutre/fast-excel | 5.7.0 | 8.50 s | 11,761 | 4 MB |
+| 4 | openspout/openspout | 5.7.0 | 9.90 s | 10,105 | 2 MB |
+| 5 | phpoffice/phpspreadsheet | 5.7.0 | 29.95 s | 3,339 | 434 MB |
+
+### 1.3 Headline — speedup vs nearest peer (avadim 6.12 / 3.0.1)
+
+| Comparison | Write | Read |
+|---|---:|---:|
+| kxs tuned vs avadim | **8.0×** faster | **2.6×** faster |
+| kxs default vs avadim | 4.2× faster | 2.4× faster |
+| kxs tuned vs OpenSpout | 8.9× faster | 5.7× faster |
+| kxs tuned vs fast-excel | 11.2× faster | 4.9× faster |
+| kxs tuned vs PhpSpreadsheet | 47.1× faster | 17.1× faster |
+
+PhpSpreadsheet is in a different category — full Excel feature support
+(charts, pivot tables, conditional formatting). For pure data pipelines
+the streaming packages are 5–47× faster and 100×+ smaller in peak RAM.
+
+### 1.4 kxs default vs tuned — the dial users can turn
+
+| Metric | Default (`lvl=6, flush=1K`) | Tuned (`lvl=1, flush=10K`) | Δ |
+|---|---:|---:|---:|
+| Write time | 1.26 s | **0.65 s** | **−48 %** |
+| Write rows/sec | 79,637 | **153,216** | **+92 %** |
+| Read time | 2.28 s | **1.75 s** | **−23 %** |
+| Read rows/sec | 43,816 | **57,043** | **+30 %** |
+| Write peak RAM | 4 MB | 11.79 MB | +7.8 MB (10K row buffer) |
+| File size | 4.47 MB | 5.64 MB | +26 % (level 1 compresses less) |
+
+**Trade-off summary:**
+
+| Scenario | Recommended kxs config |
+|---|---|
+| Maximum throughput, RAM available | `setCompressionLevel(1)->setBufferFlushInterval(10000)` |
+| Sweet spot — fast + good compression | `setCompressionLevel(3)` (≈ same speed as level 1 at 10K rows, ~3.6 % smaller file) |
+| Smallest file, RAM-constrained | Default (`level=6, flush=1000`) |
+| S3 multipart, parallel | Default + `setCompressionLevel(3)` (network-bound; file size matters more than CPU) |
+
+Compression-level numbers above level 1 were measured at the 10K-row
+microbench scale. The default-config 100K row run (`lvl=6`) shown in §1.1
+remains the authoritative cross-package baseline.
+
+---
+
+## 2. Write benchmark — internal scaling (v3.0 vs v2.2.2)
 
 `php benchmark-comprehensive.php`. The same dataset is written first to a local temp file, then to S3 via `S3MultipartSink`. Local tests cap at 2M rows (matches the v2.2.2 baseline); S3 runs the full series.
 
-### 1.1 Wall time + throughput + memory
+### 2.1 Wall time + throughput + memory
 
 | Rows | Local Speed | Local Time | Local Mem | S3 Speed | S3 Time | S3 Memory | File Size |
 |---|---|---|---|---|---|---|---|
@@ -68,7 +141,7 @@ php benchmark-random-access.php    # rowAt + rowCount, plain vs indexed
 | 4,000,000 | – | – | – | 128,971 rows/s | 31.01s | 159 MB (±156) | 158 MB |
 | 4,500,000 | – | – | – | 119,914 rows/s | 37.53s | 178 MB (±179) | 178 MB |
 
-### 1.2 Memory profile (chart)
+### 2.2 Memory profile (chart)
 
 Local writer peaks stay flat at **0 MB** (allocator chunk granularity hides the small row buffer). S3 sawtooth grows linearly with multipart buffer size — same pattern as v2.2.2.
 
@@ -81,7 +154,7 @@ Local writer peaks stay flat at **0 MB** (allocator chunk granularity hides the 
  4.5M │ ─                          4.5M │ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ 178
 ```
 
-### 1.3 Throughput vs row count
+### 2.3 Throughput vs row count
 
 Local sustains 209–222K rows/s once warm-up amortises (rows above 5K). S3 scales with file size and saturates around 109–129K rows/s for ≥750K rows.
 
@@ -97,7 +170,7 @@ Local sustains 209–222K rows/s once warm-up amortises (rows above 5K). S3 scal
         legend: ▓ local  ░ S3 (rows/s, max=221,895)
 ```
 
-### 1.4 Cross-version comparison
+### 2.4 Cross-version comparison
 
 Same machine, same workload, same compression level. Numbers within a few percent are measurement noise.
 
@@ -112,11 +185,11 @@ The v3.0 writer's default code path is unchanged from v2.2.2 — the only writer
 
 ---
 
-## 2. Read benchmark — new in v3.0
+## 3. Read benchmark — new in v3.0
 
-`php benchmark-read.php`. For each row size, the script writes a temp XLSX (via the same writer used in Section 1) then reads it back through `StreamingXlsxReader::fromFile()` or `::fromS3()`. Multi-sheet workbooks (above the per-sheet 1,048,576 limit) are read in full across every sheet.
+`php benchmark-read.php`. For each row size, the script writes a temp XLSX (via the same writer used in Section 2) then reads it back through `StreamingXlsxReader::fromFile()` or `::fromS3()`. Multi-sheet workbooks (above the per-sheet 1,048,576 limit) are read in full across every sheet.
 
-### 2.1 Wall time + throughput + memory
+### 3.1 Wall time + throughput + memory
 
 | Rows | Local Speed | Local Time | Local Peak RAM | S3 Speed | S3 Time | S3 Peak RAM | File Size |
 |---|---|---|---|---|---|---|---|
@@ -138,7 +211,7 @@ The v3.0 writer's default code path is unchanged from v2.2.2 — the only writer
 | 4,000,000 | – | – | – | 62,956 rows/s | 63.54s | 22 MB | 158 MB |
 | 4,500,000 | – | – | – | 62,198 rows/s | 72.35s | 22 MB | 178 MB |
 
-### 2.2 Memory profile — bounded by construction
+### 3.2 Memory profile — bounded by construction
 
 ```
    100 │ ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ 22
@@ -154,7 +227,7 @@ The v3.0 writer's default code path is unchanged from v2.2.2 — the only writer
 
 **Reader peak RAM is 22–24 MB across every row count — independent of file size.** That envelope is dominated by PHP's runtime baseline (opcache, autoload, php-cli overhead). The reader's own working set is a 64 KB compressed read chunk + ~256 KB inflated buffer + at most one in-progress `<row>` XML element. RAM never grows with file size.
 
-### 2.3 Throughput vs row count
+### 3.3 Throughput vs row count
 
 ```
    1K │ ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ 69,553
@@ -170,7 +243,7 @@ The v3.0 writer's default code path is unchanged from v2.2.2 — the only writer
 
 Local sustains ~70K rows/s independent of file size. S3 cold-cache ramps with file size as TTFB amortises across more bytes; saturates at ~60K rows/s for files ≥750K rows.
 
-### 2.4 Comparison with other PHP readers
+### 3.4 Comparison with other PHP readers
 
 | Package | 1M-row read time | Peak RAM | S3 native |
 |---|---|---|---|
@@ -183,11 +256,11 @@ Numbers for OpenSpout / PhpSpreadsheet are characteristic ranges from public ben
 
 ---
 
-## 3. Random-access benchmark — new in v3.0
+## 4. Random-access benchmark — new in v3.0
 
 `php benchmark-random-access.php 500000`. The script writes two XLSX files of identical content — one plain, one with `withRandomAccessIndex(every: 10_000)` — then measures `rowAt(N)` latency at increasing target positions plus `rowCount()`. Both files are visually identical when opened in any XLSX reader; only the indexed one carries a `xl/_kxs/index.bin` sidecar that the matched reader uses for O(1) seeks.
 
-### 3.1 Write cost of indexing
+### 4.1 Write cost of indexing
 
 | Metric | Plain | Indexed | Δ |
 |---|---|---|---|
@@ -197,7 +270,7 @@ Numbers for OpenSpout / PhpSpreadsheet are characteristic ranges from public ben
 
 Original design predicted ≤0.5 % file-size penalty and ≤0.06 % wall-time penalty. Measured penalty is **16× below** the file-size ceiling and below the noise floor on wall time. **Indexing is essentially free at write time.**
 
-### 3.2 Sequential read transparency
+### 4.2 Sequential read transparency
 
 The sync markers are valid DEFLATE — invisible to a sequential reader. Both files yield identical row counts:
 
@@ -208,7 +281,7 @@ The sync markers are valid DEFLATE — invisible to a sequential reader. Both fi
 
 Differences fall inside measurement noise. **Sequential read pays no observable cost for indexing.**
 
-### 3.3 `rowAt(N)` latency — plain vs indexed
+### 4.3 `rowAt(N)` latency — plain vs indexed
 
 | Target Row | Plain (full scan) | Indexed (sync + scan) | Speedup |
 |---|---|---|---|
@@ -225,7 +298,7 @@ Differences fall inside measurement noise. **Sequential read pays no observable 
 
 Speedup grows with target row depth because plain scan time scales linearly with row index; indexed scan time is bounded by the sync period (≤10,000 rows ≈ 70–150 ms inflate work) plus a single source-range fetch. The 70–150 ms alternation is the chunk-cycle pattern: when the target lands inside the first inflated chunk it's near zero extra work; one chunk further requires one more 64 KB inflate call.
 
-### 3.4 `rowCount()` — O(N) full scan vs O(1) sidecar lookup
+### 4.4 `rowCount()` — O(N) full scan vs O(1) sidecar lookup
 
 | Variant | Time | Result |
 |---|---|---|
@@ -235,7 +308,7 @@ Speedup grows with target row depth because plain scan time scales linearly with
 
 The indexed reader reads `total_rows` straight out of the sidecar header — one CRC32-validated 16-byte read, no inflation, no XML parse. The full-scan path inflates and tokenizes every row to count them.
 
-### 3.5 Random-access speedup chart
+### 4.5 Random-access speedup chart
 
 ```
   50K │ ▓▓▓▓▓▓▓ 0.67s
@@ -253,7 +326,7 @@ The indexed reader reads `total_rows` straight out of the sidecar header — one
 
 ---
 
-## 4. Methodology & reproducibility
+## 5. Methodology & reproducibility
 
 ### Scripts
 
@@ -309,7 +382,7 @@ Identical to the v1.x and v2.2.2 baselines so cross-version comparisons stay cle
 
 ---
 
-## 5. Comparison table — what changed since v2.2.2
+## 6. Comparison table — what changed since v2.2.2
 
 | Workload | v3.0 | v2.2.2 | Diff |
 |---|---|---|---|

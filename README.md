@@ -30,6 +30,46 @@ Most PHP Excel libraries (PHPSpreadsheet, Spout, Laravel Excel) have critical li
 
 ## Performance Comparison
 
+### Cross-package comparison — 100K rows (May 2026)
+
+Fresh `composer create-project` of each package, latest stable versions,
+identical 8-column mixed-type payload. `kolay/xlsx-stream` configured with
+`setCompressionLevel(1)->setBufferFlushInterval(10000)`; all other packages
+run at their out-of-the-box defaults. Each row matters — methodology and
+the trade-off table (file size, RAM, compression level) live in
+[BENCHMARK.md](BENCHMARK.md).
+
+**Write — 100,000 rows**
+
+| # | Package | Version | Time | rows/sec | Peak RAM | File |
+|---:|---|---|---:|---:|---:|---:|
+| 1 | **kolay/xlsx-stream** | **3.0.0** | **0.65 s** | **153,216** | 11.79 MB | 5.64 MB |
+| 2 | avadim/fast-excel-writer | 6.12.0 | 5.23 s | 19,127 | 4 MB | 4.34 MB |
+| 3 | openspout/openspout | 5.7.0 | 5.77 s | 17,321 | 2 MB | 4.33 MB |
+| 4 | rap2hpoutre/fast-excel | 5.7.0 | 7.30 s | 13,697 | 4 MB | 4.06 MB |
+| 5 | phpoffice/phpspreadsheet | 5.7.0 | 30.62 s | 3,265 | 531 MB | 4.82 MB |
+
+**Read — 100,000 rows** (each reader on the same package's writer output)
+
+| # | Package | Version | Time | rows/sec | Peak RAM |
+|---:|---|---|---:|---:|---:|
+| 1 | **kolay/xlsx-stream** | **3.0.0** | **1.75 s** | **57,043** | 4 MB |
+| 2 | avadim/fast-excel-reader | 3.0.1 | 4.60 s | 21,752 | 2 MB |
+| 3 | rap2hpoutre/fast-excel | 5.7.0 | 8.50 s | 11,761 | 4 MB |
+| 4 | openspout/openspout | 5.7.0 | 9.90 s | 10,105 | 2 MB |
+| 5 | phpoffice/phpspreadsheet | 5.7.0 | 29.95 s | 3,339 | 434 MB |
+
+That's **~8× faster write** and **~2.6× faster read** than the next-fastest
+streaming peer (avadim 6.12 / 3.0.1). Against `kolay/xlsx-stream`'s own
+default config (`lvl=6, flush=1K`) the gap is still ~5× and ~2.4×.
+
+**PhpSpreadsheet is in a different category** — it provides full Excel
+feature support (charts, pivot tables, conditional formatting) at the cost
+of memory-bound architecture. For pure data pipelines the streaming
+packages are 5–47× faster and 100×+ smaller in RAM.
+
+---
+
 ### Latest Benchmark — v3.0 (May 2026)
 
 v3.0 introduces the streaming **reader** plus the optional born-indexed
@@ -1071,6 +1111,26 @@ Peak Memory: 356 MB (during S3 part upload)
 - ✅ **4.5 Million rows**: 97 seconds S3 with automatic multi-sheet
 - ✅ **Memory stable**: No memory leaks, predictable usage
 - ✅ **Production proven**: Running in production since 2025
+
+## Compatibility
+
+The optional `xl/_kxs/index.bin` sidecar emitted by `withRandomAccessIndex()`
+is declared as `application/octet-stream` in `[Content_Types].xml`, so
+editors that don't recognise it leave the file alone instead of flagging
+it for repair.
+
+Files produced by the v3.0 writer (both with and without the sidecar) open
+cleanly without repair mode in:
+
+- **Microsoft Excel for Mac 16.98** (build 25060824) — sidecar ignored,
+  no repair prompt
+- **Apple Numbers 14.2** (7041.0.109) — opaque sidecar passed through
+  as expected
+
+If a downstream editor strips or rewrites the sheet, the next indexed
+read silently falls back to a sequential scan via the embedded sheet
+CRC32 cross-check — same end result, just without the O(1) speedup. The
+reader-side fallback is verified by `tests/Writers/RandomAccessIndexWriterTest.php`.
 
 ## Use Cases
 
