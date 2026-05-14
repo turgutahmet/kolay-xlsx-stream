@@ -5,6 +5,18 @@ All notable changes to `kolay/xlsx-stream` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.1] — 2026-05-14
+
+### Changed
+
+- **Widened `aws/aws-sdk-php` constraint** from `^3.300` to `^3.180`. The
+  package only touches stable S3 surface (`S3Client`, `getObject`,
+  `createMultipartUpload`, `uploadPart`, `completeMultipartUpload`,
+  `abortMultipartUpload`, `AwsException`) — all of which have been
+  present since the early 3.x line. `^3.300` was unnecessarily
+  restrictive and blocked projects whose `composer.lock` had pinned
+  an older but still-current aws-sdk-php release (e.g. 3.288.x).
+
 ## [3.0.0] — 2026-05-13
 
 The package becomes **bidirectional**: a streaming reader is added
