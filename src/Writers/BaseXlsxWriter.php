@@ -110,6 +110,16 @@ abstract class BaseXlsxWriter
     /** @var array<int, string> 1-based column index => format preset name (used for auto-width sizing) */
     protected array $columnFormatNames = [];
 
+    /**
+     * Memoized merge of a per-row style with a column number format.
+     * Keyed [rowStyleId][columnStyleId] => merged cellXfs id. Keeps the
+     * styled hot path off StyleRegistry's O(n) dedup scan after the first
+     * time a (row-style, column) pair is seen.
+     *
+     * @var array<int, array<int, int>>
+     */
+    protected array $rowStyleMergeCache = [];
+
     // Sheet view options (v2.2+)
     protected int $freezeRows = 0;
     protected int $freezeColumns = 0;
@@ -293,6 +303,38 @@ abstract class BaseXlsxWriter
         $this->headerStyleId = $this->styles->registerHeaderStyle($options);
 
         return $this;
+    }
+
+    /**
+     * Register a reusable per-row style and return its id, to be passed as
+     * the second argument of writeRow().
+     *
+     * Options are identical to setHeaderStyle(): fill (background #RRGGBB),
+     * color (text #RRGGBB), bold, size, name. Register each logical style
+     * once up front, then stamp it on whichever rows you choose:
+     *
+     *   $failed = $writer->registerRowStyle(['fill' => '#FFC7CE', 'color' => '#9C0006']);
+     *   $vip    = $writer->registerRowStyle(['fill' => '#1F4E78', 'color' => '#FFFFFF']);
+     *
+     *   foreach ($rows as $r) {
+     *       $writer->writeRow($r->toArray(), $r->failed ? $failed : null);
+     *   }
+     *
+     * Styles are dedup'd, so one logical style is a single styles.xml entry
+     * no matter how many rows use it — memory stays flat. Passing null (the
+     * writeRow default) keeps a row on the unstyled fast path at zero cost.
+     *
+     * A styled row still honours column number formats: a currency or date
+     * column keeps its format and gains the row's fill/color (the two are
+     * merged on the fly, also dedup'd).
+     */
+    public function registerRowStyle(array $options): int
+    {
+        if ($this->closed) {
+            throw XlsxStreamException::writerAlreadyClosed();
+        }
+
+        return $this->styles->registerRowStyle($options);
     }
 
     /**
@@ -538,7 +580,7 @@ abstract class BaseXlsxWriter
     /**
      * Write a single row (handles multi-sheet automatically)
      */
-    public function writeRow(array $row): void
+    public function writeRow(array $row, ?int $styleId = null): void
     {
         if (!$this->started) {
             throw XlsxStreamException::headersNotSet();
@@ -563,7 +605,7 @@ abstract class BaseXlsxWriter
         $this->currentSheetRow++;
         $this->totalRows++;
 
-        $rowXml = $this->buildRowXml($this->currentSheetRow, $row);
+        $rowXml = $this->buildRowXml($this->currentSheetRow, $row, $styleId);
 
         // Sample-mode width tracking (opt-in). Buffers row XML + records
         // per-column max char length until the sample size is reached or
@@ -1218,10 +1260,19 @@ abstract class BaseXlsxWriter
     }
 
     /**
-     * Build row XML with optimization
+     * Build row XML with optimization.
+     *
+     * The unstyled path ($rowStyleId === null) is the hot path and is kept
+     * byte-for-byte identical to pre-v3.0.2 — a single null check delegates
+     * the rare styled case to buildStyledRowXml so the common case pays
+     * nothing for the feature.
      */
-    protected function buildRowXml(int $rowIndex, array $data): string
+    protected function buildRowXml(int $rowIndex, array $data, ?int $rowStyleId = null): string
     {
+        if ($rowStyleId !== null) {
+            return $this->buildStyledRowXml($rowIndex, $data, $rowStyleId);
+        }
+
         $cells = [];
         $colIndex = 1;
         // Hoist the styles-empty check so the fast (unstyled) path skips the
@@ -1291,6 +1342,105 @@ abstract class BaseXlsxWriter
         }
 
         return '<row r="' . $rowIndex . '">' . implode('', $cells) . '</row>';
+    }
+
+    /**
+     * Styled-row variant of buildRowXml — stamps $rowStyleId onto every cell
+     * so the whole row carries the fill/font, including empty cells (so the
+     * highlight doesn't show gaps).
+     *
+     * Number formats still win their cell: where a column has its own format,
+     * the row's fill/font is merged with that column's numFmt (memoized in
+     * rowStyleMergeCache) rather than overwriting it. Type detection mirrors
+     * buildRowXml exactly; only the s="N" attribute differs.
+     */
+    protected function buildStyledRowXml(int $rowIndex, array $data, int $rowStyleId): string
+    {
+        $cells = [];
+        $colIndex = 1;
+        $hasColumnStyles = ! empty($this->columnStyleIds);
+        // Hoist the row's style attribute so it's stringified once per row,
+        // not once per cell. Cells that need a merged (column-format) style
+        // build their own; everything else reuses this.
+        $sAttr = ' s="' . $rowStyleId . '"';
+
+        foreach ($data as $value) {
+            $cellRef = $this->getColumnLetter($colIndex) . $rowIndex;
+            $col = $colIndex;
+            $colIndex++;
+
+            // Null / empty string -> empty but still filled cell
+            if ($value === null || $value === '') {
+                $cells[] = '<c r="' . $cellRef . '"' . $sAttr . '/>';
+                continue;
+            }
+
+            // Boolean -> native Excel boolean cell
+            if (is_bool($value)) {
+                $cells[] = '<c r="' . $cellRef . '"' . $sAttr . ' t="b"><v>' . ($value ? 1 : 0) . '</v></c>';
+                continue;
+            }
+
+            // DateTimeInterface -> Excel serial date; merge row style with the
+            // column's date format (or the legacy datetime style as fallback).
+            if ($value instanceof \DateTimeInterface) {
+                $serial = ($value->getTimestamp() - self::EXCEL_EPOCH_TIMESTAMP) / 86400;
+                $columnStyleId = $hasColumnStyles && isset($this->columnStyleIds[$col])
+                    ? $this->columnStyleIds[$col]
+                    : self::STYLE_DATETIME;
+                $styleId = $this->mergeRowStyleWithColumnStyle($rowStyleId, $columnStyleId);
+                $cells[] = '<c r="' . $cellRef . '" s="' . $styleId . '" t="n"><v>' . $serial . '</v></c>';
+                continue;
+            }
+
+            // Numeric values
+            if (is_int($value) || is_float($value)) {
+                if ($hasColumnStyles && isset($this->columnStyleIds[$col])) {
+                    $styleId = $this->mergeRowStyleWithColumnStyle($rowStyleId, $this->columnStyleIds[$col]);
+                    $cells[] = '<c r="' . $cellRef . '" s="' . $styleId . '" t="n"><v>' . $value . '</v></c>';
+                } else {
+                    $cells[] = '<c r="' . $cellRef . '"' . $sAttr . ' t="n"><v>' . $value . '</v></c>';
+                }
+                continue;
+            }
+
+            // Numeric strings: preserve as string when precision/format would be lost
+            if (is_string($value) && is_numeric($value)) {
+                if ($this->shouldPreserveNumericString($value)) {
+                    $escaped = $this->fastXmlEscape($value);
+                    $cells[] = '<c r="' . $cellRef . '"' . $sAttr . ' t="inlineStr"><is><t>' . $escaped . '</t></is></c>';
+                } elseif ($hasColumnStyles && isset($this->columnStyleIds[$col])) {
+                    $styleId = $this->mergeRowStyleWithColumnStyle($rowStyleId, $this->columnStyleIds[$col]);
+                    $cells[] = '<c r="' . $cellRef . '" s="' . $styleId . '" t="n"><v>' . (0 + $value) . '</v></c>';
+                } else {
+                    $cells[] = '<c r="' . $cellRef . '"' . $sAttr . ' t="n"><v>' . (0 + $value) . '</v></c>';
+                }
+                continue;
+            }
+
+            // String / Stringable / other -> inlineStr
+            $escaped = $this->fastXmlEscape((string)$value);
+
+            if ($escaped !== '' && ($escaped[0] === ' ' || $escaped[0] === "\t" ||
+                $escaped[strlen($escaped) - 1] === ' ' || $escaped[strlen($escaped) - 1] === "\t")) {
+                $cells[] = '<c r="' . $cellRef . '"' . $sAttr . ' t="inlineStr"><is><t xml:space="preserve">' . $escaped . '</t></is></c>';
+            } else {
+                $cells[] = '<c r="' . $cellRef . '"' . $sAttr . ' t="inlineStr"><is><t>' . $escaped . '</t></is></c>';
+            }
+        }
+
+        return '<row r="' . $rowIndex . '">' . implode('', $cells) . '</row>';
+    }
+
+    /**
+     * Memoized wrapper over StyleRegistry::mergeRowStyleWithColumn so a
+     * (row-style, column-style) pair only hits the registry's dedup scan
+     * once, not on every styled cell.
+     */
+    protected function mergeRowStyleWithColumnStyle(int $rowStyleId, int $columnStyleId): int
+    {
+        return $this->rowStyleMergeCache[$rowStyleId][$columnStyleId]
+            ??= $this->styles->mergeRowStyleWithColumn($rowStyleId, $columnStyleId);
     }
 
     /**
