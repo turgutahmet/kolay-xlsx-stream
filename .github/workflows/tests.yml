@@ -57,6 +57,12 @@ jobs:
 
       - name: Install dependencies
         run: |
+          # Laravel test-scaffolding deps (illuminate/support, orchestra/testbench)
+          # pull in laravel/framework, whose full v10–v13 range is currently flagged
+          # by security advisories. Newer Composer blocks advisory-affected installs
+          # by default; these are dev/test-only deps (not shipped), so opt out here.
+          # `|| true` keeps it a no-op on older Composer that lacks the policy key.
+          composer config --no-plugins policy.advisories.block false || true
           composer require \
             "illuminate/support:${{ matrix.laravel }}" \
             "orchestra/testbench:${{ matrix.testbench }}" \
@@ -83,7 +89,9 @@ jobs:
           coverage: none
 
       - name: Install dependencies
-        run: composer update --prefer-dist --no-interaction --no-progress
+        run: |
+          composer config --no-plugins policy.advisories.block false || true
+          composer update --prefer-dist --no-interaction --no-progress
 
       - name: Run PHPStan
         run: vendor/bin/phpstan analyse --no-progress --memory-limit=1G
@@ -102,7 +110,9 @@ jobs:
           coverage: none
 
       - name: Install dependencies
-        run: composer update --prefer-dist --no-interaction --no-progress
+        run: |
+          composer config --no-plugins policy.advisories.block false || true
+          composer update --prefer-dist --no-interaction --no-progress
 
       - name: Check code style
         run: vendor/bin/pint --test
