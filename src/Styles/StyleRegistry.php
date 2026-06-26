@@ -153,6 +153,59 @@ class StyleRegistry
     }
 
     /**
+     * Register a per-row style and return its cellXfs index.
+     *
+     * Structurally identical to a header style — fill (background) + font
+     * (color/bold/size/name) — but exposed separately so the intent reads
+     * clearly at the call site:
+     *
+     *   $red = $writer->registerRowStyle(['fill' => '#FFC7CE', 'color' => '#9C0006']);
+     *   $writer->writeRow($row, $failed ? $red : null);
+     *
+     * Same options → same style id (dedup via resolveCellXf), so painting a
+     * million rows with one logical style still adds a single cellXfs entry.
+     */
+    public function registerRowStyle(array $options): int
+    {
+        return $this->registerHeaderStyle($options);
+    }
+
+    /**
+     * Compose a row style (fill + font) with a column's number format and
+     * return the merged cellXfs index.
+     *
+     * Needed because a styled row must still respect a column's numFmt —
+     * a currency column on a highlighted row should stay "1.234,50 ₺", not
+     * collapse to a raw number. Takes the numFmt from the column xf and the
+     * font/fill from the row xf. Dedup'd, so each (row-style, column) pair
+     * resolves to one entry no matter how many rows hit it.
+     */
+    public function mergeRowStyleWithColumn(int $rowStyleId, int $columnStyleId): int
+    {
+        $row = $this->cellXfs[$rowStyleId] ?? null;
+        $col = $this->cellXfs[$columnStyleId] ?? null;
+
+        // Defensive: an unknown id means the caller passed something we never
+        // handed out. Fall back to whichever side we do know rather than
+        // emitting a dangling s="N".
+        if ($row === null) {
+            return $columnStyleId;
+        }
+        if ($col === null) {
+            return $rowStyleId;
+        }
+
+        return $this->resolveCellXf([
+            'numFmtId' => $col['numFmtId'],
+            'fontId' => $row['fontId'],
+            'fillId' => $row['fillId'],
+            'applyNumberFormat' => $col['applyNumberFormat'],
+            'applyFont' => $row['applyFont'],
+            'applyFill' => $row['applyFill'],
+        ]);
+    }
+
+    /**
      * Reject anything that isn't a 6-character hex color, with or without
      * a leading "#". Surfaces typos at registration time instead of
      * producing a styles.xml Excel will refuse to open.
