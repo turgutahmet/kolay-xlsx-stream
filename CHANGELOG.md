@@ -5,6 +5,55 @@ All notable changes to `kolay/xlsx-stream` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.2] — 2026-06-26
+
+### Added — Per-row styling
+
+- **`registerRowStyle(array $options): int`** on
+  `SinkableXlsxWriter` / `BaseXlsxWriter`. Registers a reusable row
+  style (background fill + text color, plus `bold`/`size`/`name`) and
+  returns a stable style id. Options are identical to
+  `setHeaderStyle()`: `fill` (`#RRGGBB`), `color` (`#RRGGBB`), `bold`,
+  `size`, `name`.
+- **`writeRow(array $row, ?int $styleId = null)`** — optional second
+  argument stamps a registered style onto every cell of that row, so
+  callers can highlight selected rows (failed red, VIP blue, etc.) with
+  both background and text color at once. `null` (the default) keeps the
+  row on the unstyled fast path.
+
+  ```php
+  $failed = $writer->registerRowStyle(['fill' => '#FFC7CE', 'color' => '#9C0006']);
+  foreach ($rows as $r) {
+      $writer->writeRow($r->toArray(), $r->failed ? $failed : null);
+  }
+  ```
+
+### Performance & guarantees
+
+- **No regression on the unstyled path.** A single null check delegates
+  the styled case to a separate builder, so the hot path stays
+  byte-for-byte identical to v3.0.1. Benchmark (500k rows, 10 runs,
+  median): unstyled unchanged (~3.10s), ~1% of rows styled is within
+  noise, every row styled costs ~1%. Peak memory stays flat at 6 MB in
+  all cases.
+- **Flat memory via dedup.** Styles are deduplicated in the registry —
+  one logical style is a single `styles.xml` entry no matter how many
+  rows use it. Painting millions of rows adds no per-row memory.
+- **Column number formats preserved.** A styled row still honours a
+  column's number format: a currency/date column keeps its format and
+  gains the row's fill/color via an on-the-fly merged cell style
+  (memoized per row-style/column pair).
+- **Empty cells in a styled row are still filled** so the highlight is
+  visually contiguous.
+
+### Compatibility
+
+- Fully backward compatible — existing `writeRow(array $row)` calls work
+  unchanged. The reader is unaffected (it is value-only and ignores the
+  cell style attribute, which the writer already emitted for header
+  styles and column formats). Output remains compatible with Excel,
+  PhpSpreadsheet, and OpenSpout.
+
 ## [3.0.1] — 2026-05-14
 
 ### Changed
