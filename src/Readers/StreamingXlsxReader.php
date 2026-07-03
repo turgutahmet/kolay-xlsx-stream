@@ -25,7 +25,7 @@ use Kolay\XlsxStream\Sources\S3RangeSource;
  *   - header()                   first row of the selected sheet
  *   - rows(skip, limit)          generator over data rows
  *   - chunked(N)                 generator over batches of N rows
- *   - rowCount()                 total rows in selected sheet (full scan)
+ *   - rowCount()                 total rows in selected sheet (boundary scan)
  *
  * RAM is bounded — independent of sheet size. Each call to rows() /
  * chunked() opens a fresh forward-only inflate stream so the API is
@@ -88,11 +88,30 @@ class StreamingXlsxReader
      */
     private string $castTimezone = 'UTC';
 
+    /**
+     * Cached DateTimeZone matching $castTimezone. Constructing a
+     * DateTimeZone does a tz-database lookup — paying that per date
+     * cell dominates castDate's cost on date-heavy sheets, so the
+     * instance is built once and reused. castTimezone() swaps it when
+     * the setting changes.
+     */
+    private ?\DateTimeZone $castTimezoneObj = null;
+
     private function __construct(Source $source)
     {
         $this->source = $source;
         $this->cd = ZipDirectory::fromSource($source);
-        $this->sheets = WorkbookResolver::resolve($source, $this->cd);
+
+        // workbook.xml feeds two construction steps — sheet resolution
+        // and date-epoch detection. Fetch + inflate the part once and
+        // hand the bytes to both; on S3 sources this saves a redundant
+        // round-trip per open. When the part is missing, resolve()
+        // raises the canonical error.
+        $workbookXml = $this->cd->has('xl/workbook.xml')
+            ? $this->cd->readEntry($source, 'xl/workbook.xml')
+            : null;
+
+        $this->sheets = WorkbookResolver::resolve($source, $this->cd, $workbookXml);
 
         if ($this->sheets === []) {
             throw XlsxReadException::corruptCentralDirectory('workbook contains no sheets');
@@ -102,7 +121,8 @@ class StreamingXlsxReader
         // files set workbookPr/@date1904 — without this, every cast
         // date comes back four years and a day too early. Manual
         // use1904Epoch() override still works on top of this default.
-        $this->use1904Epoch = WorkbookResolver::parseDate1904($source, $this->cd);
+        $this->use1904Epoch = $workbookXml !== null
+            && WorkbookResolver::parseDate1904Xml($workbookXml);
 
         $this->currentEntry = $this->sheets[0]['entry'];
     }
@@ -238,15 +258,11 @@ class StreamingXlsxReader
     }
 
     /**
-     * Total row count of the selected sheet. Currently O(N) — performs a
-     * full inflate scan. A future Mode A* implementation will return O(1)
-     * when an xl/_kxs/index.bin sidecar is present.
-     */
-    /**
      * Total row count including header. O(1) when the file carries a
-     * matching xl/_kxs/index.bin sidecar (born-indexed); O(N) full
-     * inflate scan otherwise. Both call sites are covered by the same
-     * tests so the result is identical either way.
+     * matching xl/_kxs/index.bin sidecar (born-indexed); O(N) inflate
+     * scan otherwise — but a boundary-counting scan that skips cell
+     * tokenization entirely, not a full parse. Both call sites are
+     * covered by the same tests so the result is identical either way.
      */
     public function rowCount(): int
     {
@@ -258,7 +274,13 @@ class StreamingXlsxReader
             }
         }
 
-        return iterator_count($this->openSheetReader()->rows());
+        // No-index fallback: count '</row>' boundaries in the inflated
+        // stream — same result as iterator_count over rows() (see
+        // StreamingSheetReader::countRows for the equivalence argument)
+        // at a fraction of the CPU. The shared-strings table plays no
+        // part in counting, so it is deliberately not resolved here; on
+        // S3 sources that also skips the sst fetch round-trip.
+        return (new StreamingSheetReader($this->source, $this->cd, $this->currentEntry))->countRows();
     }
 
     /**
@@ -323,6 +345,352 @@ class StreamingXlsxReader
             }
             yield $rn => $this->applyCasts($row);
         }
+    }
+
+    /**
+     * Whole-sheet aggregate for a stats-tracked column, answered from
+     * the KXSI sidecar alone — no row data is read. On S3 that means
+     * a multi-GB file's column total costs the sidecar fetch and nothing
+     * else.
+     *
+     * $column is 1-based, matching the writer's withColumnStats() —
+     * this API pairs with that opt-in (unlike castColumn(), whose
+     * 0-based indexing addresses the yielded row arrays).
+     *
+     * Returns null when the file carries no stats for the column (not
+     * born-indexed, stale sidecar, or column not tracked) — callers
+     * decide whether to fall back to a scan. min/max/avg are null when
+     * the column held no numeric values at all.
+     *
+     * @return array{min: float|null, max: float|null, sum: float, avg: float|null, count: int, other: int, sorted: string|null}|null
+     */
+    public function columnStats(int $column): ?array
+    {
+        $index = $this->loadRandomAccessIndex();
+        $stats = $index?->columnStats($this->currentEntry, $column);
+        if ($stats === null) {
+            return null;
+        }
+
+        $min = null;
+        $max = null;
+        $sum = 0.0;
+        $count = 0;
+        $other = 0;
+        foreach ($stats['blocks'] as $block) {
+            if ($block['count'] > 0) {
+                $min = $min === null ? $block['min'] : min($min, $block['min']);
+                $max = $max === null ? $block['max'] : max($max, $block['max']);
+                $sum += $block['sum'];
+                $count += $block['count'];
+            }
+            $other += $block['other'];
+        }
+
+        return [
+            'min' => $min,
+            'max' => $max,
+            'sum' => $sum,
+            'avg' => $count > 0 ? $sum / $count : null,
+            'count' => $count,
+            'other' => $other,
+            'sorted' => $stats['sorted_asc'] ? 'asc' : ($stats['sorted_desc'] ? 'desc' : null),
+        ];
+    }
+
+    /**
+     * Yield rows whose $column (1-based, see columnStats) satisfies a
+     * numeric predicate, using the sidecar's per-block zone maps to skip
+     * every block whose [min, max] provably contains no match — the
+     * spreadsheet equivalent of Parquet row-group pruning. Exports are
+     * usually ID/date-sorted, so range queries typically inflate a
+     * handful of blocks out of hundreds.
+     *
+     * Ops: '=', '<', '<=', '>', '>=', 'between' ($value2 = upper bound,
+     * inclusive). The predicate matches numeric cells only (the raw
+     * tokenized value, before any castColumn transforms); text cells
+     * never match. Yields 1-based row number => row (casts applied).
+     *
+     * Degrades to a full-scan filter when the sidecar carries no stats
+     * for the column — same results, no pruning.
+     *
+     * @return \Generator<int, array<int, mixed>>
+     */
+    public function rowsWhere(int $column, string $op, int|float $value, int|float|null $value2 = null): \Generator
+    {
+        [$lo, $hi] = $this->pruneBounds($op, $value, $value2);
+
+        $index = $this->loadRandomAccessIndex();
+        $stats = $index?->columnStats($this->currentEntry, $column);
+
+        if ($stats === null) {
+            // No zone maps — scan everything, filter per row.
+            foreach ($this->openSheetReader()->rows() as $rn => $row) {
+                if ($this->cellMatches($row[$column - 1] ?? null, $op, $value, $value2)) {
+                    yield $rn => $this->applyCasts($row);
+                }
+            }
+
+            return;
+        }
+
+        $ranges = $index->blockRanges($this->currentEntry);
+
+        // Prune, then merge surviving adjacent blocks into runs so each
+        // run costs one seek + one linear scan instead of per-block seeks.
+        $runs = [];
+        $run = null;
+        foreach ($stats['blocks'] as $i => $block) {
+            $survives = $block['count'] > 0 && $block['max'] >= $lo && $block['min'] <= $hi;
+            if ($survives) {
+                $run === null ? $run = [$i, $i] : $run[1] = $i;
+            } elseif ($run !== null) {
+                $runs[] = $run;
+                $run = null;
+            }
+        }
+        if ($run !== null) {
+            $runs[] = $run;
+        }
+
+        foreach ($runs as [$firstBlock, $lastBlock]) {
+            $start = $ranges[$firstBlock];
+            $stopRow = $ranges[$lastBlock]['last_row'];
+
+            foreach ($this->openSheetReader()->rowsFromOffset($start['comp_offset'], $start['start_row_at_offset'] ?? 1) as $rn => $row) {
+                if ($rn < $start['first_row']) {
+                    continue;
+                }
+                if ($rn > $stopRow) {
+                    break;
+                }
+                if ($this->cellMatches($row[$column - 1] ?? null, $op, $value, $value2)) {
+                    yield $rn => $this->applyCasts($row);
+                }
+            }
+        }
+    }
+
+    /**
+     * Point lookup: first row whose $column (1-based) equals $value.
+     *
+     * On a column the writer observed to be sorted, the zone maps bound
+     * the candidates to at most a couple of adjacent blocks, so the
+     * lookup costs one block inflate — two S3 range requests end to end
+     * on a multi-GB file. Unsorted columns still prune to the blocks
+     * whose [min, max] straddle $value. Falls back to a sequential scan
+     * when no stats exist.
+     *
+     * @return array{row: int, values: array<int, mixed>}|null
+     */
+    public function findRow(int $column, int|float $value): ?array
+    {
+        foreach ($this->rowsWhere($column, '=', $value) as $rn => $row) {
+            return ['row' => $rn, 'values' => $row];
+        }
+
+        return null;
+    }
+
+    /**
+     * Split the current sheet into up to $count independently readable
+     * row ranges. Because every sync point in a born-indexed file is a
+     * byte-aligned full-flush boundary, each shard can be inflated from
+     * a fresh context with zero knowledge of the others — the plan is
+     * plain data (JSON-serializable), so the natural use is queue
+     * fan-out: dispatch one job per shard, each opening its own reader:
+     *
+     *   foreach ($reader->shards(8) as $shard) {
+     *       ProcessShard::dispatch($s3Path, $shard);
+     *   }
+     *   // in the job:
+     *   $reader = StreamingXlsxReader::fromS3(...);
+     *   foreach ($reader->rowsForShard($shard) as $rn => $row) { ... }
+     *
+     * Shard boundaries snap to sync points, so shards are balanced to
+     * within one sync period (default 10K rows). Without a usable index
+     * the whole sheet is one shard — same contract, no parallelism.
+     * The header row (row 1) rides in the first shard; skip $rn === 1
+     * in workers if headers are handled elsewhere.
+     *
+     * @return list<array{sheet: string, comp_offset: int|null, start_row: int, first_row: int, last_row: int}>
+     */
+    public function shards(int $count): array
+    {
+        if ($count < 1) {
+            throw new \InvalidArgumentException("shards() count must be >= 1; got {$count}");
+        }
+
+        $index = $this->loadRandomAccessIndex();
+        $total = $index?->totalRows($this->currentEntry);
+
+        $wholeSheet = [[
+            'sheet' => $this->currentEntry,
+            'comp_offset' => null,
+            'start_row' => 1,
+            'first_row' => 1,
+            'last_row' => $total ?? PHP_INT_MAX,
+        ]];
+
+        if ($index === null || $total === null || $count === 1) {
+            return $wholeSheet;
+        }
+
+        $points = $index->syncPoints($this->currentEntry);
+        if ($points === []) {
+            return $wholeSheet;
+        }
+
+        // Pick count-1 cut points from the sync-point list, spaced evenly
+        // by ROW coverage (not point ordinal — periods are approximate).
+        // Duplicate picks collapse, so tiny sheets yield fewer shards.
+        $cuts = [];
+        for ($i = 1; $i < $count; $i++) {
+            $idealRow = (int) (1 + ($total * $i) / $count);
+            $best = null;
+            foreach ($points as $sp) {
+                if ($best === null || abs($sp['row'] - $idealRow) < abs($best['row'] - $idealRow)) {
+                    $best = $sp;
+                }
+            }
+            $cuts[$best['row']] = $best;
+        }
+        ksort($cuts);
+
+        $shards = [];
+        $firstRow = 1;
+        $compOffset = null;
+        $startRow = 1;
+        foreach ($cuts as $cut) {
+            if ($cut['row'] <= $firstRow) {
+                continue; // collapsed duplicate — would create an empty shard
+            }
+            $shards[] = [
+                'sheet' => $this->currentEntry,
+                'comp_offset' => $compOffset,
+                'start_row' => $startRow,
+                'first_row' => $firstRow,
+                'last_row' => $cut['row'] - 1,
+            ];
+            $firstRow = $cut['row'];
+            $compOffset = $cut['comp_offset'];
+            $startRow = $cut['row'];
+        }
+        $shards[] = [
+            'sheet' => $this->currentEntry,
+            'comp_offset' => $compOffset,
+            'start_row' => $startRow,
+            'first_row' => $firstRow,
+            'last_row' => $total,
+        ];
+
+        return $shards;
+    }
+
+    /**
+     * Stream exactly one shard produced by shards() — typically inside
+     * a queue worker holding its own reader instance. Yields 1-based
+     * row number => row (casts applied) for rows within the shard's
+     * [first_row, last_row] span, then stops without touching the rest
+     * of the entry.
+     *
+     * @param  array{sheet: string, comp_offset: int|null, start_row: int, first_row: int, last_row: int}  $shard
+     * @return \Generator<int, array<int, mixed>>
+     */
+    public function rowsForShard(array $shard): \Generator
+    {
+        foreach (['sheet', 'comp_offset', 'start_row', 'first_row', 'last_row'] as $key) {
+            if (! array_key_exists($key, $shard)) {
+                throw new \InvalidArgumentException("rowsForShard() shard is missing '{$key}'");
+            }
+        }
+        if ($shard['sheet'] !== $this->currentEntry) {
+            // The shard addresses a specific worksheet entry; make the
+            // reader agree instead of silently reading the wrong sheet.
+            foreach ($this->sheets as $sheet) {
+                if ($sheet['entry'] === $shard['sheet']) {
+                    $this->currentEntry = $shard['sheet'];
+                    break;
+                }
+            }
+            if ($shard['sheet'] !== $this->currentEntry) {
+                throw new \InvalidArgumentException(
+                    "rowsForShard() shard references unknown sheet entry '{$shard['sheet']}'"
+                );
+            }
+        }
+
+        // A stale or absent index invalidates recorded offsets — fall
+        // back to streaming from the sheet start; row-number bounds
+        // still carve out exactly the shard's span.
+        $compOffset = $shard['comp_offset'];
+        $startRow = $shard['start_row'];
+        if ($compOffset !== null && $this->loadRandomAccessIndex() === null) {
+            $compOffset = null;
+            $startRow = 1;
+        }
+
+        foreach ($this->openSheetReader()->rowsFromOffset($compOffset, $startRow) as $rn => $row) {
+            if ($rn < $shard['first_row']) {
+                continue;
+            }
+            if ($rn > $shard['last_row']) {
+                return;
+            }
+            yield $rn => $this->applyCasts($row);
+        }
+    }
+
+    /**
+     * Inclusive [lo, hi] window used only for BLOCK PRUNING. Strict ops
+     * deliberately widen to their inclusive counterpart — pruning must
+     * over-approximate (a block kept unnecessarily costs one scan; a
+     * block dropped incorrectly loses rows). Exact strictness is applied
+     * per cell in cellMatches().
+     *
+     * @return array{0: float, 1: float}
+     */
+    private function pruneBounds(string $op, int|float $value, int|float|null $value2): array
+    {
+        return match ($op) {
+            '=' => [(float) $value, (float) $value],
+            '<', '<=' => [-INF, (float) $value],
+            '>', '>=' => [(float) $value, INF],
+            'between' => $value2 === null
+                ? throw new \InvalidArgumentException("rowsWhere('between') requires a second bound")
+                : [(float) min($value, $value2), (float) max($value, $value2)],
+            default => throw new \InvalidArgumentException(
+                "rowsWhere() op must be one of =, <, <=, >, >=, between; got '{$op}'"
+            ),
+        };
+    }
+
+    /**
+     * Exact per-cell predicate. Numeric cells only — the tokenizer
+     * yields t="n" values as numeric strings, so is_numeric covers
+     * everything the writer's stats folded in except booleans, which
+     * the stats deliberately over-include (widening is safe, see
+     * BaseXlsxWriter::accumulateColumnStats).
+     */
+    private function cellMatches(mixed $cell, string $op, int|float $value, int|float|null $value2): bool
+    {
+        if (is_int($cell) || is_float($cell)) {
+            $v = (float) $cell;
+        } elseif (is_string($cell) && $cell !== '' && is_numeric($cell)) {
+            $v = (float) $cell;
+        } else {
+            return false;
+        }
+
+        return match ($op) {
+            '=' => $v == $value,
+            '<' => $v < $value,
+            '<=' => $v <= $value,
+            '>' => $v > $value,
+            '>=' => $v >= $value,
+            'between' => $v >= min($value, $value2) && $v <= max($value, $value2),
+            default => false, // unreachable — pruneBounds validated $op
+        };
     }
 
     /**
@@ -391,7 +759,10 @@ class StreamingXlsxReader
     public function castTimezone(string $tz): self
     {
         try {
-            new \DateTimeZone($tz);
+            // The validation instance doubles as the per-cell cache —
+            // castDate() reuses it instead of re-resolving the tz
+            // database for every date cell.
+            $this->castTimezoneObj = new \DateTimeZone($tz);
         } catch (\Exception) {
             throw new \InvalidArgumentException("Unknown timezone: {$tz}");
         }
@@ -468,7 +839,7 @@ class StreamingXlsxReader
         $ts = $epochUnix + ($whole * 86400) + $secondsOfDay;
 
         return (new \DateTimeImmutable('@'.$ts))
-            ->setTimezone(new \DateTimeZone($this->castTimezone));
+            ->setTimezone($this->castTimezoneObj ??= new \DateTimeZone($this->castTimezone));
     }
 
     /**

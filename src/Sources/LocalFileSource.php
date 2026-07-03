@@ -3,6 +3,7 @@
 namespace Kolay\XlsxStream\Sources;
 
 use Kolay\XlsxStream\Contracts\Source;
+use Kolay\XlsxStream\Contracts\SupportsSuffixRange;
 use Kolay\XlsxStream\Exceptions\XlsxReadException;
 
 /**
@@ -12,7 +13,7 @@ use Kolay\XlsxStream\Exceptions\XlsxReadException;
  * a fresh handle per streamFrom() call so the parser's long-running
  * sequential read does not interfere with central-directory lookups.
  */
-class LocalFileSource implements Source
+class LocalFileSource implements Source, SupportsSuffixRange
 {
     /** @var resource */
     private $handle;
@@ -59,6 +60,24 @@ class LocalFileSource implements Source
         }
 
         return $buf;
+    }
+
+    /**
+     * Suffix read — trivial locally: the size is already known from the
+     * constructor's stat, so this is just a clamped range() plus the
+     * cached size. Exists so ZipDirectory can use one code path for
+     * every SupportsSuffixRange source.
+     *
+     * @return array{data: string, size: int}
+     */
+    public function tail(int $length): array
+    {
+        $len = max(0, min($length, $this->size));
+
+        return [
+            'data' => $this->range($this->size - $len, $len),
+            'size' => $this->size,
+        ];
     }
 
     public function streamFrom(int $offset)

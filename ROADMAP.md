@@ -8,6 +8,7 @@ listed below `Backlog` is "considered, not committed".
 
 | Version | Date | Highlights |
 |---|---|---|
+| [3.1.0](CHANGELOG.md#310--2026-07-04) | 2026-07-04 | Queryable XLSX: KXSI TLV sidecar extension with per-block column stats (zone maps) — `withColumnStats()` on the writer; `columnStats()`/`rowsWhere()`/`findRow()` on the reader (Parquet-style block pruning, sidecar-only aggregates, single-block point lookups); `shards()`/`rowsForShard()` for zero-coordination queue fan-out; writer +55 % throughput (PCRE-JIT escape gate, flattened row builder, level-5 default); S3 reader open 7 → 3 round trips; `rowCount()` boundary-count fast path |
 | [3.0.0](CHANGELOG.md#300--2026-05-06) | 2026-05-06 | Streaming reader (`StreamingXlsxReader`) with bounded ~24 MB RAM; born-indexed XLSX via opt-in `withRandomAccessIndex()` enabling O(1) `rowAt`/`rowRange`/`rowCount`; external XLSX support via shared-strings; new read + random-access benchmark scripts; tests reorganized under `Writers/` + `Readers/`; no breaking changes |
 | [2.2.2](CHANGELOG.md#222--2026-05-03) | 2026-05-03 | XML control-byte sanitization fast-path bug fix (long-standing, pre-v2.x); `onProgress` byte-counter doc note |
 | [2.2.1](CHANGELOG.md#221--2026-05-03) | 2026-05-03 | Hex color validation, custom font name, empty-workbook guard, deferred column-format check, wider integer/decimal auto-width minimums, micro-perf tightenings |
@@ -16,10 +17,11 @@ listed below `Backlog` is "considered, not committed".
 | [2.0.1](CHANGELOG.md#201--2026-05-03) | 2026-05-03 | CI / lint cleanup |
 | [2.0.0](CHANGELOG.md#200--2026-05-03) | 2026-05-03 | DateTime support, native boolean cells, big-int preservation, state machine guards, modernized dependency matrix |
 
-## Next: v3.1 — Reader/writer ergonomics & deferred polish
+## Next: v3.2 — Reader/writer ergonomics & deferred polish
 
-Additive items that didn't make v3.0's reader/random-access core. **No
-breaking changes planned.**
+Additive items that didn't make v3.0/v3.1. **No breaking changes
+planned.** (v3.1 pivoted to the queryable-XLSX layer — zone maps,
+shards, hot-path perf — so this list carries over.)
 
 ### Reader
 
@@ -71,6 +73,32 @@ breaking changes planned.**
   currently calls `createMultipartUpload` synchronously. Defer until
   the first `write()` so the sink is cheaper to instantiate in DI
   contexts (and so test fixtures can build one without S3 mocks).
+
+### Queryable-XLSX follow-ups (v3.1 groundwork, PoC-verified)
+
+The KXSI TLV framing reserves room for these; the deflate-level
+mechanics (userland `crc32_combine`, full-flush segment concatenation)
+were proven with runnable PoCs before v3.1 shipped:
+
+- **Resumable S3 exports** — snapshot writer state at sync points
+  (running CRC via `crc32_combine`); `Writer::resume($snapshot)` after
+  a crash re-enters at row N+1 instead of restarting a 25-minute job.
+- **Appendable XLSX** — end the last sheet at a full-flush boundary,
+  reopen and continue with a fresh deflate context; on S3,
+  `UploadPartCopy` makes append O(appended data). Wants ZIP64 first.
+- **Distributed export + server-side stitch** — N queue workers each
+  write a headless full-flush-terminated deflate segment; a finalizer
+  assembles one valid born-indexed .xlsx via `UploadPartCopy` without
+  downloading the segments (pigz-style concatenation).
+- **Compact cell refs** (`c/@r` omitted, spec-legal) — measured 2.1×
+  writer throughput and −44 % file size, but fast-excel-reader silently
+  returns zero rows on such files, so this stays opt-in and gated on
+  the external-reader compat matrix.
+- **Retrofit index for foreign XLSX** — zran-style inflate-state
+  snapshots make files *other* writers produced random-access after
+  one pass. Pure PHP can't resume mid-stream (no `inflatePrime`);
+  proven feasible via FFI → candidate for an optional
+  `kolay/xlsx-stream-retrofit` package.
 
 ## Future: v4.0 — Considerations
 

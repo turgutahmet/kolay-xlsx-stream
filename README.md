@@ -276,7 +276,20 @@ The ± values in S3 memory represent **normal memory fluctuation** during stream
    - Pattern: Memory oscillates between ~2MB (after upload) and ~78MB (before upload)
    - This is **completely normal** and expected behavior
 
-### Performance Highlights *(v3.0, May 2026)*
+### Performance Highlights *(v3.1, July 2026)*
+
+- **Write — Local (v3.1)**: ~289,000 rows/second writer throughput (500K-row
+  mixed workload, 6 MB peak RAM) — **+55 % over v3.0.2** from a PCRE-JIT
+  escape fast path, a flattened row builder (output byte-identical), and
+  the level-5 default. Apples-to-apples numbers in `bench/results.json`.
+- **Reader open on S3 (v3.1)**: 7 → 3 round trips (suffix-range tail read,
+  coalesced entry fetches, workbook.xml fetched once) — ~150–300 ms less
+  first-row latency per open at typical S3 RTTs.
+- **Queryable files (v3.1)**: `columnStats()` answers min/max/sum/avg from
+  the sidecar alone; `rowsWhere()` skips blocks via zone maps; `findRow()`
+  resolves point lookups on sorted columns by reading a single block.
+
+*(v3.0, May 2026)*
 
 - **Write — Local**: ~190,000–222,000 rows/second with true O(1) memory
 - **Write — S3**: 109,000–129,000 rows/second above 750K rows (2.5–3× the v1.x baseline, identical to v2.2.2)
@@ -305,18 +318,21 @@ ZIP64 writer support is tracked for a future release.
 
 ### Compression level
 
-`setCompressionLevel(int $level)` accepts 1–9. The default is 6
-(zlib's standard balance). Pick by use case:
+`setCompressionLevel(int $level)` accepts 1–9. The default is **5**
+(v3.1+): measured on XLSX-shaped XML, level 5 produces a file within
+~0.2 % of level 6's size at ~20 % less wall time — level 6 spends its
+extra effort on entropy (unique cell refs) that doesn't compress
+anyway. Pick by use case:
 
 | Use case | Level | Tradeoff |
 |---|---:|---|
-| Queue job, fastest export | 1 | ~30 % faster than default, ~5 % larger file |
-| Balanced default | 6 | zlib default — used unless you set otherwise |
-| Archive, smallest file | 9 | ~15 % slower than default, ~2 % smaller file |
+| Queue job, fastest export | 1 | fastest, ~20 % larger file |
+| Balanced default | 5 | knee of the size/speed curve for XLSX data |
+| Marginally smaller | 6 | ~0.2 % smaller than 5, measurably slower |
+| Archive, smallest file | 9 | much slower, ~6 % smaller file |
 
-For S3 uploads, level 1 typically wins because compute is the
-bottleneck. For local file output where disk is fast, level 6 is
-fine; level 9 only helps if you're storing the file long-term.
+For S3 uploads, a lower level typically wins because compute is the
+bottleneck. Level 9 only helps if you're storing the file long-term.
 
 ### Comparison with Other Libraries
 
@@ -618,6 +634,75 @@ differs; the API contract is identical.
 > seeks once and reuses a single inflate stream; repeated `rowAt()`
 > re-seeks on every call. For 1000 nearby rows the difference is
 > ~1000× — a single ~ms seek versus 1000 × ms per call.
+
+### Queryable XLSX — zone maps & aggregates *(v3.1+)*
+
+Born-indexed files can additionally carry **per-block column statistics**
+(min/max/sum/count for every ~10K-row block — the same idea as Parquet
+row-group stats, embedded in a plain .xlsx that Excel still opens
+normally). Track the columns you'll query when writing:
+
+```php
+$writer->withRandomAccessIndex()
+       ->withColumnStats([1, 4]);   // 1-based: track "ID" and "Amount"
+```
+
+The reader then answers three kinds of questions **without scanning
+row data**:
+
+```php
+$reader = StreamingXlsxReader::fromS3($s3, 'bucket', 'huge-export.xlsx');
+
+// 1. Aggregates straight from the ~KB sidecar — on S3 this is ONE
+//    range request against a multi-GB file:
+$stats = $reader->columnStats(4);
+// ['min' => ..., 'max' => ..., 'sum' => ..., 'avg' => ...,
+//  'count' => ..., 'other' => ..., 'sorted' => 'asc'|'desc'|null]
+
+// 2. Range queries that skip every block whose [min,max] can't match
+//    (exports are usually ID/date-sorted, so this touches a handful
+//    of blocks out of hundreds):
+foreach ($reader->rowsWhere(4, 'between', 1000, 2000) as $rowNumber => $row) { ... }
+foreach ($reader->rowsWhere(1, '>=', 4_000_000) as $rowNumber => $row) { ... }
+
+// 3. Point lookups — on a sorted column this reads exactly one block,
+//    i.e. two S3 range requests end to end:
+$hit = $reader->findRow(1, 3_141_592);   // ['row' => N, 'values' => [...]] or null
+```
+
+Ops: `=`, `<`, `<=`, `>`, `>=`, `between`. Predicates match numeric
+cells (ints, floats, dates as serials); on files without stats the same
+calls degrade gracefully to a full-scan filter with identical results.
+
+### Parallel reads — shard a sheet across queue workers *(v3.1+)*
+
+Every sync point in a born-indexed file is an independently decompressible
+boundary, so a sheet can be split into self-contained row ranges. The
+shard plan is plain JSON-friendly data — dispatch one queue job per shard
+and each worker streams only its slice, with zero coordination:
+
+```php
+// Planner (e.g. the job that receives the upload)
+$reader = StreamingXlsxReader::fromS3($s3, 'bucket', 'import.xlsx');
+foreach ($reader->shards(8) as $shard) {
+    ProcessXlsxShard::dispatch('bucket', 'import.xlsx', $shard);
+}
+
+// Worker (each job opens its own reader/connection)
+public function handle(): void
+{
+    $reader = StreamingXlsxReader::fromS3($this->s3(), $this->bucket, $this->key);
+    foreach ($reader->rowsForShard($this->shard) as $rowNumber => $row) {
+        if ($rowNumber === 1) continue;   // header rides in the first shard
+        // ... import the row
+    }
+}
+```
+
+A 4M-row import's wall clock becomes `max(worker time)` instead of the
+sum. Shard boundaries snap to sync points (balanced to within one sync
+period); on non-indexed files `shards()` returns a single whole-sheet
+shard — same contract, no parallelism.
 
 ### Laravel Job Example
 
