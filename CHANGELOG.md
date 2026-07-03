@@ -73,6 +73,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - EOCD scan uses `strrpos` instead of a byte-wise backward loop;
   `S3RangeSource::range()` guards zero/negative lengths.
 
+### Fixed
+
+- **Unknown format-preset names now throw at write time.**
+  `setColumnFormat($col, 'currency')` — a typo'd or guessed preset
+  name — used to fall through as a literal `formatCode="currency"`,
+  producing a styles.xml that MS Excel refuses to open without repair
+  (verified against real Excel). A lowercase-letters string that isn't
+  a known preset is rejected with the preset list in the message; raw
+  Excel format codes (`"#,##0.000"` etc.) are unaffected.
+
 ### Benchmarks
 
 - `bench/row_style_bench.php` now measures row-generation cost in a

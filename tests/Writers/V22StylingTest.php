@@ -86,6 +86,31 @@ class V22StylingTest extends TestCase
         $this->assertStringContainsString('formatCode="yyyy-mm-dd"', $styles);
     }
 
+    public function test_unknown_preset_name_throws_instead_of_corrupting_styles(): void
+    {
+        // A lowercase-letters string that isn't a known preset ("currency",
+        // "money", a typo of "currency_try"…) must fail at write time.
+        // Passed through as a literal formatCode it produces a styles.xml
+        // that MS Excel refuses to open without repair — verified against
+        // real Excel, which flagged 'formatCode="currency"' as corrupt.
+        $writer = new SinkableXlsxWriter(new FileSink($this->testFile));
+
+        $this->expectException(\Kolay\XlsxStream\Exceptions\XlsxStreamException::class);
+        $this->expectExceptionMessageMatches('/Unknown format preset .currency./');
+        $writer->setColumnFormat(1, 'currency');
+    }
+
+    public function test_raw_format_codes_still_accepted(): void
+    {
+        $writer = new SinkableXlsxWriter(new FileSink($this->testFile));
+        $writer->setColumnFormat(1, '#,##0.000');
+        $writer->startFile(['Qty']);
+        $writer->writeRow([1.5]);
+        $writer->finishFile();
+
+        $this->assertStringContainsString('formatCode="#,##0.000"', $this->extract('xl/styles.xml'));
+    }
+
     public function test_set_column_format_preset_currency_try()
     {
         $writer = new SinkableXlsxWriter(new FileSink($this->testFile));

@@ -83,6 +83,20 @@ class StyleRegistry
     {
         $code = self::PRESETS[$presetOrCode] ?? $presetOrCode;
 
+        // A string made purely of lowercase letters/underscores is a
+        // preset NAME shape, never a plausible raw format code (real
+        // codes carry #, 0, %, punctuation or quoting). Letting a typo
+        // like "currency" fall through as a literal formatCode produces
+        // a file MS Excel refuses to open without repair — fail loudly
+        // at write time instead of corrupting the workbook silently.
+        if ($code === $presetOrCode && preg_match('/^[a-z_]+$/', $presetOrCode)) {
+            throw new \Kolay\XlsxStream\Exceptions\XlsxStreamException(
+                "Unknown format preset '{$presetOrCode}'. Available presets: ".
+                implode(', ', array_keys(self::PRESETS)).
+                '. To use a raw Excel format code, pass the code itself (e.g. "#,##0.00").'
+            );
+        }
+
         $numFmtId = $this->resolveNumFmtId($code);
 
         return $this->resolveCellXf([
