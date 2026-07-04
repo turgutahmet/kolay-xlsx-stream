@@ -360,7 +360,10 @@ class StreamingXlsxReader
      * Returns null when the file carries no stats for the column (not
      * born-indexed, stale sidecar, or column not tracked) — callers
      * decide whether to fall back to a scan. min/max/avg are null when
-     * the column held no numeric values at all.
+     * the column held no numeric values at all. Counts include the
+     * header row's cell (as `other` for the usual text header): the
+     * header participates in stats so zone-map pruning stays consistent
+     * with the full-scan path.
      *
      * @return array{min: float|null, max: float|null, sum: float, avg: float|null, count: int, other: int, sorted: string|null}|null
      */
@@ -424,8 +427,11 @@ class StreamingXlsxReader
         $stats = $index?->columnStats($this->currentEntry, $column);
 
         if ($stats === null) {
-            // No zone maps — scan everything, filter per row.
-            foreach ($this->openSheetReader()->rows() as $rn => $row) {
+            // No zone maps — scan everything, filter per row. NOT via
+            // rows(): that wrapper re-keys sequentially from 0, while
+            // this generator's contract (and the pruned path below) is
+            // 1-based sheet row numbers.
+            foreach ($this->openSheetReader()->rowsFromOffset(null, 1) as $rn => $row) {
                 if ($this->cellMatches($row[$column - 1] ?? null, $op, $value, $value2)) {
                     yield $rn => $this->applyCasts($row);
                 }
@@ -474,12 +480,15 @@ class StreamingXlsxReader
     /**
      * Point lookup: first row whose $column (1-based) equals $value.
      *
-     * On a column the writer observed to be sorted, the zone maps bound
-     * the candidates to at most a couple of adjacent blocks, so the
-     * lookup costs one block inflate — two S3 range requests end to end
-     * on a multi-GB file. Unsorted columns still prune to the blocks
-     * whose [min, max] straddle $value. Falls back to a sequential scan
-     * when no stats exist.
+     * Mechanism: zone-map pruning over the per-block [min, max] stats
+     * plus first-match early exit — not a binary search, and the sorted
+     * flag is not consulted. It doesn't need to be: on a column the
+     * writer observed to be sorted, at most two adjacent blocks can
+     * straddle any value, so the '=' prune alone bounds the lookup to
+     * typically ONE block inflate — two S3 range requests end to end on
+     * a multi-GB file. On unsorted columns pruning still applies but
+     * may leave several candidate blocks. Falls back to a sequential
+     * scan when no stats exist (same result, no pruning).
      *
      * @return array{row: int, values: array<int, mixed>}|null
      */

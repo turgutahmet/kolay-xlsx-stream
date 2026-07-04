@@ -257,4 +257,62 @@ class QueryPushdownTest extends TestCase
         $this->expectException(\InvalidArgumentException::class);
         iterator_to_array($reader->rowsWhere(1, '!=', 5));
     }
+
+    /**
+     * Soundness regression: a NUMERIC-LOOKING header cell is matchable
+     * by the full-scan path (is_numeric passes), so the pruned path must
+     * find it too. Before the fix, the header wasn't folded into block
+     * 0's stats — querying a value outside the data range pruned block 0
+     * and the same call returned different results with and without
+     * stats, violating "stats widen, never narrow".
+     */
+    public function test_numeric_header_matches_identically_with_and_without_stats(): void
+    {
+        $build = function (string $path, bool $withStats): void {
+            $writer = new SinkableXlsxWriter(new FileSink($path));
+            if ($withStats) {
+                $writer->withRandomAccessIndex(every: 100)->withColumnStats([1]);
+            }
+            $writer->setBufferFlushInterval(100);
+            $writer->startFile(['999999', 'label']); // numeric-looking header
+            for ($i = 1; $i <= 300; $i++) {
+                $writer->writeRow([$i, 'x'.$i]);
+            }
+            $writer->finishFile();
+        };
+
+        $indexed = sys_get_temp_dir().'/kxs-hdr-a-'.uniqid('', true).'.xlsx';
+        $plain = sys_get_temp_dir().'/kxs-hdr-b-'.uniqid('', true).'.xlsx';
+        $build($indexed, true);
+        $build($plain, false);
+
+        try {
+            // 999999 lives ONLY in the header — outside every data block's
+            // range. Both paths must return sheet row 1.
+            $prunedHits = iterator_to_array(StreamingXlsxReader::fromFile($indexed)->rowsWhere(1, '=', 999999));
+            $scanHits = iterator_to_array(StreamingXlsxReader::fromFile($plain)->rowsWhere(1, '=', 999999));
+
+            $this->assertCount(1, $scanHits);
+            $this->assertCount(1, $prunedHits, 'pruned path lost the header match');
+            $this->assertSame('999999', array_values($prunedHits)[0][0]);
+
+            // Both paths must also agree on the KEY: 1-based sheet row
+            // numbers per the rowsWhere contract (the fallback used to
+            // leak rows()'s sequential 0-based keys).
+            $this->assertSame([1], array_keys($prunedHits));
+            $this->assertSame([1], array_keys($scanHits));
+
+            // And a normal data query is unaffected by the header fold.
+            $this->assertCount(1, iterator_to_array(StreamingXlsxReader::fromFile($indexed)->rowsWhere(1, '=', 150)));
+
+            // The numeric header must not poison the sortedness verdict:
+            // data 1..300 is ascending even though the header value 999999
+            // precedes it in the sheet.
+            $stats = StreamingXlsxReader::fromFile($indexed)->columnStats(1);
+            $this->assertSame('asc', $stats['sorted']);
+        } finally {
+            @unlink($indexed);
+            @unlink($plain);
+        }
+    }
 }

@@ -205,14 +205,15 @@ class ColumnStatsIndexTest extends TestCase
         $this->assertFalse($id['sorted_desc']);
         $this->assertCount($syncCount + 1, $id['blocks']);
 
-        // First block covers data rows 2..101. The header row is emitted
-        // via the sheet preamble, never through writeRow(), so it is
-        // invisible to the stats — `other` stays 0 for a clean column.
+        // First block covers rows 1..101 including the header, which the
+        // writer folds into block 0 (as `other` for a text header) so
+        // zone-map pruning stays consistent with the full-scan path —
+        // rowsWhere() can match a numeric-looking header on both paths.
         $first = $id['blocks'][0];
         $this->assertSame(1.0, $first['min']);
         $this->assertSame(100.0, $first['max']);
         $this->assertSame(100, $first['count']);
-        $this->assertSame(0, $first['other']);
+        $this->assertSame(1, $first['other']); // the 'id' header cell
 
         // Whole-sheet aggregate folds exactly to n(n+1)/2.
         $totalSum = array_sum(array_column($id['blocks'], 'sum'));

@@ -1006,14 +1006,19 @@ abstract class BaseXlsxWriter
 
     /**
      * Fold one row's tracked-column values into the current block's
-     * accumulators and the per-sheet sortedness tracker.
+     * accumulators and (for data rows) the per-sheet sortedness tracker.
      *
      * Inclusion rule mirrors what a reader will see as a numeric cell —
      * over-inclusion is deliberate: a value that widens min/max can only
      * make block pruning less selective, never incorrect, whereas a
      * value the stats missed could cause a matching block to be skipped.
+     *
+     * $trackOrder is false for the header row: it participates in the
+     * block stats (a numeric-looking header is matchable by rowsWhere's
+     * full-scan path, so pruning must account for it) but says nothing
+     * about the DATA ordering the sorted flag describes.
      */
-    protected function accumulateColumnStats(array $row): void
+    protected function accumulateColumnStats(array $row, bool $trackOrder = true): void
     {
         if (! array_is_list($row)) {
             $row = array_values($row);
@@ -1041,6 +1046,10 @@ abstract class BaseXlsxWriter
             }
             $acc['sum'] += $v;
             $acc['count']++;
+
+            if (! $trackOrder) {
+                continue;
+            }
 
             $s = &$this->statsSorted[$col];
             if ($s['prev'] !== null) {
@@ -1189,6 +1198,17 @@ abstract class BaseXlsxWriter
             foreach ($this->statsColumns as $col) {
                 $this->statsAccum[$col] = ['min' => 0.0, 'max' => 0.0, 'sum' => 0.0, 'count' => 0, 'other' => 0];
                 $this->statsSorted[$col] = ['asc' => true, 'desc' => true, 'prev' => null];
+            }
+
+            // The header row is emitted via the sheet preamble, never
+            // through writeRow() — but it IS a row the reader's
+            // full-scan path can match (a numeric-looking header passes
+            // is_numeric). Fold it into block 0 so zone-map pruning can
+            // never hide a row the un-pruned path would return; without
+            // this, rowsWhere() gave different results with and without
+            // stats for out-of-data-range values matching the header.
+            if ($this->columns !== []) {
+                $this->accumulateColumnStats($this->columns, trackOrder: false);
             }
         }
 

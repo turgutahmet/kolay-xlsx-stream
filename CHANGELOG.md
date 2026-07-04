@@ -75,6 +75,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Zone-map pruning could hide a numeric-looking header row.** The
+  header is emitted via the sheet preamble, not `writeRow()`, so it
+  wasn't folded into block 0's stats — `rowsWhere()`/`findRow()` for a
+  value matching the header but outside the data range returned the
+  header on the full-scan path and nothing on the pruned path. The
+  writer now folds header cells into block 0 (min/max/sum/count; the
+  sortedness verdict deliberately stays data-only), restoring the
+  "stats widen, never narrow" invariant. Found by adversarial oracle
+  testing; regression-tested against both paths.
+- **`rowsWhere()` fallback path yielded 0-based keys.** Without stats
+  the full-scan filter iterated a key-stripping wrapper, so the same
+  query yielded sequential 0-based keys instead of the documented
+  1-based sheet row numbers the pruned path emits. Both paths now
+  yield identical keys.
+- **`findRow()` docblock overstated its mechanism.** It performs
+  zone-map pruning with first-match early exit, not a binary search;
+  on sorted columns the prune alone bounds the lookup to typically one
+  block, so the cost claim was right and the wording now matches the
+  implementation. The sidecar's sorted flag remains informational
+  (surfaced via `columnStats()['sorted']`).
 - **Unknown format-preset names now throw at write time.**
   `setColumnFormat($col, 'currency')` — a typo'd or guessed preset
   name — used to fall through as a literal `formatCode="currency"`,
