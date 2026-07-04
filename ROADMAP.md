@@ -8,6 +8,7 @@ listed below `Backlog` is "considered, not committed".
 
 | Version | Date | Highlights |
 |---|---|---|
+| [3.2.0](CHANGELOG.md#320--2026-07-04) | 2026-07-04 | KXSI becomes an **open specification** ([SPEC.md](SPEC.md)) with a byte-pinned conformance suite; `SCRC` per-sync-point integrity CRCs; approximate analytics — `withColumnSketches()` embeds t-digest + HyperLogLog, `quantile()`/`median()`/`countDistinct()` answer with zero row reads; `groupStats()` sorted-group pushdown; +30 % read throughput (tokenizer micro-pass); `rows(skip)` fast path (~1,580× indexed) + within-block fast-forward (~19×); parallel S3 multipart upload (flat memory, steady wall times); packed shared strings (ceiling 20 → 64 MB compressed at 3.5× less peak); `autoDetectDates()` for external files |
 | [3.1.0](CHANGELOG.md#310--2026-07-04) | 2026-07-04 | Queryable XLSX: KXSI TLV sidecar extension with per-block column stats (zone maps) — `withColumnStats()` on the writer; `columnStats()`/`rowsWhere()`/`findRow()` on the reader (Parquet-style block pruning, sidecar-only aggregates, single-block point lookups); `shards()`/`rowsForShard()` for zero-coordination queue fan-out; writer +55 % throughput (PCRE-JIT escape gate, flattened row builder, level-5 default); S3 reader open 7 → 3 round trips; `rowCount()` boundary-count fast path |
 | [3.0.0](CHANGELOG.md#300--2026-05-06) | 2026-05-06 | Streaming reader (`StreamingXlsxReader`) with bounded ~24 MB RAM; born-indexed XLSX via opt-in `withRandomAccessIndex()` enabling O(1) `rowAt`/`rowRange`/`rowCount`; external XLSX support via shared-strings; new read + random-access benchmark scripts; tests reorganized under `Writers/` + `Readers/`; no breaking changes |
 | [2.2.2](CHANGELOG.md#222--2026-05-03) | 2026-05-03 | XML control-byte sanitization fast-path bug fix (long-standing, pre-v2.x); `onProgress` byte-counter doc note |
@@ -17,83 +18,73 @@ listed below `Backlog` is "considered, not committed".
 | [2.0.1](CHANGELOG.md#201--2026-05-03) | 2026-05-03 | CI / lint cleanup |
 | [2.0.0](CHANGELOG.md#200--2026-05-03) | 2026-05-03 | DateTime support, native boolean cells, big-int preservation, state machine guards, modernized dependency matrix |
 
-## Next: v3.2 — Reader/writer ergonomics & deferred polish
+## Next: v3.3 — Durable exports & smarter S3 reads
 
-Additive items that didn't make v3.0/v3.1. **No breaking changes
-planned.** (v3.1 pivoted to the queryable-XLSX layer — zone maps,
-shards, hot-path perf — so this list carries over.)
+Additive, no breaking changes planned. The through-line: exports that
+survive crashes, and reads that plan their own I/O.
 
-### Reader
+### Resumable S3 exports (the headline)
 
-- **`xl/_kxs/index.bin` migration tool** — CLI command that walks a
-  prefix on S3 (or a local directory), re-encodes each XLSX with
+Snapshot writer state at sync points — the `SCRC` running CRCs shipped
+in v3.2 exist precisely for this. `Writer::resume($snapshot)` after a
+crash re-enters at row N+1 instead of restarting a 25-minute queue job.
+The deflate mechanics (userland `crc32_combine`, full-flush segment
+concatenation) are already PoC-proven.
+
+### Reader I/O planning
+
+- **Range coalescing with a cost model** — when a pruned query wants
+  blocks {17, 19, 20}, decide between three requests or one padded
+  request from measured RTT/bandwidth (S3 `GetObject` accepts only a
+  single range per request).
+- **`explain()`** — return the query plan without executing: strategy,
+  candidate blocks, estimated requests/bytes/latency. Doubles as a CI
+  oracle (plan vs. actual request count).
+- **Hedged range requests** — re-issue a slow critical-path range on a
+  second connection, first response wins; insurance against S3 tail
+  latency on point lookups.
+- **Prefetch pipeline** — keep 3-4 blocks in flight during sequential
+  S3 scans so inflate/parse overlaps fetch.
+- **`onProgress` callback for the reader** — symmetric to the writer's,
+  for ingestion dashboards.
+
+### Tooling
+
+- **`xl/_kxs/index.bin` migration tool** — CLI that walks an S3 prefix
+  (or local directory), re-encodes each XLSX with
   `withRandomAccessIndex()` and uploads with `If-Match` for race
-  safety. Lets fleets retroactively make existing data lakes
-  random-access without re-running the original export job.
-- **Strategy 2 — on-disk shared-strings index** — for archives where
-  `xl/sharedStrings.xml` exceeds the 20 MB compressed in-memory
-  threshold. Inflate to `php://temp`, build an offset map per `<si>`,
-  resolve `t="s"` references via fseek + fread. Lifts the upper bound
-  on external-XLSX read support without breaking the bounded-RAM
-  contract.
-- **`onProgress` callback for the reader** — symmetric to the writer's
-  `onProgress`. Useful for long-running ingestion jobs that need to
-  report row-count progress to a queue dashboard.
+  safety — retroactively makes existing data lakes queryable.
+- **Reference TS/JS reader** — a small browser/Node KXSI reader over
+  HTTP Range requests (fetch + `DecompressionStream`), driven by the
+  SPEC.md conformance vectors. Proves the format is a spec, not a PHP
+  quirk.
 
-### Writer
-
-- **Parallel S3 multipart upload** — currently parts are uploaded
-  sequentially, RTT-bound. AWS SDK exposes async/concurrent upload
-  primitives; running 3-4 parts in flight should land **2-3× S3
-  throughput** on workloads above 1M rows. Tradeoff: peak memory grows
-  to `partSize × concurrency` (≈ 96-128 MB at default 32 MB parts).
-- **ZIP64 support for files > 4 GB** — current 32-bit ZIP offsets
-  silently overflow. Most real workloads are well under this limit
-  (4.5M rows ≈ 178 MB), but enterprise exports can hit it. Reader-side
-  already detects ZIP64 sentinel values and refuses with a clear error.
-- **Sample-based auto column width** — opt-in pass that scans the first
-  N rows of data and computes per-column maximum widths, replacing the
-  current header-text + format-min heuristic. Defaults stay heuristic
-  to avoid the per-cell `mb_strlen` cost when not requested.
-- **`setColumnFormat($col, int $builtinId)` overload** — accept Excel
-  built-in `numFmtId` ints (e.g. `BUILTIN_NUMFMT_DATE = 14`) so callers
-  with locale-sensitive formatting can lean on Excel's locale-aware
-  built-ins instead of getting a hardcoded `yyyy-mm-dd` regardless of
-  client locale.
-- **`PhpStreamSink`** — write directly to `php://output` so HTTP
-  responses can stream the workbook without a temp file. Pairs with
-  Laravel's `Response::stream()`.
-
-### Polish
+### Polish (carried over)
 
 - Skip `<col customWidth="1"/>` when the resolved width matches
-  Excel's default (8.43). Saves a few bytes per default-width column;
-  matters more at the 16,384-column ceiling than for typical reports.
-- Lazy S3 client / multipart init — `S3MultipartSink::__construct`
-  currently calls `createMultipartUpload` synchronously. Defer until
-  the first `write()` so the sink is cheaper to instantiate in DI
-  contexts (and so test fixtures can build one without S3 mocks).
+  Excel's default (8.43).
+- Lazy S3 client / multipart init — defer `createMultipartUpload` to
+  the first `write()` so the sink is cheap to instantiate in DI
+  contexts.
 
-### Queryable-XLSX follow-ups (v3.1 groundwork, PoC-verified)
+### Queryable-XLSX follow-ups (PoC-verified, sequenced after v3.3)
 
-The KXSI TLV framing reserves room for these; the deflate-level
-mechanics (userland `crc32_combine`, full-flush segment concatenation)
-were proven with runnable PoCs before v3.1 shipped:
-
-- **Resumable S3 exports** — snapshot writer state at sync points
-  (running CRC via `crc32_combine`); `Writer::resume($snapshot)` after
-  a crash re-enters at row N+1 instead of restarting a 25-minute job.
 - **Appendable XLSX** — end the last sheet at a full-flush boundary,
   reopen and continue with a fresh deflate context; on S3,
   `UploadPartCopy` makes append O(appended data). Wants ZIP64 first.
 - **Distributed export + server-side stitch** — N queue workers each
   write a headless full-flush-terminated deflate segment; a finalizer
   assembles one valid born-indexed .xlsx via `UploadPartCopy` without
-  downloading the segments (pigz-style concatenation).
+  downloading the segments. Parallel per-block deflate is provably
+  **byte-identical** to serial output (PoC), so the whole path can be
+  CI-verified by hash comparison.
+- **Verified partial reads (`MRKL`)** — a Merkle tree over per-block
+  hashes (tag reserved in SPEC.md): prove a ranged read belongs to a
+  signed file without fetching the rest of it.
 - **Compact cell refs** (`c/@r` omitted, spec-legal) — measured 2.1×
-  writer throughput and −44 % file size, but fast-excel-reader silently
-  returns zero rows on such files, so this stays opt-in and gated on
-  the external-reader compat matrix.
+  writer throughput and −44 % file size, but at least one popular
+  reader silently returns zero rows on such files; stays opt-in and
+  gated on the external-reader compat matrix.
 - **Retrofit index for foreign XLSX** — zran-style inflate-state
   snapshots make files *other* writers produced random-access after
   one pass. Pure PHP can't resume mid-stream (no `inflatePrime`);
@@ -106,6 +97,9 @@ Things that probably need a major version bump because they change
 public behaviour or require a newer floor. **None of these are
 committed yet** — they go in once the cost/benefit case is clear.
 
+- **ZIP64 writer support** (files > 4 GB) — the real unlock for
+  appendable workbooks and distributed stitching at scale; the reader
+  side already detects ZIP64 sentinels and refuses loudly.
 - **Cell-level styling API** — current API is column-level. Per-cell
   styling (e.g. red text for negative numbers) needs a different shape
   (`writeRow` would need to accept either a value or a styled cell
@@ -142,9 +136,10 @@ or never.
 - **Sheet name uniqueness check** — `newSheet('Foo')` twice currently
   produces two sheets with the same name. Excel tolerates this; better
   if we'd auto-suffix or throw.
-- **Performance: cell XML template caching** — pre-compute the
-  per-type cell open/close fragments instead of `'<c r="' . ... . '">'`
-  concat per cell. Marginal but measurable at 1M+ rows.
+- **Schema-specialized row builder (codegen)** — generate one closure
+  per column-type signature so each row is a single call with zero
+  per-cell branching; must be proven byte-identical like the v3.1/v3.2
+  hot-path work before it ships.
 
 ## How to suggest features
 
