@@ -146,6 +146,46 @@ file size**, and zero detectable RAM overhead. The original design budget
 allowed up to 0.5 % file size; we measured ~16× below that ceiling at
 500K rows.
 
+#### Write benchmark — v3.1 vs v3.0.2 (July 2026)
+
+Two kinds of numbers, kept deliberately separate. **The improvement
+claim** comes from a same-day, same-link A/B — both versions, identical
+workload (the canonical 8-column comprehensive payload, level 1, 32 MB
+parts):
+
+| Workload (1M rows) | v3.0.2 | v3.1.0 | Diff |
+|---|---|---|---|
+| Local, level 1 | 212,996 rows/s | 292,619 rows/s | **+37 %** |
+| Local, level 5 | 188,791 rows/s | 245,576 rows/s | **+30 %** |
+| S3, level 1 | 59,383 rows/s | 80,634 rows/s | **+36 %** |
+| S3, level 5 | 54,957 rows/s | 56,298 rows/s | ≈ equal (network-bound) |
+
+The CPU win (PCRE-JIT escape gate + flattened row builder + level-5
+default) carries through to S3 because row generation serializes with
+the synchronous part uploads.
+
+**Absolute S3 throughput** varies with the network path far more than
+with the library — the same 1M-row export measured 59K, 81K, and 113K
+rows/s across three sessions on the same machine. Full size sweep
+(2026-07-04, level 1, 32 MB parts, sequential runs):
+
+| Rows | S3 Speed | S3 Time | Peak RAM | File | Sheets |
+|------|----------|---------|----------|------|--------|
+| 500,000 | 44,828 rows/s | 11.2s | 41 MB | 20.0 MB | 1 |
+| 1,000,000 | 81,776 rows/s | 12.2s | 85 MB | 40.0 MB | 1 |
+| 2,000,000 | 84,297 rows/s | 23.7s | 120 MB | 79.2 MB | 2 |
+| 3,000,000 | **153,042 rows/s** | 19.6s | 150 MB | 119.0 MB | 3 |
+| 4,000,000 | 131,551 rows/s | 30.4s | 184 MB | 158.4 MB | 4 |
+
+The 3M figure reproduced in an isolated re-run minutes later (152,812
+rows/s, 19.63s) — but treat every S3 row as "that link, that hour":
+small files amortize fixed costs (TTFB, multipart finalize, staying
+under the 32 MB part threshold) poorly, and run-to-run jitter exceeds
+version-to-version deltas. Benchmark on your own link; the sequential
+`uploadPart` stall is the known bottleneck and parallel multipart
+upload is on the roadmap. Peak RAM grows ~40 MB per million rows with
+32 MB parts (part buffer + copies — the same rework will flatten this).
+
 #### Write benchmark — v3.0 vs v2.2.2
 
 v3.0's writer default code path is byte-identical to v2.2.2 — the only
@@ -288,8 +328,13 @@ The ± values in S3 memory represent **normal memory fluctuation** during stream
 - **Queryable files (v3.1)**: `columnStats()` answers min/max/sum/avg from
   the sidecar alone; `rowsWhere()` skips blocks via zone maps; `findRow()`
   resolves point lookups on sorted columns by reading a single block.
+- **Write — S3 (v3.1)**: **+36 % over v3.0.2** in a same-day, same-link A/B
+  at 1M rows; absolute throughput ranged 59K–153K rows/s across sessions
+  and sizes (peak: 3M rows at 153K rows/s, reproduced twice — full sweep
+  in the v3.1 write benchmark table). S3 numbers track the network path
+  far more than the library; benchmark on your own link.
 
-*(v3.0, May 2026)*
+*(v3.0, May 2026 — S3 figures reflect that day's network path)*
 
 - **Write — Local**: ~190,000–222,000 rows/second with true O(1) memory
 - **Write — S3**: 109,000–129,000 rows/second above 750K rows (2.5–3× the v1.x baseline, identical to v2.2.2)
