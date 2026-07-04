@@ -123,6 +123,108 @@ class SharedStringsParserTest extends TestCase
         $this->assertSame('real', $sst->get(0));
     }
 
+    public function test_out_of_range_index_throws(): void
+    {
+        $sst = SharedStringsParser::parseInMemory($this->wrap('<si><t>only</t></si>'));
+
+        $this->expectException(\Kolay\XlsxStream\Exceptions\XlsxReadException::class);
+        $this->expectExceptionMessageMatches('/shared-string index 1 out of range/');
+
+        $sst->get(1);
+    }
+
+    public function test_negative_index_throws(): void
+    {
+        $sst = SharedStringsParser::parseInMemory($this->wrap('<si><t>only</t></si>'));
+
+        $this->expectException(\Kolay\XlsxStream\Exceptions\XlsxReadException::class);
+        $this->expectExceptionMessageMatches('/shared-string index -1 out of range/');
+
+        $sst->get(-1);
+    }
+
+    public function test_streaming_chunks_split_at_every_byte_boundary(): void
+    {
+        // The whole point of the incremental parser: an <si> entry (or
+        // the '<si' needle itself, or an entity, or a quoted attribute)
+        // straddling a chunk edge must parse identically to the
+        // one-shot path. Exhaustively split a document that exercises
+        // every recognised shape at EVERY byte position.
+        $xml = $this->wrap(
+            '<si><t>plain</t></si>'.
+            '<si/>'.
+            '<si><t xml:space="preserve">  ws  </t></si>'.
+            '<si><r><rPr><b/></rPr><t>Bold</t></r><r><t> tail</t></r></si>'.
+            '<sidetable>noise</sidetable>'.
+            '<si><t>a &amp; b</t></si>'.
+            '<si><t>İstanbul 🌊</t></si>'
+        );
+        $expected = ['plain', '', '  ws  ', 'Bold tail', 'a & b', 'İstanbul 🌊'];
+
+        $len = strlen($xml);
+        for ($split = 1; $split < $len; $split++) {
+            $parser = new SharedStringsParser();
+            $parser->push(substr($xml, 0, $split));
+            $parser->push(substr($xml, $split));
+            $sst = $parser->finish();
+
+            $this->assertSame(count($expected), $sst->count(), "split at byte {$split}");
+            foreach ($expected as $i => $value) {
+                $this->assertSame($value, $sst->get($i), "entry {$i}, split at byte {$split}");
+            }
+        }
+    }
+
+    public function test_streaming_single_byte_chunks(): void
+    {
+        // Degenerate chunking — every push carries one byte, so every
+        // carry path (partial '<si', unfinished opening tag, unfinished
+        // body) runs on every entry.
+        $xml = $this->wrap('<si><t>one</t></si><si/><si><t>two &lt;3</t></si>');
+
+        $parser = new SharedStringsParser();
+        foreach (str_split($xml) as $byte) {
+            $parser->push($byte);
+        }
+        $sst = $parser->finish();
+
+        $this->assertSame(3, $sst->count());
+        $this->assertSame('one', $sst->get(0));
+        $this->assertSame('', $sst->get(1));
+        $this->assertSame('two <3', $sst->get(2));
+    }
+
+    public function test_truncated_trailing_entry_is_dropped(): void
+    {
+        // EOF in the middle of an entry — the incomplete tail parses to
+        // nothing, matching the pre-streaming parser's break-on-missing
+        // '</si>' behaviour.
+        $parser = new SharedStringsParser();
+        $parser->push('<sst><si><t>whole</t></si><si><t>cut off he');
+        $sst = $parser->finish();
+
+        $this->assertSame(1, $sst->count());
+        $this->assertSame('whole', $sst->get(0));
+    }
+
+    public function test_unclosed_si_entry_exceeding_carry_cap_throws(): void
+    {
+        // An <si> that never closes would otherwise accumulate the whole
+        // remaining document in the carry buffer — the 16 MB cap keeps
+        // the streaming parse's memory bound honest on malicious input.
+        $parser = new SharedStringsParser();
+        $parser->push('<sst><si><t>');
+
+        $this->expectException(\Kolay\XlsxStream\Exceptions\XlsxReadException::class);
+        $this->expectExceptionMessageMatches('/<si> entry exceeds 16 MB/');
+
+        // 17 MB of body that never reaches '</si>'.
+        $filler = str_repeat('x', 1024 * 1024);
+        for ($i = 0; $i < 17; $i++) {
+            $parser->push($filler);
+        }
+    }
+
     private function wrap(string $body): string
     {
         return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'.

@@ -277,6 +277,116 @@ class ZipDirectory
     }
 
     /**
+     * Stream an entry's INFLATED bytes as string chunks, never holding
+     * more than one compressed read + its inflated output at a time.
+     *
+     * This is readEntry()'s bounded-RAM sibling: same DEFLATE/STORED
+     * support, but for parts too large to materialise as one string —
+     * today that's xl/sharedStrings.xml, whose parser consumes chunks
+     * incrementally. Sheet bodies keep going through
+     * StreamingSheetReader, whose chunk engine additionally supports
+     * mid-stream offsets (sync-point seeks) that plain entry streaming
+     * never needs; the read loop below deliberately mirrors its
+     * validation, FINISH-flush and stalled-source handling so the two
+     * paths fail identically on the same malformed archives.
+     *
+     * @return \Generator<int, string>
+     */
+    public function streamEntry(Source $source, string $name, int $chunkSize = 65536): \Generator
+    {
+        $entry = $this->entry($name);
+        if ($entry === null) {
+            throw XlsxReadException::entryNotFound($name);
+        }
+
+        $method = $entry['method'];
+        if ($method !== 8 && $method !== 0) {
+            throw XlsxReadException::inflateFailed(
+                "entry {$name} uses unsupported ZIP compression method {$method}"
+            );
+        }
+
+        $stream = $source->streamFrom($this->dataOffset($source, $name));
+        $compRemaining = $entry['compressed_size'];
+
+        $inflate = null;
+        if ($method === 8) {
+            $inflate = inflate_init(ZLIB_ENCODING_RAW);
+            if ($inflate === false) {
+                if (is_resource($stream)) {
+                    fclose($stream);
+                }
+                throw XlsxReadException::inflateFailed("inflate_init failed for {$name}");
+            }
+        }
+
+        // STORED has no deflate state to flush — treat the FINISH step
+        // as already done so the loop exits cleanly when input runs out.
+        $finishedFlush = $method === 0;
+        $emptyReads = 0;
+
+        try {
+            while (true) {
+                $inflated = '';
+
+                if ($compRemaining > 0) {
+                    $compressed = fread($stream, min($chunkSize, $compRemaining));
+                    $n = is_string($compressed) ? strlen($compressed) : 0;
+
+                    if ($n === 0) {
+                        if (feof($stream)) {
+                            $compRemaining = 0;
+                        } elseif (++$emptyReads >= 100) {
+                            throw XlsxReadException::sourceUnreadable(
+                                'source stream stalled — 100 consecutive empty reads with feof=false'
+                            );
+                        } else {
+                            usleep(10_000); // 10ms backoff before retry
+
+                            continue;
+                        }
+                    } else {
+                        $emptyReads = 0;
+                        $compRemaining -= $n;
+
+                        if ($method === 8) {
+                            $flag = $compRemaining === 0 ? ZLIB_FINISH : ZLIB_NO_FLUSH;
+                            if ($flag === ZLIB_FINISH) {
+                                $finishedFlush = true;
+                            }
+                            $inflated = inflate_add($inflate, $compressed, $flag);
+                            if ($inflated === false) {
+                                throw XlsxReadException::inflateFailed("mid-stream inflate_add failed for {$name}");
+                            }
+                        } else {
+                            // STORED: raw bytes are the "inflated" output.
+                            $inflated = $compressed;
+                        }
+                    }
+                } elseif (! $finishedFlush) {
+                    $inflated = inflate_add($inflate, '', ZLIB_FINISH);
+                    if ($inflated === false) {
+                        throw XlsxReadException::inflateFailed("final inflate_add failed for {$name}");
+                    }
+                    $finishedFlush = true;
+                }
+
+                if ($inflated !== '') {
+                    yield $inflated;
+                }
+
+                if ($compRemaining === 0 && $finishedFlush) {
+                    break;
+                }
+            }
+        } finally {
+            if (is_resource($stream)) {
+                fclose($stream);
+            }
+        }
+    }
+
+    /**
      * Fetch an entry's compressed body, coalescing the Local File
      * Header lookup and the body read into a single ranged fetch for
      * small entries.

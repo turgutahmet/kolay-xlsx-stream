@@ -1,0 +1,118 @@
+{
+  "rows": 500000,
+  "runs_each": 10,
+  "machine": "darwin, PHP 8.2.28 NTS",
+  "baseline_v3.0.1": {
+    "mode": "unstyled",
+    "median_s": 3.1222,
+    "mean_s": 3.1134,
+    "min_s": 3.0302,
+    "max_s": 3.1853,
+    "peak_mb": 6,
+    "best_rows_per_sec": 165006,
+    "note": "measured with the pre-v3.1 bench that generated rows (incl. DateTime->modify parsing) inside the timed loop — understates writer throughput by ~10-13%"
+  },
+  "v3.0.2": {
+    "note": "styled paths measured AFTER hoisting the row style attribute out of the per-cell loop",
+    "unstyled": {
+      "median_s": 3.100,
+      "mean_s": 3.1052,
+      "min_s": 3.006,
+      "max_s": 3.3419,
+      "peak_mb": 6,
+      "best_rows_per_sec": 166335,
+      "delta_vs_baseline_median": "-0.7% (within noise, no regression — path is byte-identical)"
+    },
+    "styled_1pct": {
+      "median_s": 3.0875,
+      "mean_s": 3.087,
+      "min_s": 3.0366,
+      "max_s": 3.1264,
+      "peak_mb": 6,
+      "best_rows_per_sec": 164656,
+      "delta_vs_baseline_median": "-1.1% (within noise, effectively zero overhead)"
+    },
+    "all_rows_styled_worstcase": {
+      "median_s": 3.1574,
+      "mean_s": 3.146,
+      "min_s": 3.075,
+      "max_s": 3.1948,
+      "peak_mb": 6,
+      "best_rows_per_sec": 162604,
+      "delta_vs_baseline_median": "+1.1%"
+    }
+  },
+  "v3.1.0": {
+    "note": "bench hygiene fixed first (row generation cost measured via calibration pass and subtracted; DateTime pool outside the loop), then both versions re-measured apples-to-apples with the SAME fixed bench, 5 runs each",
+    "v3.0.2_remeasured_writer_only": {
+      "median_s": 2.678,
+      "min_s": 2.6124,
+      "max_s": 2.6828,
+      "peak_mb": 6,
+      "file_mb": 17.35,
+      "best_rows_per_sec": 191397
+    },
+    "v3.1.0_writer_only": {
+      "median_s": 1.7287,
+      "min_s": 1.7171,
+      "max_s": 1.7305,
+      "peak_mb": 6,
+      "file_mb": 17.37,
+      "best_rows_per_sec": 291184,
+      "delta_vs_v3.0.2_median": "-35.4% wall, +55% throughput, +0.12% file size",
+      "changes": [
+        "fastXmlEscape: strpbrk 34-char needle replaced with PCRE JIT character-class pre-check (clean-string fast path ~5x cheaper)",
+        "buildRowXml/buildStyledRowXml: string-first type dispatch, column-letter cache hoisted to a local, direct string append instead of array+implode (sheet XML verified byte-identical against v3.0.2 on an edge-case corpus)",
+        "default deflate level 6 -> 5 (measured knee of the size/speed curve for XLSX-shaped XML)"
+      ]
+    }
+  },
+  "v3.2.0-dev": {
+    "note": "reader-side release: rows(skip) fast path (index seek + '</row>' boundary-scan skip), within-block fast-forward for rowAt/rowRange, blockRanges memoization, groupStats() sorted-group pushdown. New benches: read_bench.php (full-scan rows/s), query_bench.php (query surface). Query/read numbers are 5-run fresh-process medians; before/after skip numbers use the audit 04 in-process methodology on the same fixtures.",
+    "skip_fast_path_before_after": {
+      "fixtures": "indexed: 1.1M rows, sync every 10K, stats col 1; no-index: 500K rows",
+      "rows_skip_1M_limit1_indexed": { "before_s": 3.9435, "after_s": 0.0025, "speedup": "~1580x" },
+      "rows_skip_400K_limit1_no_index": { "before_s": 1.6111, "after_s": 0.0555, "speedup": "~29x (boundary scan instead of tokenized skip)" },
+      "rowAt_random_targets_within_block": { "before_ms_per_call": 21.06, "after_ms_per_call": 1.13, "speedup": "~19x (sync-point-to-target gap boundary-scanned, not tokenized)" },
+      "rowAt_1000001_near_sync_point": { "before_s": 0.0403, "after_s": 0.0019 }
+    },
+    "read_full_scan": {
+      "narrow_6col_500K": {
+        "rows": 500001,
+        "file_mb": 17.63,
+        "runs": 5,
+        "peak_mb": 6,
+        "min_s": 3.9405,
+        "median_s": 3.9768,
+        "max_s": 4.011,
+        "best_rows_per_sec": 126887
+      },
+      "wide_30col_100K": {
+        "rows": 100001,
+        "file_mb": 11.57,
+        "runs": 5,
+        "peak_mb": 6,
+        "min_s": 3.746,
+        "median_s": 3.7716,
+        "max_s": 3.7775,
+        "best_rows_per_sec": 26696
+      }
+    },
+    "query_1M_rows_sync10K": {
+      "fixture": "1M rows [ID, Name, Amount, Group], index every 10K, stats cols 1/3/4, Group = 20 sorted duplicate groups",
+      "file_mb": 21.45,
+      "runs_each": 5,
+      "cold_open_ms": 1.072,
+      "rowAt_ms_per_call": 1.28,
+      "findRow_ms_per_call": 26.454,
+      "rowsWhere_between": {
+        "selectivity_0.01%": { "rows": 100, "ms": 109.2 },
+        "selectivity_1%": { "rows": 10000, "ms": 108.6 },
+        "selectivity_10%": { "rows": 100000, "ms": 599.3 }
+      },
+      "rows_skip_999000_limit100_ms": 2.7,
+      "groupStats_20_groups_ms": 56.9,
+      "peak_mb": 6
+    }
+  }
+}

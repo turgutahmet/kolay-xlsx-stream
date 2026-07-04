@@ -36,10 +36,12 @@ use Kolay\XlsxStream\Sources\S3RangeSource;
  * (t="inlineStr") — no sharedStrings.xml is needed. Files written by
  * other XLSX writers (PhpSpreadsheet, openpyxl, Apache POI, …) typically
  * deduplicate strings into xl/sharedStrings.xml; the reader detects this
- * and loads the table into memory transparently. Archives whose
- * sharedStrings.xml exceeds SST_RAM_THRESHOLD compressed bytes are
- * refused with a clear error — an on-disk variant for very large tables
- * is tracked as a future addition.
+ * and loads the table transparently — streamed straight from the inflate
+ * loop into a packed lookup (one payload buffer + a binary offset index),
+ * so the table costs its text plus 4 bytes per entry, never a PHP array
+ * or the whole XML document. Archives whose sharedStrings.xml exceeds
+ * SST_RAM_THRESHOLD compressed bytes are refused with a clear error — an
+ * on-disk variant for very large tables is tracked as a future addition.
  */
 class StreamingXlsxReader
 {
@@ -48,18 +50,34 @@ class StreamingXlsxReader
      * fitting comfortably in RAM. ~99% of real-world XLSX files have a
      * sst well below this. Files above the threshold get a clear error
      * pointing at the limitation.
+     *
+     * 64 MB (up from 20 MB pre-v3.2): the packed table + streaming
+     * parse cut the measured resolution peak ~3.5x — a 30 MB sst that
+     * used to cost 84 MB of RAM (full XML + list<string> at ~57 B/entry
+     * of array overhead) now costs 24 MB (payload + 4 B/entry offset
+     * index, XML never materialised) — so the same RAM budget covers a
+     * proportionally larger table.
      */
-    public const SST_RAM_THRESHOLD = 20 * 1024 * 1024;
+    public const SST_RAM_THRESHOLD = 64 * 1024 * 1024;
 
     /**
      * Upper bound on the *uncompressed* shared-strings size we will
-     * inflate into RAM. Highly repetitive XML (a single repeated <si>
+     * parse into RAM. Highly repetitive XML (a single repeated <si>
      * entry, common in adversarial inputs and accidentally in some
-     * exports) compresses 50:1 or higher, so a 20 MB compressed payload
-     * can balloon to 1 GB+. This second guard keeps the bounded-RAM
-     * contract intact even when the deflate ratio is pathological.
+     * exports) compresses 50:1 or higher, so a compressed payload well
+     * under SST_RAM_THRESHOLD can balloon far past it. This second
+     * guard keeps the bounded-RAM contract intact even when the
+     * deflate ratio is pathological.
+     *
+     * 320 MB (up from 100 MB pre-v3.2), scaled by the same measured
+     * ~3.5x reduction: the resolution peak is now the packed table —
+     * roughly the string payload (typically 50-70% of the XML size)
+     * plus 4 bytes per entry — not a multiple of the document, so a
+     * table this size parses in ~200 MB (measured 245 MB XML / 8M
+     * entries → 185 MB peak) instead of the ~700 MB the old model
+     * would have needed.
      */
-    public const SST_UNCOMPRESSED_THRESHOLD = 100 * 1024 * 1024;
+    public const SST_UNCOMPRESSED_THRESHOLD = 320 * 1024 * 1024;
 
     private Source $source;
     private ZipDirectory $cd;
@@ -74,10 +92,39 @@ class StreamingXlsxReader
     private ?RandomAccessIndex $randomAccessIndex = null;
     private bool $indexResolved = false;
 
+    /**
+     * Per-entry memo of RandomAccessIndex::blockRanges(). The index
+     * rebuilds the ranges from its sync-point list on every call, and
+     * query methods (rowsWhere / groupStats / findRow) may run hundreds
+     * of times against the same sheet — hot query workloads pay that
+     * rebuild per call for an answer that never changes. The decoded
+     * index is immutable and resolved once per reader, so entries can
+     * never go stale; keying by entry also makes sheet switches
+     * invalidation-free (each entry carries its own slot).
+     *
+     * @var array<string, list<array{first_row: int, last_row: int, comp_offset: int|null, uncomp_offset: int|null, start_row_at_offset: int|null}>>
+     */
+    private array $blockRangesByEntry = [];
+
     /** @var array<int, callable> */
     private array $columnCasts = [];
 
     private bool $use1904Epoch = false;
+
+    private bool $autoDetectDates = false;
+
+    private bool $autoDetectWithTime = true;
+
+    /**
+     * cellXfs index → is-date bitmap from xl/styles.xml, resolved
+     * lazily like the sst (styles are workbook-wide, so no per-sheet
+     * invalidation). null when the archive has no styles.xml.
+     *
+     * @var list<bool>|null
+     */
+    private ?array $dateStyleBitmap = null;
+
+    private bool $stylesResolved = false;
 
     /**
      * Excel stores dates as timezone-naive numeric serials. We materialise
@@ -201,7 +248,17 @@ class StreamingXlsxReader
     /**
      * Yield rows from the selected sheet. By default returns every row
      * including the header; pass skip=1 to drop the header, or skip=N
-     * to start at row N+1.
+     * to start at row N+1. Yielded keys count emitted rows from 0 —
+     * they are NOT sheet row numbers (rowRange() carries those).
+     *
+     * skip is cheap: the reader seeks to the nearest sync point before
+     * the target when the file carries a usable index, and covers the
+     * remaining gap (or, without an index, the whole prefix) with a
+     * '</row>' boundary scan instead of tokenizing rows nobody asked
+     * for. Yielded rows are byte-for-byte what the naive "drop the
+     * first N yields" loop produced before v3.2 — only the skipping
+     * got faster (measured: 3.9s -> 2.5ms for skip=1M indexed, 1.6s ->
+     * 56ms for skip=400K without an index).
      *
      * @return \Generator<int, array<int, mixed>>
      */
@@ -214,15 +271,32 @@ class StreamingXlsxReader
             return;
         }
 
+        if ($skip > 0) {
+            // rows() counts yields, and rowsFromOffset() yields exactly
+            // one row per '</row>' boundary from its starting row — so
+            // "drop the first N yields" is the same operation as "start
+            // at row N+1" (the countRows() equivalence argument; self-
+            // closing rows produce neither a yield nor a boundary).
+            // seekTarget degrades to [null, 1] without a usable index,
+            // in which case $fastForwardTo alone does the work as a
+            // boundary scan from the sheet start.
+            [$compOffset, $startingRow] = $this->seekTarget($skip + 1);
+
+            $emitted = 0;
+            foreach ($this->openSheetReader()->rowsFromOffset($compOffset, $startingRow, $skip + 1) as $row) {
+                yield $this->applyCasts($row);
+                $emitted++;
+                if ($limit !== null && $emitted >= $limit) {
+                    return;
+                }
+            }
+
+            return;
+        }
+
         $emitted = 0;
-        $skipped = 0;
 
         foreach ($this->openSheetReader()->rows() as $row) {
-            if ($skipped < $skip) {
-                $skipped++;
-
-                continue;
-            }
             yield $this->applyCasts($row);
             $emitted++;
             if ($limit !== null && $emitted >= $limit) {
@@ -290,10 +364,13 @@ class StreamingXlsxReader
      *
      * Cost:
      *   - With xl/_kxs/index.bin → O(period) — fresh inflate from the
-     *     nearest sync point + scan up to $period rows. Effectively
-     *     constant time bounded by the writer-chosen sync period.
-     *   - Without the sidecar → O(N) — full inflate scan from the
-     *     start until the target row is reached.
+     *     nearest sync point, boundary-scanning (not tokenizing) the
+     *     up-to-$period rows between the sync point and the target.
+     *     Effectively constant time bounded by the writer-chosen sync
+     *     period; the fast-forward cut that cost ~19x (measured 21ms →
+     *     1.1ms per random rowAt at period 10K).
+     *   - Without the sidecar → O(N) — inflate from the start, but the
+     *     prefix is boundary-scanned rather than tokenized.
      *
      * @return array<int, mixed>|null
      */
@@ -305,7 +382,7 @@ class StreamingXlsxReader
 
         [$compOffset, $startingRow] = $this->seekTarget($rowNumber);
 
-        foreach ($this->openSheetReader()->rowsFromOffset($compOffset, $startingRow) as $rn => $row) {
+        foreach ($this->openSheetReader()->rowsFromOffset($compOffset, $startingRow, $rowNumber) as $rn => $row) {
             if ($rn === $rowNumber) {
                 return $this->applyCasts($row);
             }
@@ -336,7 +413,10 @@ class StreamingXlsxReader
 
         [$compOffset, $startingRow] = $this->seekTarget($from);
 
-        foreach ($this->openSheetReader()->rowsFromOffset($compOffset, $startingRow) as $rn => $row) {
+        // $from doubles as the fast-forward target: rows between the
+        // sync point and the range start are boundary-scanned, never
+        // tokenized. The $rn < $from guard stays as a no-op safety net.
+        foreach ($this->openSheetReader()->rowsFromOffset($compOffset, $startingRow, $from) as $rn => $row) {
             if ($rn < $from) {
                 continue;
             }
@@ -402,6 +482,66 @@ class StreamingXlsxReader
     }
 
     /**
+     * Approximate value at quantile $q (0 = min .. 1 = max) of a
+     * column's numeric values, answered from the sidecar's t-digest
+     * sketch (KXSI "TDIG") alone — ZERO row data is read and, the index
+     * being cached at open, zero additional range requests are issued:
+     * on S3 a multi-GB file answers its p99 from bytes already in hand.
+     *
+     * The value population is the STAT one — cells the writer rendered
+     * numerically (int/float, numeric strings, DateTime as Excel serial,
+     * bool as 0/1) in DATA rows; the header row is excluded by the
+     * format (sketches estimate the data distribution — see SPEC.md
+     * §4.3). q=0 and q=1 are the exact min/max; typical rank error at
+     * compression 100 is well under 0.1% at the tails.
+     *
+     * Returns null when the file carries no sketch for the column (not
+     * born-sketched, stale sidecar, or column not tracked) — callers
+     * decide whether an exact scan is worth it. Also null for a sketch
+     * that saw no numeric values (e.g. a text column).
+     */
+    public function quantile(int $column, float $q): ?float
+    {
+        if ($q < 0.0 || $q > 1.0) {
+            throw new \InvalidArgumentException("quantile must be within [0, 1]; got {$q}");
+        }
+
+        $digest = $this->loadRandomAccessIndex()?->columnDigest($this->currentEntry, $column);
+
+        return $digest?->quantile($q);
+    }
+
+    /**
+     * Approximate median — sugar for quantile($column, 0.5).
+     */
+    public function median(int $column): ?float
+    {
+        return $this->quantile($column, 0.5);
+    }
+
+    /**
+     * Approximate number of distinct values in a column, answered from
+     * the sidecar's HyperLogLog sketch (KXSI "CHLL") alone — like
+     * quantile(), zero row data and zero additional requests.
+     *
+     * Distinctness is over canonical string forms (SPEC.md §4.4), so
+     * text columns are fully covered — non-numeric values, invisible to
+     * quantile(), count here. Empty cells (null/'') are not values and
+     * are never counted; the header row is excluded. Standard error at
+     * p=11 is ±~2.3%; small cardinalities are near-exact (linear
+     * counting).
+     *
+     * Returns null when the file carries no sketch for the column;
+     * 0 for a tracked column whose data rows were all empty.
+     */
+    public function countDistinct(int $column): ?int
+    {
+        $hll = $this->loadRandomAccessIndex()?->columnHll($this->currentEntry, $column);
+
+        return $hll?->count();
+    }
+
+    /**
      * Yield rows whose $column (1-based, see columnStats) satisfies a
      * numeric predicate, using the sidecar's per-block zone maps to skip
      * every block whose [min, max] provably contains no match — the
@@ -431,7 +571,7 @@ class StreamingXlsxReader
             // rows(): that wrapper re-keys sequentially from 0, while
             // this generator's contract (and the pruned path below) is
             // 1-based sheet row numbers.
-            foreach ($this->openSheetReader()->rowsFromOffset(null, 1) as $rn => $row) {
+            foreach ($this->openSheetReader([$column - 1])->rowsFromOffset(null, 1) as $rn => $row) {
                 if ($this->cellMatches($row[$column - 1] ?? null, $op, $value, $value2)) {
                     yield $rn => $this->applyCasts($row);
                 }
@@ -440,7 +580,7 @@ class StreamingXlsxReader
             return;
         }
 
-        $ranges = $index->blockRanges($this->currentEntry);
+        $ranges = $this->blockRanges($index);
 
         // Prune, then merge surviving adjacent blocks into runs so each
         // run costs one seek + one linear scan instead of per-block seeks.
@@ -463,7 +603,7 @@ class StreamingXlsxReader
             $start = $ranges[$firstBlock];
             $stopRow = $ranges[$lastBlock]['last_row'];
 
-            foreach ($this->openSheetReader()->rowsFromOffset($start['comp_offset'], $start['start_row_at_offset'] ?? 1) as $rn => $row) {
+            foreach ($this->openSheetReader([$column - 1])->rowsFromOffset($start['comp_offset'], $start['start_row_at_offset'] ?? 1, $start['first_row']) as $rn => $row) {
                 if ($rn < $start['first_row']) {
                     continue;
                 }
@@ -496,6 +636,250 @@ class StreamingXlsxReader
     {
         foreach ($this->rowsWhere($column, '=', $value) as $rn => $row) {
             return ['row' => $rn, 'values' => $row];
+        }
+
+        return null;
+    }
+
+    /**
+     * Sorted-group aggregate pushdown: GROUP BY bucket(group column),
+     * aggregating another column — sum/count/min/max per group — with
+     * whole blocks answered from the sidecar's zone maps instead of row
+     * data whenever the sheet allows it.
+     *
+     * $groupBy and $aggregate are 1-based columns (see columnStats).
+     * $bucket maps a numeric group value to its group key; default is
+     * identity. It MUST be monotone non-decreasing over the column's
+     * value range — pruning concludes "every row in this block is one
+     * group" from bucket(min) == bucket(max), which only follows when
+     * bucketing preserves order. Threshold buckets (floor of a
+     * division, date serial → calendar month, …) qualify:
+     *
+     *     // date-serial group column → per-month totals (202401, …)
+     *     $reader->groupStats(2, 4, fn (float $d) => (int) gmdate('Ym', (int) (($d - 25569) * 86400)));
+     *
+     * Pushdown applies when the sidecar tracks BOTH columns and saw the
+     * group column sorted (asc or desc) — groups then span contiguous
+     * blocks. A block whose min and max bucket to the same group, with
+     * no non-numeric group cells (other == 0 — the writer counts
+     * missing cells there too), is group-pure: the aggregate column's
+     * block stats are exactly that group's contribution, so the block
+     * is never inflated. Blocks straddling a group boundary are
+     * inflated and folded row by row, as is block 0 (the header row
+     * folds into its stats for both columns — a numeric-looking header
+     * would otherwise leak into the aggregates, so block 0's rows go
+     * through the scan path where the row-1 exclusion is
+     * authoritative). Blocks whose group column shows count == 0 hold
+     * no numeric group values at all — no row in them can join any
+     * group — and are skipped without being read. Unsorted or
+     * untracked columns degrade to an honest full scan with the same
+     * grouping: identical results, no pruning.
+     *
+     * Row semantics, identical on every path:
+     *   - The header row (row 1) never participates — data rows only.
+     *   - Rows whose group cell is non-numeric are EXCLUDED, consistent
+     *     with rowsWhere()'s numeric-only matching (block stats cannot
+     *     see non-numeric values, so no pruned plan could honour them).
+     *   - sum/count/min/max cover the group's numeric aggregate cells;
+     *     a group whose aggregate cells are all non-numeric still
+     *     appears, with count 0, sum 0.0 and null min/max.
+     *   - "Numeric" matches the writer's stats fold (statNumericValue):
+     *     booleans count as 0/1, because the block stats the pushdown
+     *     consumes already include them.
+     *
+     * Groups are returned in first-encounter sheet order — ascending
+     * group keys for an asc-sorted column, descending for desc.
+     *
+     * @param  callable(float): (int|float)  $bucket
+     * @return list<array{group: int|float, sum: float, count: int, min: float|null, max: float|null}>
+     */
+    public function groupStats(int $groupBy, int $aggregate, ?callable $bucket = null): array
+    {
+        if ($groupBy < 1 || $aggregate < 1) {
+            throw new \InvalidArgumentException(
+                "groupStats() columns are 1-based; got groupBy={$groupBy}, aggregate={$aggregate}"
+            );
+        }
+        $bucket ??= static fn (float $v): float => $v;
+
+        $index = $this->loadRandomAccessIndex();
+        $groupCol = $index?->columnStats($this->currentEntry, $groupBy);
+        $aggCol = $index?->columnStats($this->currentEntry, $aggregate);
+
+        /** @var array<string, array{group: int|float, sum: float, count: int, min: float|null, max: float|null}> $groups */
+        $groups = [];
+
+        if ($index === null || $groupCol === null || $aggCol === null
+            || (! $groupCol['sorted_asc'] && ! $groupCol['sorted_desc'])) {
+            // No pushdown basis — honest full scan with the same
+            // grouping. Not via rows(): the scan must see 1-based row
+            // numbers to exclude exactly the header.
+            foreach ($this->openSheetReader([$groupBy - 1, $aggregate - 1])->rowsFromOffset(null, 1) as $rn => $row) {
+                if ($rn === 1) {
+                    continue;
+                }
+                $this->foldRowIntoGroups($groups, $row, $groupBy, $aggregate, $bucket);
+            }
+
+            return array_values($groups);
+        }
+
+        $ranges = $this->blockRanges($index);
+        $aggBlocks = $aggCol['blocks'];
+
+        // Plan pass: classify every block in sheet order. Adjacent scan
+        // blocks merge into one run so a group boundary costs one seek,
+        // not one per block; the plan keeps sheet order so groups
+        // register in first-encounter order no matter which step (block
+        // stats or row scan) sees them first.
+        /** @var list<array{stats: array{0: int|float, 1: int}}|array{scan: array{0: int, 1: int}}> $plan */
+        $plan = [];
+        $scanRun = null; // [firstBlockIdx, lastBlockIdx] pending row-level scan
+        foreach ($groupCol['blocks'] as $i => $block) {
+            // count == 0: the block holds NO numeric group values, and
+            // only a numeric group cell can place a row in a group —
+            // nothing in this block can reach the result. Skipped
+            // without being read, whatever its `other` count says.
+            if ($block['count'] === 0) {
+                if ($scanRun !== null) {
+                    $plan[] = ['scan' => $scanRun];
+                    $scanRun = null;
+                }
+
+                continue;
+            }
+
+            // Group-purity test. other == 0 guarantees EVERY row in the
+            // block has a numeric group cell, so with a monotone bucket
+            // bucket(min) == bucket(max) puts every row in one group —
+            // and the aggregate column's block stats then describe
+            // exactly this group's rows. Block 0 is exempt (see the
+            // docblock: the header folds into its stats).
+            $g = $bucket($block['min']);
+            if ($i !== 0 && $block['other'] === 0 && $g == $bucket($block['max'])) {
+                if ($scanRun !== null) {
+                    $plan[] = ['scan' => $scanRun];
+                    $scanRun = null;
+                }
+                $plan[] = ['stats' => [$g, $i]];
+
+                continue;
+            }
+
+            // Boundary block — needs its rows.
+            $scanRun === null ? $scanRun = [$i, $i] : $scanRun[1] = $i;
+        }
+        if ($scanRun !== null) {
+            $plan[] = ['scan' => $scanRun];
+        }
+
+        // Execute pass.
+        foreach ($plan as $step) {
+            if (isset($step['stats'])) {
+                [$g, $i] = $step['stats'];
+                $this->foldBlockIntoGroups($groups, $g, $aggBlocks[$i]);
+
+                continue;
+            }
+
+            [$first, $last] = $step['scan'];
+            $start = $ranges[$first];
+            $stopRow = $ranges[$last]['last_row'];
+            foreach ($this->openSheetReader([$groupBy - 1, $aggregate - 1])->rowsFromOffset($start['comp_offset'], $start['start_row_at_offset'] ?? 1, $start['first_row']) as $rn => $row) {
+                if ($rn > $stopRow) {
+                    break;
+                }
+                if ($rn === 1) {
+                    continue; // header rides in block 0 — data rows only
+                }
+                $this->foldRowIntoGroups($groups, $row, $groupBy, $aggregate, $bucket);
+            }
+        }
+
+        return array_values($groups);
+    }
+
+    /**
+     * Fold one data row into the running group map. The map is keyed
+     * by the string cast of the bucket value — PHP arrays truncate
+     * float keys to int, which would merge distinct groups — while
+     * 'group' preserves the first-seen numeric value for the caller.
+     *
+     * @param  array<string, array{group: int|float, sum: float, count: int, min: float|null, max: float|null}>  $groups
+     * @param  array<int, mixed>  $row
+     */
+    private function foldRowIntoGroups(array &$groups, array $row, int $groupBy, int $aggregate, callable $bucket): void
+    {
+        $gv = $this->statNumericCell($row[$groupBy - 1] ?? null);
+        if ($gv === null) {
+            return; // non-numeric group cell — row excluded by contract
+        }
+
+        $g = $bucket($gv);
+        $key = (string) $g;
+        if (! isset($groups[$key])) {
+            $groups[$key] = ['group' => $g, 'sum' => 0.0, 'count' => 0, 'min' => null, 'max' => null];
+        }
+
+        $av = $this->statNumericCell($row[$aggregate - 1] ?? null);
+        if ($av === null) {
+            return; // group registered; nothing numeric to aggregate
+        }
+
+        $acc = &$groups[$key];
+        $acc['sum'] += $av;
+        $acc['count']++;
+        $acc['min'] = $acc['min'] === null ? $av : min($acc['min'], $av);
+        $acc['max'] = $acc['max'] === null ? $av : max($acc['max'], $av);
+    }
+
+    /**
+     * Fold a group-pure block's aggregate-column stats into the group
+     * map — the pushdown twin of foldRowIntoGroups(): same accumulator
+     * shape, fed from the writer's precomputed block aggregates instead
+     * of rows.
+     *
+     * @param  array<string, array{group: int|float, sum: float, count: int, min: float|null, max: float|null}>  $groups
+     * @param  array{min: float, max: float, sum: float, count: int, other: int}  $aggBlock
+     */
+    private function foldBlockIntoGroups(array &$groups, int|float $g, array $aggBlock): void
+    {
+        $key = (string) $g;
+        if (! isset($groups[$key])) {
+            $groups[$key] = ['group' => $g, 'sum' => 0.0, 'count' => 0, 'min' => null, 'max' => null];
+        }
+        if ($aggBlock['count'] === 0) {
+            return; // block's aggregate cells were all non-numeric
+        }
+
+        $acc = &$groups[$key];
+        $acc['sum'] += $aggBlock['sum'];
+        $acc['count'] += $aggBlock['count'];
+        $acc['min'] = $acc['min'] === null ? $aggBlock['min'] : min($acc['min'], $aggBlock['min']);
+        $acc['max'] = $acc['max'] === null ? $aggBlock['max'] : max($acc['max'], $aggBlock['max']);
+    }
+
+    /**
+     * Numeric interpretation of a reader-side cell for groupStats,
+     * mirroring the writer's statNumericValue(): int/float pass
+     * through, numeric strings (the tokenizer's t="n" shape) parse,
+     * booleans fold as 0/1. The bool case deliberately DIFFERS from
+     * cellMatches(): pushdown contributions come from block stats that
+     * already include booleans, so the scanned-block path must apply
+     * the identical interpretation or the two paths would disagree on
+     * bool-bearing sheets. (DateTime never appears here — groupStats
+     * reads raw tokenized cells, before any castColumn transform.)
+     */
+    private function statNumericCell(mixed $cell): ?float
+    {
+        if (is_int($cell) || is_float($cell)) {
+            return (float) $cell;
+        }
+        if (is_string($cell)) {
+            return $cell !== '' && is_numeric($cell) ? (float) $cell : null;
+        }
+        if (is_bool($cell)) {
+            return $cell ? 1.0 : 0.0;
         }
 
         return null;
@@ -646,7 +1030,11 @@ class StreamingXlsxReader
             $startRow = 1;
         }
 
-        foreach ($this->openSheetReader()->rowsFromOffset($compOffset, $startRow) as $rn => $row) {
+        // first_row doubles as the fast-forward target — for shards()
+        // output it equals start_row (a no-op), but hand-built shards
+        // with first_row > start_row (e.g. "skip the header") get the
+        // boundary-scan skip instead of tokenizing the gap.
+        foreach ($this->openSheetReader()->rowsFromOffset($compOffset, $startRow, $shard['first_row']) as $rn => $row) {
             if ($rn < $shard['first_row']) {
                 continue;
             }
@@ -710,6 +1098,18 @@ class StreamingXlsxReader
     }
 
     /**
+     * Memoized view of RandomAccessIndex::blockRanges() for the current
+     * sheet — see $blockRangesByEntry for why the reader caches it
+     * instead of the (deliberately stateless) index.
+     *
+     * @return list<array{first_row: int, last_row: int, comp_offset: int|null, uncomp_offset: int|null, start_row_at_offset: int|null}>
+     */
+    private function blockRanges(RandomAccessIndex $index): array
+    {
+        return $this->blockRangesByEntry[$this->currentEntry] ??= $index->blockRanges($this->currentEntry);
+    }
+
+    /**
      * Resolve a target row to a (compressed-offset, starting-row)
      * pair the StreamingSheetReader can inflate from. Returns
      * [null, 1] when no index is present or the target precedes
@@ -739,6 +1139,10 @@ class StreamingXlsxReader
      * Casts are applied lazily as rows() / rowAt() / rowRange() yield —
      * the underlying tokenization is unchanged, so registering a cast
      * after iteration began is allowed (subsequent rows will see it).
+     *
+     * An explicit cast takes precedence over autoDetectDates(): the
+     * column is exempted from detection, so the cast always receives
+     * the raw tokenized value, never a DateTimeImmutable.
      */
     public function castColumn(int $col, string|callable $cast): self
     {
@@ -794,6 +1198,45 @@ class StreamingXlsxReader
     public function use1904Epoch(): self
     {
         $this->use1904Epoch = true;
+
+        return $this;
+    }
+
+    /**
+     * Opt in to numFmt-based date detection: numeric cells whose s="N"
+     * style resolves to a date number format (built-in ids 14-22 and
+     * 45-47, or a custom formatCode carrying date tokens) come back as
+     * DateTimeImmutable instead of raw Excel serials. This is how
+     * externally-written files (Excel, openpyxl, PhpSpreadsheet) mark
+     * dates — the cell itself is just t="n" — so without the opt-in
+     * (or a manual castColumn) their date columns read as numbers.
+     *
+     * Off by default: detection reads xl/styles.xml (fetched lazily,
+     * once) and inspects each numeric cell's style, and the raw-serial
+     * output shape is a long-standing contract.
+     *
+     * Semantics:
+     *   - $withTime=true keeps the serial's fractional day (datetime);
+     *     false truncates to midnight — the castColumn 'date' vs
+     *     'datetime' split.
+     *   - Conversion shares castDate(): castTimezone() and the 1904
+     *     epoch (declared or forced) apply identically.
+     *   - An explicit castColumn() on a column takes precedence: its
+     *     cells skip detection and the cast sees the raw serial.
+     *   - Values castDate() rejects (non-numeric, out of Excel's date
+     *     range) pass through unconverted — detection is an inference
+     *     and must not destroy data.
+     *   - Workbook-wide, like castTimezone(): survives onSheet()
+     *     switches (styles.xml is shared by every sheet).
+     *   - rowsWhere()/findRow()/groupStats() keep matching and
+     *     aggregating the QUERIED columns' raw serials (their contract
+     *     is numeric comparison against writer block stats); other
+     *     columns in yielded rows are converted normally.
+     */
+    public function autoDetectDates(bool $withTime = true): self
+    {
+        $this->autoDetectDates = true;
+        $this->autoDetectWithTime = $withTime;
 
         return $this;
     }
@@ -876,7 +1319,15 @@ class StreamingXlsxReader
         return $row;
     }
 
-    private function openSheetReader(): StreamingSheetReader
+    /**
+     * @param  list<int>  $rawColumns  0-based columns whose values must
+     *                                 stay raw even under autoDetectDates()
+     *                                 — the query paths pass their predicate
+     *                                 columns here so numeric matching /
+     *                                 aggregation semantics don't change
+     *                                 underneath them
+     */
+    private function openSheetReader(array $rawColumns = []): StreamingSheetReader
     {
         return new StreamingSheetReader(
             $this->source,
@@ -884,6 +1335,71 @@ class StreamingXlsxReader
             $this->currentEntry,
             65536,
             $this->resolveSharedStrings(),
+            $this->buildDateDetection($rawColumns),
+        );
+    }
+
+    /**
+     * Assemble the tokenizer's date-detection bundle, or null when the
+     * opt-in is off / the workbook has no date styles (null keeps the
+     * tokenizer on its unchanged fast path). Built per iteration start
+     * so the skip set reflects the casts registered at that moment —
+     * castColumn() precedence is snapshotted here.
+     *
+     * @param  list<int>  $rawColumns
+     */
+    private function buildDateDetection(array $rawColumns): ?DateDetection
+    {
+        if (! $this->autoDetectDates) {
+            return null;
+        }
+
+        $bitmap = $this->resolveDateStyles();
+        if ($bitmap === null || ! in_array(true, $bitmap, true)) {
+            return null;
+        }
+
+        $skip = [];
+        foreach (array_keys($this->columnCasts) as $col) {
+            $skip[$col] = true;
+        }
+        foreach ($rawColumns as $col) {
+            $skip[$col] = true;
+        }
+
+        return new DateDetection(
+            $bitmap,
+            // ?? falls back to the raw value: castDate returns null for
+            // non-numeric or out-of-range serials, and a merely-inferred
+            // conversion must never eat data an explicit cast would at
+            // least surface as null by caller request.
+            fn (mixed $v): mixed => $this->castDate($v, $this->autoDetectWithTime) ?? $v,
+            $skip,
+        );
+    }
+
+    /**
+     * Lazy-load the styleId → is-date bitmap from xl/styles.xml.
+     * Resolved at most once per reader (the part is workbook-global
+     * and immutable for our lifetime); archives without styles.xml —
+     * rare, but legal when no cell carries s= — resolve to null and
+     * detection stays inert.
+     *
+     * @return list<bool>|null
+     */
+    private function resolveDateStyles(): ?array
+    {
+        if ($this->stylesResolved) {
+            return $this->dateStyleBitmap;
+        }
+        $this->stylesResolved = true;
+
+        if (! $this->cd->has('xl/styles.xml')) {
+            return $this->dateStyleBitmap = null;
+        }
+
+        return $this->dateStyleBitmap = StylesParser::dateStyleBitmap(
+            $this->cd->readEntry($this->source, 'xl/styles.xml')
         );
     }
 
@@ -949,6 +1465,12 @@ class StreamingXlsxReader
      * shape — every cell uses inlineStr). Throws a clear error for
      * tables larger than SST_RAM_THRESHOLD so callers know the file is
      * outside the supported range without their RAM filling up first.
+     *
+     * The table is parsed STREAMING: entry chunks flow straight from
+     * the inflate loop into SharedStringsParser::push(), so the peak
+     * cost is the packed table plus one chunk — the full sst XML never
+     * exists in memory (measured ~7x peak reduction vs the previous
+     * inflate-then-parse flow on a 1M-entry table).
      */
     private function resolveSharedStrings(): ?SharedStrings
     {
@@ -981,25 +1503,33 @@ class StreamingXlsxReader
             );
         }
 
-        $sstXml = $this->cd->readEntry($this->source, 'xl/sharedStrings.xml');
-
         // Defense-in-depth: the metadata guard above trusts the
         // uncompressed_size value the ZIP central directory carries. A
         // crafted archive can lie about that field to slip past the
-        // bound while the actual inflate balloons RAM. Once readEntry
-        // returns the real bytes, recheck before passing them to the
-        // parser — this catches forged metadata and keeps the parser's
-        // allocation profile predictable.
-        if (strlen($sstXml) > self::SST_UNCOMPRESSED_THRESHOLD) {
-            $actualMb = number_format(strlen($sstXml) / 1024 / 1024, 1);
-            $declaredMb = number_format($entry['uncompressed_size'] / 1024 / 1024, 1);
-            throw XlsxReadException::corruptCentralDirectory(
-                "xl/sharedStrings.xml inflated to {$actualMb} MB despite a {$declaredMb} MB ".
-                'declared size — ZIP metadata may be corrupt or forged.'
-            );
+        // bound while the actual inflate balloons RAM. Counting the
+        // real inflated bytes as they stream catches the forgery at
+        // the first chunk past the declared size — before the excess
+        // is ever buffered, let alone parsed. (A well-formed archive
+        // inflates to exactly its declared size, so any overshoot is
+        // corruption by definition; honest oversized tables were
+        // already rejected above.)
+        $declared = $entry['uncompressed_size'];
+        $inflatedTotal = 0;
+        $parser = new SharedStringsParser();
+        foreach ($this->cd->streamEntry($this->source, 'xl/sharedStrings.xml') as $chunk) {
+            $inflatedTotal += strlen($chunk);
+            if ($inflatedTotal > $declared) {
+                $actualMb = number_format($inflatedTotal / 1024 / 1024, 1);
+                $declaredMb = number_format($declared / 1024 / 1024, 1);
+                throw XlsxReadException::corruptCentralDirectory(
+                    "xl/sharedStrings.xml inflated to {$actualMb} MB despite a {$declaredMb} MB ".
+                    'declared size — ZIP metadata may be corrupt or forged.'
+                );
+            }
+            $parser->push($chunk);
         }
 
-        $this->sst = SharedStringsParser::parseInMemory($sstXml);
+        $this->sst = $parser->finish();
         $this->sstResolved = true;
 
         return $this->sst;

@@ -146,36 +146,31 @@ class ExternalXlsxTest extends TestCase
         $this->assertSame(50, $reader->rowCount() - 1);
     }
 
-    public function test_sst_with_extreme_deflate_ratio_is_rejected_via_uncompressed_guard(): void
+    public function test_sst_declaring_uncompressed_size_beyond_threshold_is_rejected(): void
     {
-        // Builds a synthetic XLSX whose xl/sharedStrings.xml fits well
-        // under the 20 MB compressed threshold but would inflate to
-        // ~110 MB — pathological deflate ratio that adversarial inputs
-        // (and some accidental exports) can produce. The new
-        // uncompressed-size guard must reject it before any inflation
-        // happens, preserving the bounded-RAM contract.
-        //
-        // Fixture creation needs ~250 MB transiently (raw sst string +
-        // ZipArchive deflate buffer). The bumped limit is left in place
-        // for the rest of the test process — restoring it would race
-        // with the still-allocated reader/zip data and itself fail.
-        // The follow-up ExternalXlsxTest cases don't need extra memory.
-        ini_set('memory_limit', '512M');
+        // The uncompressed-size guard fires on the CD's declared size
+        // BEFORE any bytes are fetched — a pathological deflate ratio
+        // (single repeated <si>, 50:1+) can push a modest compressed
+        // sst far past the RAM budget. Actually building a >320 MB sst
+        // in a unit test would cost more than the guard it exercises,
+        // so the fixture is a small honest archive whose CD entry is
+        // patched to DECLARE an over-threshold uncompressed size; a
+        // real oversized file carries exactly this declaration (and a
+        // file lying in the other direction — declaring small,
+        // inflating big — is caught by the streaming forged-metadata
+        // guard, pinned separately below).
+        $this->buildExternalXlsx(
+            sharedStrings: ['only entry'],
+            sheetRows: [[['t' => 's', 'v' => '0']]]
+        );
 
-        $sstXml = $this->buildHighRatioSstXml(targetUncompressedBytes: 110 * 1024 * 1024);
-
-        $zip = new \ZipArchive();
-        $this->assertTrue($zip->open($this->testFile, \ZipArchive::CREATE | \ZipArchive::OVERWRITE) === true);
-        $zip->addFromString('[Content_Types].xml', $this->contentTypes());
-        $zip->addFromString('_rels/.rels', $this->packageRels());
-        $zip->addFromString('xl/workbook.xml', $this->workbookXml());
-        $zip->addFromString('xl/_rels/workbook.xml.rels', $this->workbookRels());
-        $zip->addFromString('xl/sharedStrings.xml', $sstXml);
-        $zip->addFromString('xl/worksheets/sheet1.xml', $this->buildSheetXml([[['t' => 's', 'v' => '0']]]));
-        $zip->close();
-
-        unset($sstXml, $zip);
-        gc_collect_cycles();
+        $bytes = file_get_contents($this->testFile);
+        $bytes = $this->patchCdUncompressedSize(
+            $bytes,
+            'xl/sharedStrings.xml',
+            StreamingXlsxReader::SST_UNCOMPRESSED_THRESHOLD + 1
+        );
+        file_put_contents($this->testFile, $bytes);
 
         // SST load is lazy — triggered the first time row data needs a
         // shared-string lookup. fromFile() alone won't reach the guard.
@@ -185,6 +180,39 @@ class ExternalXlsxTest extends TestCase
         $this->expectExceptionMessageMatches('/inflates to .+ MB/');
 
         iterator_to_array($reader->rows());
+    }
+
+    public function test_sst_within_raised_threshold_parses_high_ratio_table(): void
+    {
+        // Regression companion to the rejection test above: a genuinely
+        // high-ratio sst that stays UNDER the (v3.2-raised) uncompressed
+        // threshold must now parse instead of blowing RAM — the packed
+        // streaming model is what paid for the raise. ~24 MB of
+        // repeated entries deflates to well under 1 MB.
+        $sstXml = $this->buildHighRatioSstXml(targetUncompressedBytes: 24 * 1024 * 1024);
+        $entryCount = substr_count($sstXml, '<si>');
+
+        $zip = new \ZipArchive();
+        $this->assertTrue($zip->open($this->testFile, \ZipArchive::CREATE | \ZipArchive::OVERWRITE) === true);
+        $zip->addFromString('[Content_Types].xml', $this->contentTypes());
+        $zip->addFromString('_rels/.rels', $this->packageRels());
+        $zip->addFromString('xl/workbook.xml', $this->workbookXml());
+        $zip->addFromString('xl/_rels/workbook.xml.rels', $this->workbookRels());
+        $zip->addFromString('xl/sharedStrings.xml', $sstXml);
+        $zip->addFromString('xl/worksheets/sheet1.xml', $this->buildSheetXml([
+            [['t' => 's', 'v' => '0'], ['t' => 's', 'v' => (string) ($entryCount - 1)]],
+        ]));
+        $zip->close();
+        unset($sstXml, $zip);
+        gc_collect_cycles();
+
+        $reader = StreamingXlsxReader::fromFile($this->testFile);
+        $rows = iterator_to_array($reader->rows(), false);
+
+        $this->assertSame(
+            ['repeated content for deflate ratio testing', 'repeated content for deflate ratio testing'],
+            $rows[0]
+        );
     }
 
     public function test_reader_handles_stored_worksheet_method_zero(): void
@@ -229,16 +257,19 @@ class ExternalXlsxTest extends TestCase
         $this->assertSame(['2', 'Bob'], $rows[2]);
     }
 
-    public function test_sst_post_inflate_strlen_catches_forged_metadata(): void
+    public function test_sst_inflating_past_declared_size_catches_forged_metadata(): void
     {
         // Defense-in-depth scenario: the ZIP central directory claims a
-        // small uncompressed_size for xl/sharedStrings.xml so the metadata
-        // guard passes, but the entry actually inflates to 110 MB. The
-        // post-inflate strlen() check must catch the lie before the
-        // parser allocates.
-        ini_set('memory_limit', '512M');
-
-        $sstXml = $this->buildHighRatioSstXml(targetUncompressedBytes: 110 * 1024 * 1024);
+        // small uncompressed_size for xl/sharedStrings.xml so the
+        // metadata guard passes, but the entry actually inflates to
+        // 16 MB. The streaming byte counter must catch the lie at the
+        // first chunk past the declared size — a well-formed archive
+        // inflates to exactly what it declares, so any overshoot is
+        // forged or corrupt metadata, however small. (Pre-v3.2 this was
+        // a post-inflate strlen() check against the threshold; the
+        // streaming parse both tightened the bound — declared size, not
+        // threshold — and stopped buffering the ballooning payload.)
+        $sstXml = $this->buildHighRatioSstXml(targetUncompressedBytes: 16 * 1024 * 1024);
         $actualUncompressed = strlen($sstXml);
 
         $zip = new \ZipArchive();
@@ -253,8 +284,13 @@ class ExternalXlsxTest extends TestCase
         unset($sstXml);
         gc_collect_cycles();
 
+        // Sanity: confirm the fixture really does inflate far past the
+        // declaration patched in below. Catches the test losing its
+        // premise if a future refactor changes the fixture shape.
+        $this->assertGreaterThan(8 * 1024 * 1024, $actualUncompressed);
+
         // Patch the CD entry's uncompressed_size field down to 1 MB —
-        // far below the actual 110 MB and well under the threshold so
+        // far below the actual 16 MB and well under the threshold so
         // the metadata-trust path no longer rejects it.
         $bytes = file_get_contents($this->testFile);
         $bytes = $this->patchCdUncompressedSize($bytes, 'xl/sharedStrings.xml', 1024 * 1024);
@@ -267,11 +303,6 @@ class ExternalXlsxTest extends TestCase
         $this->expectExceptionMessageMatches('/inflated to .+ MB.+may be corrupt or forged/');
 
         iterator_to_array($reader->rows());
-
-        // Sanity: confirm the fixture really did inflate large despite
-        // the patched declaration. Catches the test losing its premise
-        // if a future refactor changes the deflate ratio.
-        $this->assertGreaterThan(100 * 1024 * 1024, $actualUncompressed);
     }
 
     public function test_reader_rejects_pathological_row_xml_exceeding_16mb(): void

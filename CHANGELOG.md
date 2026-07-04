@@ -5,6 +5,106 @@ All notable changes to `kolay/xlsx-stream` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.2.0] — Unreleased
+
+### Added — KXSI is now an open specification
+
+- **`SPEC.md`**: normative binary layout, TLV contract (unknown tags MUST
+  be skipped; the version byte never bumps for additive sections), the
+  two hard-won soundness laws ("stats widen, never narrow"; "block stats
+  MUST account for every row the scan path can yield, including
+  preamble-emitted rows"), must-understand `flags` bitmask semantics
+  (now enforced by the reference decoder), security bounds, and ten
+  reserved section tags. Conformance suite: 5 committed fixture
+  workbooks under `tests/SpecVectors/` with sidecar hexdumps and JSON
+  goldens, byte-pinned in CI.
+- **`SCRC` TLV section**: running CRC32 of the sheet's uncompressed
+  bytes at every sync point, emitted whenever the index is enabled
+  (capture cost ≈ 69 ns per sync point). Enables truncation detection
+  today and is the shared prerequisite for resumable exports,
+  appendable workbooks, and signing. Reader accessor:
+  `syncPointCrcs($entry)`.
+- **`groupStats(int $groupBy, int $aggregate, ?callable $bucket)`**:
+  sorted-group aggregate pushdown — group-pure interior blocks
+  contribute their precomputed sidecar sums without being read; only
+  boundary blocks are inflated. 20 groups over 1M rows in ~57 ms with
+  interior blocks provably never fetched (spy-tested); degrades to an
+  honest full scan on unsorted/untracked columns.
+- **`withColumnSketches(array $columns)`** (writer) + **`quantile()` /
+  `median()` / `countDistinct()`** (reader): file-level approximate
+  statistics answered from the sidecar alone. Per sheet, per tracked
+  column, the writer embeds a merging t-digest (`TDIG` TLV section,
+  δ=100, ~1-4 KB) and a HyperLogLog (`CHLL`, p=11, 2051 bytes) — the
+  reader then answers "what is the p99 amount" or "how many distinct
+  emails" for a multi-GB file with **zero row reads and zero
+  additional range requests** after open (spy-pinned: no `range()`, no
+  `streamFrom()`). Measured error on 100K samples: p01/p99 within
+  0.04 % rank error and p50 within 0.05 % on continuous distributions
+  (pinned at 0.2 %/0.5 % in CI; heavy-duplicate mid-range pinned at
+  4.5 % — interpolation between duplicate masses); distinct counts
+  within 3 % at 100K cardinality, near-exact below ~1K (linear-counting
+  range). Both sketches merge associatively (HLL merge is exactly the
+  union sketch) — the property future segment/partition stitching
+  builds on. Orthogonal to `withColumnStats()`; implies
+  `withRandomAccessIndex()`. Header row deliberately excluded from
+  sketches (estimation bias vs `STAT`'s pruning-soundness header fold —
+  the asymmetry is documented in SPEC.md §4.3). Warm quantile calls run
+  in ~1.4 µs, countDistinct in ~62 µs (1M-row fixture, 4 MB peak).
+  Write-side cost is ~0.4 µs per sketched cell after batch-fold
+  optimization: ~10 % wall time with 2 tracked columns on a realistic
+  12-column 500K-row export, ~45 % on the deliberately minimal 4-column
+  hot-path bench whose baseline is 0.48 µs/cell.
+- **`autoDetectDates(bool $withTime = true)`** (reader, opt-in):
+  parses `xl/styles.xml` once into a styleId→isDate bitmap (builtin ids
+  14–22/45–47 plus a quote/bracket/escape-aware format-code scanner) and
+  yields `DateTimeImmutable` for date-styled numeric cells in external
+  files — the "why is my date 45123?" fix. Explicit `castColumn` wins;
+  query predicates keep matching raw serials; the default read path is
+  measurably unchanged.
+
+### Performance
+
+- **Tokenizer micro-pass: +30 % read throughput** (isolated A/B vs
+  v3.1.0 on a 13K real-row corpus: 106K → 138K rows/s): `strcspn`-based
+  tag-end scanning, single-pass `r`/`t`(/`s`) attribute extraction,
+  dense-row fast path, plain-`<is><t>` fast path, and namespaced hot
+  functions imported via `use function` (the namespace-fallback lookup
+  alone was ~5-8 %). Same treatment in `SharedStringsParser`.
+- **`rows(skip: N)` fast path**: with an index, the skip seeks through
+  the same sync-point machinery as `rowAt` (measured skip=1M:
+  3.94 s → 2.5 ms); without one, a `</row>` boundary scan replaces
+  tokenized skipping (~29× on skip=400K).
+- **Within-block fast-forward** for `rowAt`/`rowRange`/`rowsWhere`/
+  `rowsForShard`: rows between a sync point and the target are
+  boundary-scanned instead of tokenized — random `rowAt` at 10K sync
+  period measured 21.1 → 1.13 ms/call (~19×).
+- **Parallel S3 multipart upload**: parts now upload through a bounded
+  async window (`concurrency` constructor param, default 4;
+  `uploadPartAsync` + FIFO waits, parts re-sorted before completion,
+  first-error abort with in-flight settlement). Peak memory is capped
+  at ~`partSize × (concurrency + 2)` and the former ~40 MB-per-million-
+  rows ratchet is gone (measured 46.5 MB flat at 1M rows). On an
+  RTT-bound link the window projects ~2×; on a single-connection-
+  saturated uplink the measured win is stability (7.8–9.9 s steady vs
+  10.5–30.5 s swings sequentially). `concurrency: 1` reproduces the
+  v3.1 request sequence exactly.
+- **Packed shared strings + streaming SST parse**: the shared-strings
+  table now parses incrementally from the inflate loop (the full XML
+  never exists in memory) into a packed offset-indexed buffer — 1M-entry
+  / 30 MB table: 83.7 → 24.0 MB peak (3.5×). Support thresholds raised
+  accordingly: compressed 20 → 64 MB, uncompressed 100 → 320 MB; the
+  forged-metadata guard now trips at the first byte past the declared
+  size with O(1) memory.
+- `blockRanges()` memoized per sheet on the query path.
+
+### Benchmarks
+
+- New `bench/read_bench.php`, `bench/query_bench.php`,
+  `bench/sst_bench.php` (same fresh-process/median hygiene as the write
+  bench). v3.2 baselines recorded in `bench/results.json`: full-scan
+  126.9K rows/s (6-col) at 6 MB peak; cold open 1.07 ms; rowAt
+  1.28 ms; findRow 26.5 ms; groupStats 56.9 ms over 1M rows.
+
 ## [3.1.0] — 2026-07-04
 
 ### Added — Queryable XLSX (KXSI "STAT" sidecar extension)

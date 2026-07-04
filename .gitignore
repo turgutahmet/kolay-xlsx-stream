@@ -18,6 +18,8 @@ Thumbs.db
 .env
 .env.local
 *.xlsx
+# KXSI conformance vectors (SPEC.md §8) are committed on purpose.
+!/tests/SpecVectors/*.xlsx
 /test-output/
 /benchmark-output/
 /output/

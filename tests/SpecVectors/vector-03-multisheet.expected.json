@@ -1,0 +1,131 @@
+{
+    "sync_period": 50,
+    "sheets": [
+        {
+            "entry": "xl/worksheets/sheet1.xml",
+            "total_rows": 101,
+            "sheet_crc32": 2442220386,
+            "sync_points": [
+                {
+                    "row": 52,
+                    "comp_offset": 809,
+                    "uncomp_offset": 5262
+                },
+                {
+                    "row": 102,
+                    "comp_offset": 1467,
+                    "uncomp_offset": 10320
+                }
+            ],
+            "sync_point_crcs": [
+                2886208992,
+                1876436762
+            ],
+            "column_stats": {
+                "1": {
+                    "sorted_asc": true,
+                    "sorted_desc": false,
+                    "blocks": [
+                        {
+                            "min": 1,
+                            "max": 50,
+                            "sum": 1275,
+                            "count": 50,
+                            "other": 1
+                        },
+                        {
+                            "min": 51,
+                            "max": 100,
+                            "sum": 3775,
+                            "count": 50,
+                            "other": 0
+                        },
+                        {
+                            "min": 0,
+                            "max": 0,
+                            "sum": 0,
+                            "count": 0,
+                            "other": 0
+                        }
+                    ]
+                }
+            }
+        },
+        {
+            "entry": "xl/worksheets/sheet2.xml",
+            "total_rows": 201,
+            "sheet_crc32": 2174150495,
+            "sync_points": [
+                {
+                    "row": 52,
+                    "comp_offset": 819,
+                    "uncomp_offset": 5235
+                },
+                {
+                    "row": 102,
+                    "comp_offset": 1488,
+                    "uncomp_offset": 10292
+                },
+                {
+                    "row": 152,
+                    "comp_offset": 2179,
+                    "uncomp_offset": 15542
+                },
+                {
+                    "row": 202,
+                    "comp_offset": 2876,
+                    "uncomp_offset": 20792
+                }
+            ],
+            "sync_point_crcs": [
+                712733029,
+                2911437124,
+                137883651,
+                1330476022
+            ],
+            "column_stats": {
+                "1": {
+                    "sorted_asc": true,
+                    "sorted_desc": false,
+                    "blocks": [
+                        {
+                            "min": 3,
+                            "max": 150,
+                            "sum": 3825,
+                            "count": 50,
+                            "other": 1
+                        },
+                        {
+                            "min": 153,
+                            "max": 300,
+                            "sum": 11325,
+                            "count": 50,
+                            "other": 0
+                        },
+                        {
+                            "min": 303,
+                            "max": 450,
+                            "sum": 18825,
+                            "count": 50,
+                            "other": 0
+                        },
+                        {
+                            "min": 453,
+                            "max": 600,
+                            "sum": 26325,
+                            "count": 50,
+                            "other": 0
+                        },
+                        {
+                            "min": 0,
+                            "max": 0,
+                            "sum": 0,
+                            "count": 0,
+                            "other": 0
+                        }
+                    ]
+                }
+            }
+        }
+    ]
+}

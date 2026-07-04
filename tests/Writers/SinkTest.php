@@ -103,8 +103,9 @@ class SinkTest extends TestCase
         
         // Write less than 5MB - should not trigger upload yet
         $sink->write(str_repeat('a', 1024 * 1024)); // 1MB
-        
+
         // Verify no upload was triggered (buffering)
+        $s3Client->shouldNotHaveReceived('uploadPartAsync');
         $s3Client->shouldNotHaveReceived('uploadPart');
         
         // Add assertion
@@ -119,13 +120,13 @@ class SinkTest extends TestCase
             ->once()
             ->andReturn(['UploadId' => 'test-upload-id']);
         
-        $s3Client->shouldReceive('uploadPart')
+        $s3Client->shouldReceive('uploadPartAsync')
             ->once()
             ->with(Mockery::on(function ($args) {
-                return $args['PartNumber'] === 1 
+                return $args['PartNumber'] === 1
                     && strlen($args['Body']) === 5 * 1024 * 1024;
             }))
-            ->andReturn(['ETag' => 'etag-1']);
+            ->andReturn(new \GuzzleHttp\Promise\FulfilledPromise(['ETag' => 'etag-1']));
         
         $s3Client->shouldReceive('completeMultipartUpload')
             ->once()
