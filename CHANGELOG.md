@@ -5,6 +5,20 @@ All notable changes to `kolay/xlsx-stream` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.2.1] — 2026-07-04
+
+Documentation-only patch. The v3.2.0 tag was published with this
+changelog section still reading "Unreleased"; Packagist's stable-version
+immutability (correctly) blocked amending the published tag, so the
+corrections ship as a patch release. No code changes — the 3.2.0 and
+3.2.1 trees differ only in documentation.
+
+- CHANGELOG: 3.2.0 release date stamped.
+- ROADMAP: v3.2.0 moved to Shipped; long-shipped items removed from the
+  "next" list (`PhpStreamSink`, sample-based auto width, built-in
+  numFmtId overload, parallel multipart, shared-strings ceiling); next
+  release scoped as v3.3 — resumable exports & smarter S3 reads.
+
 ## [3.2.0] — 2026-07-04
 
 ### Added — KXSI is now an open specification
