@@ -91,9 +91,10 @@ class RealS3Test extends TestCase
 
         $this->assertGreaterThan(0, $result['ContentLength']);
 
-        echo "\n✓ Successfully uploaded {$stats['rows']} rows to S3";
-        echo "\n✓ File size: " . number_format($result['ContentLength']) . " bytes";
-        echo "\n✓ Location: s3://{$bucket}/{$key}\n";
+        // STDERR bypasses PHPUnit's output capture (beStrictAboutOutputDuringTests)
+        fwrite(STDERR, "\n✓ Successfully uploaded {$stats['rows']} rows to S3");
+        fwrite(STDERR, "\n✓ File size: " . number_format($result['ContentLength']) . " bytes");
+        fwrite(STDERR, "\n✓ Location: s3://{$bucket}/{$key}\n");
     }
 
     public function test_real_s3_upload_larger_file()
@@ -145,8 +146,9 @@ class RealS3Test extends TestCase
             'Key' => $key,
         ]);
 
-        echo "\n✓ Successfully uploaded {$stats['rows']} rows to S3";
-        echo "\n✓ File size: " . number_format($result['ContentLength']) . " bytes";
-        echo "\n✓ Location: s3://{$bucket}/{$key}\n";
+        // STDERR bypasses PHPUnit's output capture (beStrictAboutOutputDuringTests)
+        fwrite(STDERR, "\n✓ Successfully uploaded {$stats['rows']} rows to S3");
+        fwrite(STDERR, "\n✓ File size: " . number_format($result['ContentLength']) . " bytes");
+        fwrite(STDERR, "\n✓ Location: s3://{$bucket}/{$key}\n");
     }
 }

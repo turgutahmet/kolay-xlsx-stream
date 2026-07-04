@@ -316,7 +316,24 @@ The ± values in S3 memory represent **normal memory fluctuation** during stream
    - Pattern: Memory oscillates between ~2MB (after upload) and ~78MB (before upload)
    - This is **completely normal** and expected behavior
 
-### Performance Highlights *(v3.1, July 2026)*
+### Performance Highlights *(v3.2, July 2026)*
+
+- **Read — +30 % tokenizer throughput** over v3.1 (isolated A/B on a real-row
+  corpus: 106K → 138K rows/s); full-scan baseline 126.9K rows/s at 6 MB peak.
+- **`rows(skip: N)`**: skip=1M measured 3.94 s → 2.5 ms with an index
+  (**~1,580×**), ~29× via boundary scan without one; random `rowAt` within a
+  block 21.1 → 1.13 ms (**~19×**).
+- **`groupStats()`**: 20 sorted groups over 1M rows in ~57 ms — interior
+  blocks never fetched. **`quantile()`/`countDistinct()`**: zero row reads,
+  zero extra requests (warm calls ~1.4 µs / ~62 µs).
+- **Parallel S3 multipart** (window of 4): flat ~46 MB peak (the old
+  ~40 MB-per-million-rows ratchet is gone) and steady wall times where
+  sequential swung 3×; ~2× projected on RTT-bound links.
+- **External files**: shared-strings support ceiling raised 20 → 64 MB
+  compressed (1M-entry table peak: 83.7 → 24 MB, 3.5×); `autoDetectDates()`
+  fixes the "my date is 45123" class of surprises.
+
+*(v3.1, July 2026)*
 
 - **Write — Local (v3.1)**: ~289,000 rows/second writer throughput (500K-row
   mixed workload, 6 MB peak RAM) — **+55 % over v3.0.2** from a PCRE-JIT
@@ -718,6 +735,33 @@ $hit = $reader->findRow(1, 3_141_592);   // ['row' => N, 'values' => [...]] or n
 Ops: `=`, `<`, `<=`, `>`, `>=`, `between`. Predicates match numeric
 cells (ints, floats, dates as serials); on files without stats the same
 calls degrade gracefully to a full-scan filter with identical results.
+
+### Grouped aggregates & approximate analytics *(v3.2+)*
+
+Two more layers on the same sidecar:
+
+```php
+// GROUP BY over S3 without reading interior blocks: on a sorted group
+// column, group-pure blocks contribute their precomputed sums — only
+// blocks straddling a group boundary are fetched. 20 groups over 1M
+// rows: ~57 ms, interior blocks provably never read.
+$byMonth = $reader->groupStats(groupBy: 6, aggregate: 5,
+                               bucket: fn ($serial) => (int) ($serial / 30.44));
+
+// Approximate analytics with ZERO row reads and ZERO extra requests —
+// the answers live in the sidecar the reader already fetched at open:
+$writer->withColumnSketches([4, 3]);        // writer side, once
+$reader->median(4);                          // p50 salary
+$reader->quantile(4, 0.99);                  // p99 order amount
+$reader->countDistinct(3);                   // ~distinct emails (±3% at 100K)
+```
+
+The sketches are a merging t-digest (~1-4 KB/column, p01/p99 within
+0.2% rank error) and a HyperLogLog (2 KB, ±5% pinned) per column — both
+merge associatively, which is what future segment/partition stitching
+builds on. The full binary layout is public: **KXSI is an open spec**
+(see [SPEC.md](SPEC.md)) with committed conformance vectors under
+`tests/SpecVectors/`, so other implementations can verify byte-for-byte.
 
 ### Parallel reads — shard a sheet across queue workers *(v3.1+)*
 
