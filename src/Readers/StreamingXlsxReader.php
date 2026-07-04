@@ -616,9 +616,16 @@ class StreamingXlsxReader
         if ($shard['sheet'] !== $this->currentEntry) {
             // The shard addresses a specific worksheet entry; make the
             // reader agree instead of silently reading the wrong sheet.
+            // The switch must go through the SAME per-sheet resets the
+            // explicit onSheet()/onSheetIndex() setters perform —
+            // skipping them leaves a stale cached header and leaks
+            // column casts registered for the previous sheet into this
+            // one (both observed as real bugs before this guard).
             foreach ($this->sheets as $sheet) {
                 if ($sheet['entry'] === $shard['sheet']) {
                     $this->currentEntry = $shard['sheet'];
+                    $this->cachedHeader = null;
+                    $this->columnCasts = [];
                     break;
                 }
             }

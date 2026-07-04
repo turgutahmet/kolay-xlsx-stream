@@ -575,11 +575,19 @@ abstract class BaseXlsxWriter
      *   $writer->setColumnFormat(3, 'currency_try');                        // #,##0.00 ₺
      *   $writer->setColumnFormat(4, '0.000');                               // raw code
      *   $writer->setColumnFormat(5, BaseXlsxWriter::BUILTIN_NUMFMT_DATE);   // locale-aware
+     *   $writer->setColumnFormat(6, 'General', raw: true);                  // verbatim, skip preset lookup
+     *
+     * Unknown preset-shaped strings throw (a typo'd preset written as a
+     * literal formatCode sends Excel into repair mode); pure date-token
+     * runs like 'dddd'/'mmss' pass as raw codes, and $raw = true skips
+     * preset resolution and the guard entirely — the escape hatch for
+     * arbitrary codes coming from external constant tables (e.g.
+     * PhpSpreadsheet NumberFormat values).
      *
      * Numeric values in that column are wrapped with the chosen format.
      * String values pass through unchanged.
      */
-    public function setColumnFormat(int $column, string|int $format): self
+    public function setColumnFormat(int $column, string|int $format, bool $raw = false): self
     {
         if ($this->closed) {
             throw XlsxStreamException::writerAlreadyClosed();
@@ -606,7 +614,7 @@ abstract class BaseXlsxWriter
             return $this;
         }
 
-        $this->columnStyleIds[$column] = $this->styles->registerColumnFormat($format);
+        $this->columnStyleIds[$column] = $this->styles->registerColumnFormat($format, $raw);
         // Stored separately so the auto-width heuristic can pick a sensible
         // minimum based on the format (e.g. currency cells need ~14 chars
         // even when the header is shorter).

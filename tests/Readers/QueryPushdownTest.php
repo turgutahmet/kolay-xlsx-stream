@@ -259,6 +259,50 @@ class QueryPushdownTest extends TestCase
     }
 
     /**
+     * rowsForShard()'s implicit sheet switch must perform the SAME
+     * per-sheet resets as onSheet()/onSheetIndex(). Before the fix it
+     * left the previous sheet's cached header in place and leaked its
+     * castColumn registrations onto the new sheet's rows — both
+     * observed as real bugs by adversarial audit.
+     */
+    public function test_rows_for_shard_implicit_sheet_switch_resets_state(): void
+    {
+        $writer = new SinkableXlsxWriter(new FileSink($this->testFile));
+        $writer->startFile(['S1_ID', 'S1_Name']);
+        for ($i = 1; $i <= 5; $i++) {
+            $writer->writeRow([$i, 'alpha-'.$i]);
+        }
+        $writer->newSheet('Second', ['S2_ID', 'S2_Name']);
+        for ($i = 1; $i <= 5; $i++) {
+            $writer->writeRow([10000 + $i, 'beta-'.$i]);
+        }
+        $writer->finishFile();
+
+        $reader = StreamingXlsxReader::fromFile($this->testFile);
+
+        // Prime sheet-1 state: cached header + an uppercase cast.
+        $this->assertSame(['S1_ID', 'S1_Name'], $reader->header());
+        $reader->castColumn(1, fn ($v) => strtoupper((string) $v));
+
+        // Shard addressing sheet 2 forces the implicit switch.
+        $sheet2Shard = [
+            'sheet' => $reader->sheets()[1]['entry'],
+            'comp_offset' => null,
+            'start_row' => 1,
+            'first_row' => 2,
+            'last_row' => 3,
+        ];
+        $rows = iterator_to_array($reader->rowsForShard($sheet2Shard));
+
+        // Sheet-1's cast must NOT have been applied to sheet-2 rows.
+        $this->assertSame('beta-1', $rows[2][1], 'sheet-1 castColumn leaked across implicit switch');
+
+        // And header() must reflect the newly selected sheet.
+        $this->assertSame(['S2_ID', 'S2_Name'], $reader->header(), 'stale cached header after implicit switch');
+        $reader->close();
+    }
+
+    /**
      * Soundness regression: a NUMERIC-LOOKING header cell is matchable
      * by the full-scan path (is_numeric passes), so the pruned path must
      * find it too. Before the fix, the header wasn't folded into block

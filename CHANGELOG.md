@@ -75,6 +75,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`rowsForShard()` implicit sheet switch left stale per-sheet state.**
+  A shard addressing a different worksheet switched the reader's
+  current entry without the resets `onSheet()`/`onSheetIndex()`
+  perform: `header()` kept returning the previous sheet's cached
+  header, and `castColumn()` registrations from the previous sheet
+  were applied to the new sheet's rows. The implicit switch now runs
+  the same resets. Found by adversarial audit with reproduction.
+- **Preset-name guard rejected valid pure-lowercase format codes.**
+  Date-token runs like `'dddd'` (weekday) or `'mmss'` are legitimate
+  Excel format codes but matched the typo-guard's preset-name shape.
+  Strings built only from the `d/m/y/h/s` token letters now pass, and
+  `setColumnFormat($col, $code, raw: true)` skips preset resolution
+  and the guard entirely — the escape hatch for arbitrary codes from
+  external constant tables (e.g. PhpSpreadsheet `NumberFormat`).
 - **Zone-map pruning could hide a numeric-looking header row.** The
   header is emitted via the sheet preamble, not `writeRow()`, so it
   wasn't folded into block 0's stats — `rowsWhere()`/`findRow()` for a
