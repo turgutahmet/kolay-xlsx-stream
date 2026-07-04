@@ -61,8 +61,12 @@ try {
     if ($rowCount !== 251) {
         fail($failures, 'kxs→PhpSpreadsheet rowcount', "expected 251, got {$rowCount}");
     } else {
-        $first = $sheet->getCell('B2')->getValue();
-        $last = $sheet->getCell('B251')->getValue();
+        // PhpSpreadsheet ≥5.x materialises inlineStr cells as RichText
+        // objects (2.x returned plain strings). The contract under test
+        // is CONTENT equality, so compare through the Stringable cast —
+        // strict === against a raw string false-fails on 5.x otherwise.
+        $first = (string) $sheet->getCell('B2')->getValue();
+        $last = (string) $sheet->getCell('B251')->getValue();
         if ($first !== 'user-1' || $last !== 'user-250') {
             fail($failures, 'kxs→PhpSpreadsheet content', "got first={$first} last={$last}");
         } else {

@@ -1,0 +1,33 @@
+name: External XLSX Reader Compatibility
+
+# Manual + tag-only roundtrip against PhpSpreadsheet and OpenSpout. NOT
+# part of the regular CI matrix because it pulls in heavyweight optional
+# dev dependencies. Run before tagging a release to catch any
+# externally-visible regressions in our writer / reader contracts.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  compat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: mbstring, zip
+          tools: composer:v2
+
+      - name: Install package + compat libraries
+        run: |
+          composer install --no-progress --no-interaction
+          composer require --dev --no-interaction \
+            phpoffice/phpspreadsheet:^5.0 \
+            openspout/openspout:^4.0
+
+      - name: Run external roundtrip tests
+        run: php tests/compat/external_readers_roundtrip.php
