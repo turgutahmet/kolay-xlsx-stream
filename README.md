@@ -6,362 +6,72 @@
 [![License](https://img.shields.io/packagist/l/kolay/xlsx-stream.svg?style=flat-square)](https://packagist.org/packages/kolay/xlsx-stream)
 [![PHP Version](https://img.shields.io/packagist/php-v/kolay/xlsx-stream.svg?style=flat-square)](https://packagist.org/packages/kolay/xlsx-stream)
 
-High-performance bidirectional XLSX streaming for Laravel — write to local or S3 with **zero disk I/O**, read back with **bounded memory**, and seek to any row in **O(1)** via the optional born-indexed sidecar. Built for exporting and ingesting millions of rows without spiking RAM.
+Bidirectional XLSX streaming for PHP and Laravel — and the only library
+in any language that makes the spreadsheet itself **queryable**. Write
+millions of rows straight to S3 with zero disk I/O, read them back with
+bounded memory, seek to any row in O(1), and ask for a column's sum,
+median, p99 or distinct count **without reading a single row** — over
+HTTP range requests, from a file Excel opens like any other.
 
-## Why This Package?
+- **Write**: ~289K rows/s locally at 6 MB peak RAM; direct S3 multipart
+  (parallel upload window, no temp files)
+- **Read**: ~127K rows/s full scans with bounded memory, any file size
+- **Seek**: `rowAt(1_000_000)` in milliseconds via the born-indexed sidecar
+- **Query**: `columnStats` / `rowsWhere` / `findRow` / `groupStats` with
+  Parquet-style block pruning; `median` / `quantile` / `countDistinct`
+  from embedded sketches with **zero row reads**
+- **Open format**: the sidecar is a published spec ([SPEC.md](SPEC.md))
+  with a byte-pinned conformance suite
 
-### The Problem with Existing Solutions
+## Why this package?
 
-Most PHP Excel libraries (PHPSpreadsheet, Spout, Laravel Excel) have critical limitations:
+Most PHP Excel libraries load whole documents into RAM (unusable at
+scale), spill temp files before uploading to S3, and can only read
+forward — reaching row 900,000 means scanning 899,999 rows first.
 
-- **Memory Issues**: Load entire documents in RAM (unusable for large files)
-- **Disk I/O**: Write temporary files then upload to S3 (2x I/O, slow)
-- **No True Streaming**: Can't stream directly to S3
-- **No Random Access**: O(N) full scan to reach any specific row
+This package streams in both directions with constant memory, and its
+born-indexed mode embeds a small binary sidecar (`xl/_kxs/index.bin`)
+that vanilla readers ignore but this library uses for random access,
+block-pruned queries and sidecar-only analytics. Excel, LibreOffice,
+Numbers, PhpSpreadsheet and OpenSpout all open the files normally.
 
-### Our Solution
+## Performance
 
-- **Zero Disk I/O**: Direct streaming to S3 using multipart upload
-- **Constant Memory**: O(1) memory for the writer (32 MB part buffer) and ~24 MB for the reader regardless of file size
-- **Bidirectional**: Write *and* read XLSX files through the same package — including files produced by other writers (PhpSpreadsheet, openpyxl, …) via shared-strings support
-- **Random Access**: Optional `xl/_kxs/index.bin` sidecar lets `rowAt(N)`, `rowRange(a, b)`, and `rowCount()` skip ahead in **O(1)** instead of full-scanning. Backward-compatible — Excel and every other reader ignore the sidecar. (Per-lookup work is bounded by the writer-chosen sync period, default 10,000 rows; independent of file size.)
-- **Blazing Fast**: 2-3× faster than alternatives on writes; ~70K rows/s sustained reads with constant RAM
-- **Production Tested**: Successfully exported and re-read 4.5 million rows (500MB+ files)
+### The trajectory — same canonical workloads, every release
 
-## Performance Comparison
+| | v1.x (Sep 2025) | v2.2 (May 2026) | v3.0 (May 2026) | v3.1 (Jul 2026) | v3.2 (Jul 2026) |
+|---|---|---|---|---|---|
+| Write, local | ~182K rows/s | ~210K | ~215K | **~289K** | ~289K |
+| Write, S3 (1M rows) | ~9K rows/s | ~107K | ~107K | +36% same-link A/B | + parallel window |
+| Read, local | — | — | ~70K rows/s | ~106K | **~127K** |
+| Random access | — | — | O(1) `rowAt` | + block-pruned queries | + within-block skip (~19×) |
+| Analytics | — | — | — | `columnStats` 0-request | **median/p99/distinct 0-request** |
+| Peak RAM (write/read) | 0-2 MB / — | ~6 MB / — | 6 / 24 MB | 6 / 24 MB | 6 / **6 MB** |
 
-### Cross-package comparison — 100K rows (May 2026)
+Absolute S3 throughput tracks the network path far more than the
+library (the same 1M-row export measured 59K–153K rows/s across
+sessions) — the honest S3 claim is the same-day A/B: **v3.2's writer is
++36% over v3.0.2 on an identical link**, and the parallel upload window
+turns 3× wall-time swings into steady runs. Benchmark on your own link.
 
-Fresh `composer create-project` of each package, latest stable versions,
-identical 8-column mixed-type payload. `kolay/xlsx-stream` configured with
-`setCompressionLevel(1)->setBufferFlushInterval(10000)`; all other packages
-run at their out-of-the-box defaults. Each row matters — methodology and
-the trade-off table (file size, RAM, compression level) live in
-[BENCHMARK.md](BENCHMARK.md).
+### Cross-package, 100K rows (May 2026, latest stables)
 
-**Write — 100,000 rows**
+| Write | Time | rows/s | | Read | Time | rows/s |
+|---|---:|---:|---|---|---:|---:|
+| **kolay/xlsx-stream** | **0.65s** | **153K** | | **kolay/xlsx-stream** | **1.75s** | **57K** |
+| avadim/fast-excel-writer | 5.23s | 19K | | avadim/fast-excel-reader | 4.60s | 22K |
+| openspout | 5.77s | 17K | | fast-excel | 8.50s | 12K |
+| fast-excel | 7.30s | 14K | | openspout | 9.90s | 10K |
+| phpspreadsheet | 30.62s | 3K | | phpspreadsheet | 29.95s | 3K |
 
-| # | Package | Version | Time | rows/sec | Peak RAM | File |
-|---:|---|---|---:|---:|---:|---:|
-| 1 | **kolay/xlsx-stream** | **3.0.0** | **0.65 s** | **153,216** | 11.79 MB | 5.64 MB |
-| 2 | avadim/fast-excel-writer | 6.12.0 | 5.23 s | 19,127 | 4 MB | 4.34 MB |
-| 3 | openspout/openspout | 5.7.0 | 5.77 s | 17,321 | 2 MB | 4.33 MB |
-| 4 | rap2hpoutre/fast-excel | 5.7.0 | 7.30 s | 13,697 | 4 MB | 4.06 MB |
-| 5 | phpoffice/phpspreadsheet | 5.7.0 | 30.62 s | 3,265 | 531 MB | 4.82 MB |
+(Numbers predate the v3.1/v3.2 speedups. PhpSpreadsheet plays a
+different game — full Excel feature support at memory-bound cost.)
 
-**Read — 100,000 rows** (each reader on the same package's writer output)
-
-| # | Package | Version | Time | rows/sec | Peak RAM |
-|---:|---|---|---:|---:|---:|
-| 1 | **kolay/xlsx-stream** | **3.0.0** | **1.75 s** | **57,043** | 4 MB |
-| 2 | avadim/fast-excel-reader | 3.0.1 | 4.60 s | 21,752 | 2 MB |
-| 3 | rap2hpoutre/fast-excel | 5.7.0 | 8.50 s | 11,761 | 4 MB |
-| 4 | openspout/openspout | 5.7.0 | 9.90 s | 10,105 | 2 MB |
-| 5 | phpoffice/phpspreadsheet | 5.7.0 | 29.95 s | 3,339 | 434 MB |
-
-That's **~8× faster write** and **~2.6× faster read** than the next-fastest
-streaming peer (avadim 6.12 / 3.0.1). Against `kolay/xlsx-stream`'s own
-default config (`lvl=6, flush=1K`) the gap is still ~5× and ~2.4×.
-
-**PhpSpreadsheet is in a different category** — it provides full Excel
-feature support (charts, pivot tables, conditional formatting) at the cost
-of memory-bound architecture. For pure data pipelines the streaming
-packages are 5–47× faster and 100×+ smaller in RAM.
-
----
-
-### Latest Benchmark — v3.0 (May 2026)
-
-v3.0 introduces the streaming **reader** plus the optional born-indexed
-**random-access** primitive on top of the v2.2.2 writer. Measured on the
-same Apple Silicon laptop, PHP 8.2.28, AWS SDK 3.379, against the
-`xlsx-test-package` bucket in `us-east-2`. Same 8-column mixed-type
-workload as v1.x and v2.2.2 — every release uses the canonical
-`benchmark-*.php` scripts in the repo root so the numbers stay
-comparable across versions.
-
-#### Sequential read
-
-```
-php benchmark-read.php
-```
-
-| Rows | Local Read Speed | Local Time | Local Peak RAM | S3 Read Speed | S3 Time | S3 Peak RAM | File Size |
-|------|------------------|------------|----------------|---------------|---------|-------------|-----------|
-| 100 | 27,216 rows/s | 0.00s | 22 MB | 56 rows/s | 1.79s | 24 MB | 0.01 MB |
-| 500 | 61,830 rows/s | 0.01s | 22 MB | 281 rows/s | 1.78s | 24 MB | 0.02 MB |
-| 1,000 | 69,553 rows/s | 0.01s | 22 MB | 480 rows/s | 2.08s | 24 MB | 0.04 MB |
-| 5,000 | 69,433 rows/s | 0.07s | 24 MB | 2,278 rows/s | 2.19s | 24 MB | 0.20 MB |
-| 10,000 | 75,843 rows/s | 0.13s | 24 MB | 4,235 rows/s | 2.36s | 24 MB | 0.40 MB |
-| 25,000 | 66,957 rows/s | 0.37s | 24 MB | 9,664 rows/s | 2.59s | 24 MB | 1.00 MB |
-| 50,000 | 72,895 rows/s | 0.69s | 24 MB | 16,967 rows/s | 2.95s | 22 MB | 2.00 MB |
-| 100,000 | 75,899 rows/s | 1.32s | 24 MB | 27,412 rows/s | 3.65s | 22 MB | 4.00 MB |
-| 250,000 | 72,267 rows/s | 3.46s | 24 MB | 43,139 rows/s | 5.80s | 22 MB | 10.01 MB |
-| 500,000 | 68,772 rows/s | 7.27s | 24 MB | 52,204 rows/s | 9.58s | 22 MB | 20.02 MB |
-| 750,000 | 71,360 rows/s | 10.51s | 24 MB | 57,230 rows/s | 13.11s | 24 MB | 30.03 MB |
-| 1,000,000 | 69,946 rows/s | 14.30s | 24 MB | 60,253 rows/s | 16.60s | 24 MB | 40.03 MB |
-| 1,500,000 | 69,517 rows/s | 21.58s | 24 MB | 59,746 rows/s | 25.11s | 22 MB | 59.66 MB |
-| 2,000,000 | 68,710 rows/s | 29.11s | 24 MB | 61,306 rows/s | 32.62s | 24 MB | 79.24 MB |
-| 3,000,000 | – | – | – | 62,447 rows/s | 48.04s | 24 MB | 119.04 MB |
-| 4,000,000 | – | – | – | 62,956 rows/s | 63.54s | 22 MB | 158.43 MB |
-| 4,500,000 | – | – | – | 62,198 rows/s | 72.35s | 22 MB | 178.09 MB |
-
-**Reading is bounded-memory by construction.** Peak RAM stays at 22-24 MB
-across every row count, from 100 rows to 4.5 million — independent of
-file size. Local sustains ~67-76K rows/s. S3 cold-cache ramps with file
-size as TTFB amortises; saturates at ~60-62K rows/s for files ≥750K
-rows. Multi-sheet workbooks (above the 1,048,576-rows-per-sheet limit)
-read every sheet automatically; there is no per-sheet cap from the
-reader's side.
-
-#### Random access — `rowAt(N)` and `rowCount()`
-
-```
-php benchmark-random-access.php 500000
-```
-
-500,000-row workbook, sync period 10,000. Same plain-vs-indexed comparison
-methodology as the POC's BENCHMARK.md — the two writers produce visually
-identical files and the indexed reader uses the embedded sidecar to
-fresh-init inflate from the nearest sync point.
-
-| Target Row | Plain (full scan) | Indexed (sync + scan) | Speedup |
-|------------|-------------------|-----------------------|---------|
-| 1 | 1.3 ms | 0.2 ms | 6.1× |
-| 50,000 | 665.8 ms | 132.6 ms | 5.0× |
-| 125,000 | 1,645.9 ms | 67.6 ms | 24.3× |
-| 250,000 | 3,426.5 ms | 136.8 ms | 25.0× |
-| 375,000 | 5,087.3 ms | 68.2 ms | **74.6×** |
-| 450,000 | 6,291.8 ms | 136.6 ms | 46.0× |
-| 499,900 | 6,897.9 ms | 135.6 ms | 50.9× |
-| 500,000 | 6,768.0 ms | 135.9 ms | 49.8× |
-
-`rowCount()` on the same file: **7,014 ms plain** (full inflate scan) vs
-**<1 ms indexed** (constant lookup from the sidecar header) — **>260,000×
-speedup**, the indexed call returns inside measurement noise.
-
-**Index cost:** writing with `withRandomAccessIndex()` adds **−0.33 % wall
-time** (within measurement noise — i.e. zero detectable cost), **+0.032 %
-file size**, and zero detectable RAM overhead. The original design budget
-allowed up to 0.5 % file size; we measured ~16× below that ceiling at
-500K rows.
-
-#### Write benchmark — v3.1 vs v3.0.2 (July 2026)
-
-Two kinds of numbers, kept deliberately separate. **The improvement
-claim** comes from a same-day, same-link A/B — both versions, identical
-workload (the canonical 8-column comprehensive payload, level 1, 32 MB
-parts):
-
-| Workload (1M rows) | v3.0.2 | v3.1.0 | Diff |
-|---|---|---|---|
-| Local, level 1 | 212,996 rows/s | 292,619 rows/s | **+37 %** |
-| Local, level 5 | 188,791 rows/s | 245,576 rows/s | **+30 %** |
-| S3, level 1 | 59,383 rows/s | 80,634 rows/s | **+36 %** |
-| S3, level 5 | 54,957 rows/s | 56,298 rows/s | ≈ equal (network-bound) |
-
-The CPU win (PCRE-JIT escape gate + flattened row builder + level-5
-default) carries through to S3 because row generation serializes with
-the synchronous part uploads.
-
-**Absolute S3 throughput** varies with the network path far more than
-with the library — the same 1M-row export measured 59K, 81K, and 113K
-rows/s across three sessions on the same machine. Full size sweep
-(2026-07-04, level 1, 32 MB parts, sequential runs):
-
-| Rows | S3 Speed | S3 Time | Peak RAM | File | Sheets |
-|------|----------|---------|----------|------|--------|
-| 500,000 | 44,828 rows/s | 11.2s | 41 MB | 20.0 MB | 1 |
-| 1,000,000 | 81,776 rows/s | 12.2s | 85 MB | 40.0 MB | 1 |
-| 2,000,000 | 84,297 rows/s | 23.7s | 120 MB | 79.2 MB | 2 |
-| 3,000,000 | **153,042 rows/s** | 19.6s | 150 MB | 119.0 MB | 3 |
-| 4,000,000 | 131,551 rows/s | 30.4s | 184 MB | 158.4 MB | 4 |
-
-The 3M figure reproduced in an isolated re-run minutes later (152,812
-rows/s, 19.63s) — but treat every S3 row as "that link, that hour":
-small files amortize fixed costs (TTFB, multipart finalize, staying
-under the 32 MB part threshold) poorly, and run-to-run jitter exceeds
-version-to-version deltas. Benchmark on your own link; the sequential
-`uploadPart` stall is the known bottleneck and parallel multipart
-upload is on the roadmap. Peak RAM grows ~40 MB per million rows with
-32 MB parts (part buffer + copies — the same rework will flatten this).
-
-#### Write benchmark — v3.0 vs v2.2.2
-
-v3.0's writer default code path is byte-identical to v2.2.2 — the only
-new writer-side addition is the opt-in `withRandomAccessIndex()`. We
-re-ran the full write benchmark on v3.0 to verify zero regression:
-
-| Workload | v3.0 | v2.2.2 | Diff |
-|---|---|---|---|
-| Local 100K | 221,895 rows/s | 188,771 rows/s | +18 % |
-| Local 1M | 214,912 rows/s | 209,905 rows/s | +2.4 % |
-| Local 2M | 209,462 rows/s | 208,512 rows/s | +0.5 % |
-| S3 1M | 109,562 rows/s | 106,924 rows/s | +2.5 % |
-| S3 4.5M | 119,914 rows/s | 130,293 rows/s | −8 % (network jitter) |
-
-Deltas are inside measurement noise. Memory profile is unchanged.
-For the full v2.2.2 write table, see **Write benchmark — v2.2.2
-(May 2026)** below.
-
-For the full v3.0 measurement detail (write, read, random-access plus
-methodology and reproducibility notes), see [BENCHMARK.md](BENCHMARK.md).
-
----
-
-### Write benchmark — v2.2.2 (May 2026)
-
-Re-measured on an Apple Silicon laptop with PHP 8.2.28 and AWS SDK
-3.379 against the same `xlsx-test-package` bucket in `us-east-2`. The
-workload is identical to the v1.x baseline below (8 columns,
-mixed types, compression level 1).
-
-| Rows | Local Speed | Local Time | S3 Speed | S3 Memory | S3 Time | File Size |
-|------|-------------|------------|----------|-----------|---------|-----------|
-| 100 | 45,290 rows/s | 0.00s | 112 rows/s | 0 MB | 0.89s | 0.01 MB |
-| 500 | 191,346 rows/s | 0.00s | 491 rows/s | 0 MB | 1.02s | 0.02 MB |
-| 1,000 | 184,836 rows/s | 0.01s | 966 rows/s | 0 MB | 1.03s | 0.04 MB |
-| 5,000 | 195,825 rows/s | 0.03s | 3,345 rows/s | 0 MB | 1.49s | 0.2 MB |
-| 10,000 | 198,898 rows/s | 0.05s | 2,551 rows/s | 0 MB | 3.92s | 0.4 MB |
-| 25,000 | 210,498 rows/s | 0.12s | 10,170 rows/s | 0 MB | 2.46s | 1 MB |
-| 50,000 | 217,123 rows/s | 0.23s | 15,597 rows/s | 2 MB | 3.21s | 2 MB |
-| 100,000 | 188,771 rows/s | 0.53s | 24,258 rows/s | 4 MB | 4.12s | 4 MB |
-| 250,000 | 215,340 rows/s | 1.16s | 63,713 rows/s | 12 MB (±6) | 3.92s | 10 MB |
-| 500,000 | 209,428 rows/s | 2.39s | 87,679 rows/s | 20 MB (±18) | 5.70s | 20 MB |
-| 750,000 | 211,315 rows/s | 3.55s | 84,221 rows/s | 30 MB (±26) | 8.91s | 30 MB |
-| 1,000,000 | 209,905 rows/s | 4.76s | 106,924 rows/s | 40 MB (±38) | 9.35s | 40 MB |
-| 1,500,000 | 207,503 rows/s | 7.23s | 117,631 rows/s | 60 MB (±58) | 12.75s | 60 MB |
-| 2,000,000 | 208,512 rows/s | 9.59s | 112,708 rows/s | 79 MB (±77) | 17.74s | 79 MB |
-| 3,000,000 | – | – | 112,229 rows/s | 119 MB (±117) | 26.73s | 119 MB |
-| 4,000,000 | – | – | 128,930 rows/s | 160 MB (±156) | 31.02s | 158 MB |
-| 4,500,000 | – | – | 130,293 rows/s | 178 MB (±178) | 34.54s | 178 MB |
-
-#### What changed since v1.x
-
-- **Local throughput is now ~15–25% *faster* than the v1.x baseline**
-  (1M rows: 210K rows/s vs 183K). The v2.0+ per-cell type detection
-  added a small overhead at first (v2.0 was about 5% slower than v1.x),
-  but v2.2.2 fixed a long-standing bug in the XML escape fast path — the
-  `strpbrk` needle was a single-quoted literal so `\xNN` escapes were
-  embedded as the characters `\`, `x`, `0..9`, `A..F` instead of as
-  actual control bytes. The fix shrank the needle from 129 to 36 chars
-  and per-cell sanitization got ~3.5× cheaper as a side effect.
-- **S3 throughput is up 2.5–3× over v1.x** for any workload above 50K
-  rows (1M: 107K rows/s vs 43K, 4.5M: 130K rows/s vs 46K). Drivers:
-  AWS SDK 3.379+, faster measurement-machine network, and a smaller
-  share from the per-row hot-path improvement.
-- **Memory is unchanged** — local stays at 0–2 MB constant, S3 keeps the
-  same sawtooth pattern as the buffer fills and flushes per part.
-
-### Original Benchmark — v1.x (September 2025)
-
-Kept here for historical context. Different machine and PHP version, so
-direct cell-by-cell deltas reflect environment variance as well as code
-changes.
-
-| Rows | Local Speed | Local Memory | Local Time | S3 Speed | S3 Memory | S3 Time | File Size |
-|------|-------------|--------------|------------|----------|-----------|---------|-----------|
-| 100 | 47,913 rows/s | 2 MB | 0.00s | 99 rows/s | 0 MB | 1.01s | 0.01 MB |
-| 500 | 161,183 rows/s | 0 MB | 0.00s | 362 rows/s | 0 MB | 1.38s | 0.02 MB |
-| 1,000 | 161,711 rows/s | 0 MB | 0.01s | 913 rows/s | 0 MB | 1.09s | 0.04 MB |
-| 5,000 | 167,101 rows/s | 0 MB | 0.03s | 3,092 rows/s | 0 MB | 1.62s | 0.2 MB |
-| 10,000 | 183,281 rows/s | 0 MB | 0.05s | 5,411 rows/s | 0 MB | 1.85s | 0.4 MB |
-| 25,000 | 187,322 rows/s | 0 MB | 0.13s | 11,482 rows/s | 0 MB | 2.18s | 1 MB |
-| 50,000 | 187,455 rows/s | 2 MB | 0.27s | 5,829 rows/s | 2 MB | 8.58s | 2 MB |
-| 100,000 | 182,167 rows/s | 0 MB | 0.55s | 9,288 rows/s | 4 MB | 10.77s | 4 MB |
-| 250,000 | 185,586 rows/s | 0 MB | 1.35s | 59,744 rows/s | 12 MB (±6) | 4.18s | 10 MB |
-| 500,000 | 184,268 rows/s | 0 MB | 2.71s | 28,553 rows/s | 20 MB (±18) | 17.51s | 20 MB |
-| 750,000 | 182,648 rows/s | 0 MB | 4.11s | 33,504 rows/s | 30 MB (±26) | 22.39s | 30 MB |
-| 1,000,000 | 182,693 rows/s | 0 MB | 5.47s | 43,215 rows/s | 40 MB (±38) | 23.14s | 40 MB |
-| 1,500,000 | 180,578 rows/s | 0 MB | 8.31s | 36,733 rows/s | 60 MB (±58) | 40.84s | 60 MB |
-| 2,000,000 | 177,012 rows/s | 0 MB | 11.30s | 51,323 rows/s | 79 MB (±77) | 38.97s | 79 MB |
-| 3,000,000 | – | – | – | 39,150 rows/s | 117 MB (±117) | 76.63s | 119 MB |
-| 4,000,000 | – | – | – | 42,500 rows/s | 160 MB (±156) | 94.12s | 158 MB |
-| 4,500,000 | – | – | – | 46,462 rows/s | 178 MB (±178) | 96.85s | 178 MB |
-
-*Note: Tests with 1M+ rows automatically create multiple sheets (Excel limit: 1,048,576 rows per sheet)*  
-*Note: ± values in S3 Memory column indicate memory fluctuation during streaming due to periodic part uploads*
-
-### Understanding Memory Behavior
-
-> **Reader bounded-RAM contract — when it holds:** Files written by
-> this package use inline strings exclusively, so the reader's bounded
-> 22-24 MB peak RAM applies unconditionally. Files produced by other
-> tools that store text in `xl/sharedStrings.xml` are loaded into
-> memory **provided the table fits** — compressed ≤ 20 MB AND
-> uncompressed ≤ 100 MB. Files exceeding either threshold are rejected
-> with a clear error rather than silently exhausting RAM. On-disk
-> shared-strings table support is tracked for a future release.
-
-#### Local File System
-- **True O(1) Memory**: Constant memory usage regardless of file size
-- **No Growth**: Memory stays at 0-2MB even for millions of rows
-- **Speed**: 180,000+ rows/second consistently
-
-#### S3 Streaming Memory Fluctuation
-The ± values in S3 memory represent **normal memory fluctuation** during streaming:
-
-1. **Buffer Accumulation Phase** (↑ Memory Growth)
-   - Data is compressed and buffered until reaching 32MB
-   - Memory grows gradually as buffer fills
-
-2. **Part Upload Phase** (↓ Memory Drop)
-   - When buffer reaches 32MB, it's uploaded to S3
-   - After upload, memory drops back to baseline
-   - This creates the characteristic sawtooth pattern
-
-3. **Example: 1M Rows Test**
-   - Average memory: 40MB
-   - Fluctuation: ±38MB
-   - Pattern: Memory oscillates between ~2MB (after upload) and ~78MB (before upload)
-   - This is **completely normal** and expected behavior
-
-### Performance Highlights *(v3.2, July 2026)*
-
-- **Read — +30 % tokenizer throughput** over v3.1 (isolated A/B on a real-row
-  corpus: 106K → 138K rows/s); full-scan baseline 126.9K rows/s at 6 MB peak.
-- **`rows(skip: N)`**: skip=1M measured 3.94 s → 2.5 ms with an index
-  (**~1,580×**), ~29× via boundary scan without one; random `rowAt` within a
-  block 21.1 → 1.13 ms (**~19×**).
-- **`groupStats()`**: 20 sorted groups over 1M rows in ~57 ms — interior
-  blocks never fetched. **`quantile()`/`countDistinct()`**: zero row reads,
-  zero extra requests (warm calls ~1.4 µs / ~62 µs).
-- **Parallel S3 multipart** (window of 4): flat ~46 MB peak (the old
-  ~40 MB-per-million-rows ratchet is gone) and steady wall times where
-  sequential swung 3×; ~2× projected on RTT-bound links.
-- **External files**: shared-strings support ceiling raised 20 → 64 MB
-  compressed (1M-entry table peak: 83.7 → 24 MB, 3.5×); `autoDetectDates()`
-  fixes the "my date is 45123" class of surprises.
-
-*(v3.1, July 2026)*
-
-- **Write — Local (v3.1)**: ~289,000 rows/second writer throughput (500K-row
-  mixed workload, 6 MB peak RAM) — **+55 % over v3.0.2** from a PCRE-JIT
-  escape fast path, a flattened row builder (output byte-identical), and
-  the level-5 default. Apples-to-apples numbers in `bench/results.json`.
-- **Reader open on S3 (v3.1)**: 7 → 3 round trips (suffix-range tail read,
-  coalesced entry fetches, workbook.xml fetched once) — ~150–300 ms less
-  first-row latency per open at typical S3 RTTs.
-- **Queryable files (v3.1)**: `columnStats()` answers min/max/sum/avg from
-  the sidecar alone; `rowsWhere()` skips blocks via zone maps; `findRow()`
-  resolves point lookups on sorted columns by reading a single block.
-- **Write — S3 (v3.1)**: **+36 % over v3.0.2** in a same-day, same-link A/B
-  at 1M rows; absolute throughput ranged 59K–153K rows/s across sessions
-  and sizes (peak: 3M rows at 153K rows/s, reproduced twice — full sweep
-  in the v3.1 write benchmark table). S3 numbers track the network path
-  far more than the library; benchmark on your own link.
-
-*(v3.0, May 2026 — S3 figures reflect that day's network path)*
-
-- **Write — Local**: ~190,000–222,000 rows/second with true O(1) memory
-- **Write — S3**: 109,000–129,000 rows/second above 750K rows (2.5–3× the v1.x baseline, identical to v2.2.2)
-- **Read — Local**: ~67,000–76,000 rows/second sustained, 22-24 MB peak RAM regardless of file size
-- **Read — S3**: 60,000–62,000 rows/second saturation on multi-MB files (cold cache, single-stream)
-- **Random Access**: O(1) `rowAt(N)`, `rowRange(a, b)`, and `rowCount()` via opt-in `withRandomAccessIndex()` — **up to 74.6× speedup** vs full scan, **>260,000× speedup** on `rowCount()`, **+0.032 % file size cost**
-- **Memory Efficiency**: Local writer uses <2 MB, S3 writer averages 40 MB per million rows; reader caps at ~24 MB independent of file size
-- **Multi-sheet Support**: Automatic sheet creation at Excel's 1,048,576 row limit, transparent multi-sheet reading
-- **External XLSX**: Reads files produced by PhpSpreadsheet, openpyxl, Apache POI, Excel etc. via shared-strings table support
-- **Production Ready**: Successfully written and round-tripped 4.5 million rows
+**Every historical table** (per-version scaling runs from 100 rows to
+4.5M, random-access speedups, memory profiles, methodology) lives in
+[BENCHMARK.md](BENCHMARK.md). All numbers come from the committed
+`bench/` harnesses — fresh process per run, medians, generation cost
+subtracted; re-run them yourself.
 
 ### File size limits
 
@@ -451,7 +161,7 @@ battle-tested across millions of installs.
 
 > Upgrading from v2.x? Reader and random-access APIs are purely
 > additive — no breaking changes. See [CHANGELOG.md](CHANGELOG.md) for
-> the full v3.0 highlights.
+> the full v3.2 highlights.
 >
 > Upgrading from v1.x? See [UPGRADE.md](UPGRADE.md) for the v2.0
 > migration guide as well.
@@ -467,6 +177,56 @@ composer require kolay/xlsx-stream
 ```bash
 php artisan vendor:publish --tag=xlsx-stream-config
 ```
+
+
+## Use cases
+
+Each scenario below links to the how-to section further down.
+
+**1. The million-row queued export that stopped eating RAM.**
+A Laravel queue job streams `FromQuery`-style data straight to S3 —
+no temp file, no reopen-per-chunk, ~6 MB writer footprint, progress
+callbacks for the UI. Add `withRandomAccessIndex()` and the artifact is
+instantly seekable for every scenario below. → *Direct S3 Streaming*,
+*Laravel Job Example*, *Progress Reporting*.
+
+**2. "Download report" endpoints that start instantly.**
+Stream the workbook into the HTTP response as it's generated
+(`PhpStreamSink` → `php://output`) — first bytes reach the browser
+while row 1,000,000 is still being written. → *Streaming directly to
+an HTTP response*.
+
+**3. Importing customer uploads without fear.**
+Read files produced by Excel/openpyxl/PhpSpreadsheet with bounded
+memory (shared-strings tables up to 64 MB compressed), correct dates
+via `autoDetectDates()`, validate row-by-row, and batch-insert.
+→ *Reading XLSX Files*, *Reading dates and times*.
+
+**4. Parallel imports: wall clock = slowest worker.**
+`shards(8)` splits a born-indexed sheet into eight independently
+decompressible, JSON-serializable ranges — dispatch one queue job per
+shard, zero coordination. → *Parallel reads*.
+
+**5. Admin file preview without importing to a database.**
+Paginate a 4M-row S3 export in a UI: `rowCount()` is O(1), page 40,000
+costs the same as page 1 via `rowRange()`, "jump to ID" is `findRow()`
+— two range requests on a sorted column. → *Random-Access Reading*.
+
+**6. Dashboard numbers straight from the file.**
+"Total payroll", "median salary", "p99 order value", "distinct
+customers" — answered from the sidecar with zero row reads
+(`columnStats`, `quantile`, `countDistinct`), and per-month breakdowns
+via `groupStats()` reading only group-boundary blocks. The file IS the
+report backend. → *Queryable XLSX*, *Grouped aggregates*.
+
+**7. Styled corporate reports, still streaming.**
+Header styling, per-row highlight styles, ₺/date/weekday number
+formats, frozen header, autofilter, auto column widths — all
+single-pass compatible. → *Header & Column Styling*.
+
+**8. Tight environments: Lambda, small pods, multi-tenant SaaS.**
+Constant memory on both directions means the same code runs in a
+128 MB function and a shared worker without per-tenant memory math.
 
 ## Quick Start
 
@@ -1145,6 +905,7 @@ try {
 }
 ```
 
+
 ## Configuration
 
 Published configuration file (`config/xlsx-stream.php`):
@@ -1214,42 +975,25 @@ return [
    - 32MB parts uploaded as they're ready
    - No local file required at any point
 
-### Memory Efficiency Explained
 
-#### Local Files: True O(1) Memory
-```php
-// Only these stay in memory:
-$rowBuffer = '';        // Current batch of rows (flushed every 10K rows)
-$deflateContext = ...;  // Compression context (minimal)
-$zipMetadata = [];      // File entry metadata (bytes per file)
-```
+### Memory model
 
-#### S3 Streaming: Near O(1) with Controlled Growth
-```php
-// Memory components:
-$buffer = '';           // 32MB max (uploaded when full)
-$parts = [];           // Part metadata (ETag + number per part)
-// Growth: ~1KB per part × (filesize / 32MB) parts
-// Example: 100MB file = 3 parts = ~3KB metadata
-```
+- **Local writes are O(1)**: a row buffer (default 10K rows) plus the
+  deflate context — ~6 MB peak regardless of row count.
+- **S3 writes are bounded by the upload window** *(v3.2)*: peak ≈
+  `part_size × (concurrency + 2)` — ~46 MB flat at the defaults, at 1M
+  rows and at 10M rows alike. (Before v3.2 the sink's buffer copies
+  ratcheted ~40 MB per million rows; the parallel window rework removed
+  that.) Memory saw-tooths as parts fill and upload — that's the buffer
+  cycle, not a leak.
+- **Reads are bounded by construction**: inflate chunks + one row in
+  flight — ~6 MB for files this package wrote (24 MB ceiling with large
+  external shared-strings tables, which now parse streaming — the full
+  XML never materializes).
 
-### Why Memory Fluctuates in S3
-
-The sawtooth memory pattern in S3 streaming is **by design**:
-
-```
-Memory
-  ▲
-78MB │     ╱╲      ╱╲      ╱╲
-     │    ╱  ╲    ╱  ╲    ╱  ╲
-40MB │   ╱    ╲  ╱    ╲  ╱    ╲
-     │  ╱      ╲╱      ╲╱      ╲
-2MB  │─╯                         
-     └────────────────────────────▶ Time
-       ↑Upload  ↑Upload  ↑Upload
-```
-
-Each peak represents a full 32MB buffer ready for upload. After upload, memory drops as the buffer is cleared. This is optimal for streaming large files.
+The random-access / query layer is built on deflate `FULL_FLUSH` sync
+points plus the KXSI sidecar — the full binary format, its invariants
+and the conformance suite are documented in [SPEC.md](SPEC.md).
 
 ## Real-World Performance
 
@@ -1267,24 +1011,16 @@ Memory Usage: 178 MB average with ±178 MB fluctuation
 Peak Memory: 356 MB (during S3 part upload)
 ```
 
-### Key Performance Metrics
 
-#### Speed
-- **Local Files**: 180,000+ rows/second sustained
-- **S3 Streaming**: 30,000-50,000 rows/second
-- **Network Impact**: S3 speed varies with network latency and bandwidth
+### Key Performance Metrics *(v3.2)*
 
-#### Memory Usage
-- **Local Files**: True O(1) - constant 0-2MB regardless of size
-- **S3 Streaming**: Averages 40MB per million rows
-- **Fluctuation**: Normal sawtooth pattern during S3 uploads
-
-#### Scalability
-- ✅ **100 rows**: Instant (< 0.01s local, ~1s S3)
-- ✅ **1 Million rows**: 5.5 seconds local, 23 seconds S3
-- ✅ **4.5 Million rows**: 97 seconds S3 with automatic multi-sheet
-- ✅ **Memory stable**: No memory leaks, predictable usage
-- ✅ **Production proven**: Running in production since 2025
+- **Write — Local**: ~289K rows/s sustained, 6 MB peak
+- **Write — S3**: network-bound; +36% over v3.0.2 same-link, steady
+  wall times under the parallel window, ~46 MB flat peak
+- **Read — Local**: ~127K rows/s full scan, bounded memory at any size
+- **Point reads**: `rowAt` ~1.1 ms within a block; `rows(skip: 1M)` 2.5 ms
+- **Analytics**: `median`/`quantile`/`countDistinct` answer with zero
+  row reads; `groupStats` over 1M rows in ~57 ms
 
 ## Compatibility
 
@@ -1306,14 +1042,10 @@ read silently falls back to a sequential scan via the embedded sheet
 CRC32 cross-check — same end result, just without the O(1) speedup. The
 reader-side fallback is verified by `tests/Writers/RandomAccessIndexWriterTest.php`.
 
-## Use Cases
+v3.1/v3.2 extend the same sidecar with additional TLV sections
+(`STAT`/`SCRC`/`TDIG`/`CHLL`) under the identical opaque-part contract;
+manual open-tests are repeated against real Excel before every tag.
 
-Perfect for:
-- Large data exports (millions of rows)
-- Memory-constrained environments
-- Kubernetes/Docker with small pods
-- AWS Lambda functions
-- Real-time streaming exports
 - Multi-tenant SaaS applications
 
 ## Contributing
