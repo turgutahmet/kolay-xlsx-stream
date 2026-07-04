@@ -3,6 +3,8 @@
 namespace Kolay\XlsxStream\Readers;
 
 use Kolay\XlsxStream\Exceptions\XlsxReadException;
+use Kolay\XlsxStream\Sketches\HyperLogLog;
+use Kolay\XlsxStream\Sketches\TDigest;
 
 /**
  * Binary decoder for the xl/_kxs/index.bin sidecar produced by the
@@ -18,6 +20,9 @@ use Kolay\XlsxStream\Exceptions\XlsxReadException;
  *   - totalRows($sheetEntry)        sheet's row count, for O(1) rowCount
  *   - syncPoints($sheetEntry)       full per-sheet sync-point list
  *   - findSyncPoint($entry, $row)   nearest sync point with row <= target
+ *   - syncPointCrcs($sheetEntry)    running CRC32 per sync point (SCRC)
+ *   - columnDigest($entry, $col)    per-column t-digest sketch (TDIG)
+ *   - columnHll($entry, $col)       per-column HyperLogLog sketch (CHLL)
  *
  * @internal
  */
@@ -28,6 +33,12 @@ class RandomAccessIndex
     public const ENTRY_PATH = 'xl/_kxs/index.bin';
 
     public const TAG_STATS = 'STAT';
+
+    public const TAG_SYNC_CRCS = 'SCRC';
+
+    public const TAG_TDIGEST = 'TDIG';
+
+    public const TAG_HLL = 'CHLL';
 
     public const SORTED_ASC = 0x01;
     public const SORTED_DESC = 0x02;
@@ -68,13 +79,45 @@ class RandomAccessIndex
      */
     private array $columnStatsByEntry = [];
 
-    private function __construct(int $syncPeriod, array $totals, array $crcs, array $syncs, array $columnStats = [])
+    /**
+     * Running CRC32 of the sheet's uncompressed bytes at each sync point,
+     * from the KXSI "SCRC" TLV section — value k covers exactly the first
+     * uncomp_offset bytes of sync point k (aligned 1:1 with syncPoints()).
+     *
+     * @var array<string, list<int>> entry path => running CRC32 per sync point
+     */
+    private array $syncPointCrcsByEntry = [];
+
+    /**
+     * Raw serialized sketch payloads from the KXSI "TDIG" / "CHLL" TLV
+     * sections. Framing is validated at decode time; the payloads
+     * themselves deserialize lazily in columnDigest()/columnHll() —
+     * most opens never query a sketch, so the parse cost stays with the
+     * calls that need it. Deserialized instances are memoized.
+     *
+     * @var array<string, array<int, string>> entry path => 1-based column => payload
+     */
+    private array $columnDigestPayloads = [];
+
+    /** @var array<string, array<int, string>> entry path => 1-based column => payload */
+    private array $columnHllPayloads = [];
+
+    /** @var array<string, array<int, TDigest>> memoized deserialized digests */
+    private array $columnDigests = [];
+
+    /** @var array<string, array<int, HyperLogLog>> memoized deserialized HLLs */
+    private array $columnHlls = [];
+
+    private function __construct(int $syncPeriod, array $totals, array $crcs, array $syncs, array $columnStats = [], array $syncPointCrcs = [], array $columnDigestPayloads = [], array $columnHllPayloads = [])
     {
         $this->syncPeriod = $syncPeriod;
         $this->totalRowsByEntry = $totals;
         $this->sheetCrc32ByEntry = $crcs;
         $this->syncPointsByEntry = $syncs;
         $this->columnStatsByEntry = $columnStats;
+        $this->syncPointCrcsByEntry = $syncPointCrcs;
+        $this->columnDigestPayloads = $columnDigestPayloads;
+        $this->columnHllPayloads = $columnHllPayloads;
     }
 
     public static function decode(string $payload): self
@@ -106,6 +149,18 @@ class RandomAccessIndex
         if ($version !== self::VERSION) {
             throw XlsxReadException::corruptCentralDirectory(
                 "random-access index version {$version} is not supported by this reader"
+            );
+        }
+
+        // The flags byte is a must-understand bitmask: every bit is
+        // reserved and writers emit 0. A set bit signals a semantic this
+        // decoder does not implement, so — unlike an unknown TLV tag,
+        // which is skippable by design — the only safe response is to
+        // reject the sidecar outright.
+        $flags = ord($payload[5]);
+        if ($flags !== 0) {
+            throw XlsxReadException::corruptCentralDirectory(
+                sprintf('random-access index flags byte 0x%02X carries bits this reader does not understand', $flags)
             );
         }
 
@@ -244,6 +299,9 @@ class RandomAccessIndex
         // that's what lets future writers add sections without
         // stranding this reader.
         $columnStats = [];
+        $syncPointCrcs = [];
+        $columnDigestPayloads = [];
+        $columnHllPayloads = [];
         $entryOrder = array_keys($totals);
         while ($cursor + 8 <= $bodyLen) {
             $tag = substr($body, $cursor, 4);
@@ -262,12 +320,30 @@ class RandomAccessIndex
                     $entryOrder,
                     $syncs
                 );
+            } elseif ($tag === self::TAG_SYNC_CRCS) {
+                $syncPointCrcs = self::decodeScrcSection(
+                    substr($body, $cursor, $length),
+                    $entryOrder,
+                    $syncs
+                );
+            } elseif ($tag === self::TAG_TDIGEST) {
+                $columnDigestPayloads = self::decodeSketchSection(
+                    substr($body, $cursor, $length),
+                    $entryOrder,
+                    self::TAG_TDIGEST
+                );
+            } elseif ($tag === self::TAG_HLL) {
+                $columnHllPayloads = self::decodeSketchSection(
+                    substr($body, $cursor, $length),
+                    $entryOrder,
+                    self::TAG_HLL
+                );
             }
 
             $cursor += $length;
         }
 
-        return new self($syncPeriod, $totals, $crcs, $syncs, $columnStats);
+        return new self($syncPeriod, $totals, $crcs, $syncs, $columnStats, $syncPointCrcs, $columnDigestPayloads, $columnHllPayloads);
     }
 
     /**
@@ -345,6 +421,103 @@ class RandomAccessIndex
     }
 
     /**
+     * Parse the "SCRC" TLV payload — per-sheet running CRC32 values in
+     * core-body sheet order, one uint32 per sync point. Enforces the
+     * structural invariant count == sync_count so a misaligned sidecar
+     * surfaces loudly instead of mis-mapping CRCs to sync points.
+     *
+     * @param  list<string>  $entryOrder  sheet entries in core-body order
+     * @param  array<string, list<array{row: int, comp_offset: int, uncomp_offset: int}>>  $syncs
+     * @return array<string, list<int>>
+     */
+    private static function decodeScrcSection(string $scrc, array $entryOrder, array $syncs): array
+    {
+        $result = [];
+        $cursor = 0;
+        $len = strlen($scrc);
+
+        foreach ($entryOrder as $entry) {
+            if ($cursor + 4 > $len) {
+                throw XlsxReadException::corruptCentralDirectory('truncated SCRC section sheet header');
+            }
+            $count = unpack('V', substr($scrc, $cursor, 4))[1];
+            $cursor += 4;
+
+            $expected = count($syncs[$entry] ?? []);
+            if ($count !== $expected) {
+                throw XlsxReadException::corruptCentralDirectory(
+                    "SCRC section CRC count {$count} does not match sync count {$expected} for sheet '{$entry}'"
+                );
+            }
+            if ($cursor + 4 * $count > $len) {
+                throw XlsxReadException::corruptCentralDirectory(
+                    "truncated SCRC value list for sheet '{$entry}'"
+                );
+            }
+
+            $values = [];
+            for ($k = 0; $k < $count; $k++) {
+                $values[] = unpack('V', substr($scrc, $cursor, 4))[1];
+                $cursor += 4;
+            }
+
+            $result[$entry] = $values;
+        }
+
+        return $result;
+    }
+
+    /**
+     * Parse a "TDIG" or "CHLL" TLV payload — both share one frame:
+     * per-sheet records in core-body order, each listing (column,
+     * payload_len, payload) triples. Only the framing is validated
+     * here; sketch payloads stay opaque until an accessor needs them
+     * (their own deserializers enforce internal invariants).
+     *
+     * @param  list<string>  $entryOrder  sheet entries in core-body order
+     * @return array<string, array<int, string>>
+     */
+    private static function decodeSketchSection(string $data, array $entryOrder, string $tag): array
+    {
+        $result = [];
+        $cursor = 0;
+        $len = strlen($data);
+
+        foreach ($entryOrder as $entry) {
+            if ($cursor + 2 > $len) {
+                throw XlsxReadException::corruptCentralDirectory("truncated {$tag} section sheet header");
+            }
+            $colCount = unpack('v', substr($data, $cursor, 2))[1];
+            $cursor += 2;
+
+            for ($c = 0; $c < $colCount; $c++) {
+                if ($cursor + 6 > $len) {
+                    throw XlsxReadException::corruptCentralDirectory("truncated {$tag} column header");
+                }
+                $col = unpack('v', substr($data, $cursor, 2))[1];
+                $payloadLen = unpack('V', substr($data, $cursor + 2, 4))[1];
+                $cursor += 6;
+
+                if ($col < 1) {
+                    throw XlsxReadException::corruptCentralDirectory(
+                        "{$tag} section column index must be 1-based"
+                    );
+                }
+                if ($cursor + $payloadLen > $len) {
+                    throw XlsxReadException::corruptCentralDirectory(
+                        "truncated {$tag} sketch payload for column {$col} of sheet '{$entry}'"
+                    );
+                }
+
+                $result[$entry][$col] = substr($data, $cursor, $payloadLen);
+                $cursor += $payloadLen;
+            }
+        }
+
+        return $result;
+    }
+
+    /**
      * Sheet content CRC32 captured at write time. Reader compares this
      * against the live ZIP CD CRC for the same entry; mismatch means the
      * sheet was rewritten by a tool that didn't update the sidecar
@@ -389,6 +562,82 @@ class RandomAccessIndex
     public function statsColumns(string $sheetEntry): array
     {
         return array_keys($this->columnStatsByEntry[$sheetEntry] ?? []);
+    }
+
+    /**
+     * T-digest sketch for one column (KXSI "TDIG" section), or null
+     * when the sidecar carries none for that entry/column. A payload
+     * whose internal structure fails the sketch's own invariants
+     * (crafted or corrupt) is rejected loudly — mirroring how the
+     * structural decode treats every other section.
+     */
+    public function columnDigest(string $sheetEntry, int $column): ?TDigest
+    {
+        $payload = $this->columnDigestPayloads[$sheetEntry][$column] ?? null;
+        if ($payload === null) {
+            return null;
+        }
+
+        if (! isset($this->columnDigests[$sheetEntry][$column])) {
+            try {
+                $this->columnDigests[$sheetEntry][$column] = TDigest::deserialize($payload);
+            } catch (\InvalidArgumentException $e) {
+                throw XlsxReadException::corruptCentralDirectory(
+                    "TDIG sketch for sheet '{$sheetEntry}' column {$column} is invalid: ".$e->getMessage()
+                );
+            }
+        }
+
+        return $this->columnDigests[$sheetEntry][$column];
+    }
+
+    /**
+     * HyperLogLog sketch for one column (KXSI "CHLL" section), or null
+     * when the sidecar carries none for that entry/column.
+     */
+    public function columnHll(string $sheetEntry, int $column): ?HyperLogLog
+    {
+        $payload = $this->columnHllPayloads[$sheetEntry][$column] ?? null;
+        if ($payload === null) {
+            return null;
+        }
+
+        if (! isset($this->columnHlls[$sheetEntry][$column])) {
+            try {
+                $this->columnHlls[$sheetEntry][$column] = HyperLogLog::deserialize($payload);
+            } catch (\InvalidArgumentException $e) {
+                throw XlsxReadException::corruptCentralDirectory(
+                    "CHLL sketch for sheet '{$sheetEntry}' column {$column} is invalid: ".$e->getMessage()
+                );
+            }
+        }
+
+        return $this->columnHlls[$sheetEntry][$column];
+    }
+
+    /** @return list<int> 1-based columns that carry a t-digest for the sheet */
+    public function digestColumns(string $sheetEntry): array
+    {
+        return array_keys($this->columnDigestPayloads[$sheetEntry] ?? []);
+    }
+
+    /** @return list<int> 1-based columns that carry an HLL for the sheet */
+    public function hllColumns(string $sheetEntry): array
+    {
+        return array_keys($this->columnHllPayloads[$sheetEntry] ?? []);
+    }
+
+    /**
+     * Running CRC32 of the sheet's uncompressed bytes at each sync point
+     * (KXSI "SCRC" section), aligned 1:1 with syncPoints(): value k is
+     * crc32 of the first uncomp_offset bytes of sync point k. Empty when
+     * the sidecar carries no SCRC section (pre-v3.2 writers).
+     *
+     * @return list<int>
+     */
+    public function syncPointCrcs(string $sheetEntry): array
+    {
+        return $this->syncPointCrcsByEntry[$sheetEntry] ?? [];
     }
 
     /**

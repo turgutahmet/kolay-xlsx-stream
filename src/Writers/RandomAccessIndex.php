@@ -67,6 +67,38 @@ namespace Kolay\XlsxStream\Writers;
  *             4   count     uint32, numeric values folded into min/max/sum
  *             4   other     uint32, nulls + non-numeric values
  *
+ *     "SCRC" — per-sheet running CRC32 of the sheet's uncompressed bytes
+ *     captured at each sync point. Sheets appear in core-body order,
+ *     aligned 1:1 with that sheet's sync_points: value k is
+ *     crc32(uncompressed sheet bytes [0, sync_point[k].uncomp_offset)),
+ *     i.e. the CRC a fresh crc32 would produce after consuming exactly
+ *     the prefix that precedes the sync row. count MUST equal the
+ *     sheet's sync_count (mirror of the STAT block_count invariant).
+ *     Shared prerequisite for resumable exports, appendable files,
+ *     truncation detection and block-granular signing: the writer can
+ *     resume its live CRC context from a pinned prefix, and a verifier
+ *     can prove a prefix untampered without inflating past it.
+ *       per sheet:
+ *         4   count         uint32, == sync_count of that sheet
+ *         4*K running_crc   uint32 each, K = count
+ *
+ *     "TDIG" / "CHLL" — file-level approximate-statistics sketches per
+ *     tracked column: a merging t-digest (quantiles/median) and a
+ *     HyperLogLog (distinct counts). Unlike STAT these are whole-sheet
+ *     sketches, not per-block pruning structures — one record per sheet
+ *     in core-body order, both sections sharing one generic frame:
+ *       per sheet:
+ *         2   tracked_column_count  uint16 (0 when none for the sheet)
+ *         per column:
+ *           2   column       uint16, 1-based
+ *           4   payload_len  uint32
+ *           N   payload      the sketch's own serialized form
+ *                            (TDigest::serialize / HyperLogLog::serialize)
+ *     Header row is EXCLUDED from both sketches (estimation bias — the
+ *     opposite call from STAT's header fold, which exists for pruning
+ *     soundness); see SPEC.md §4.3/§4.4 for the full rationale and the
+ *     CHLL canonicalization rule.
+ *
  * Offsets are relative to the sheet's *compressed* (resp. uncompressed)
  * data stream — measured from just after the Local File Header. The
  * reader resolves them to absolute file offsets at runtime via the
@@ -93,6 +125,12 @@ class RandomAccessIndex
 
     public const TAG_STATS = 'STAT';
 
+    public const TAG_SYNC_CRCS = 'SCRC';
+
+    public const TAG_TDIGEST = 'TDIG';
+
+    public const TAG_HLL = 'CHLL';
+
     public const SORTED_ASC = 0x01;
     public const SORTED_DESC = 0x02;
 
@@ -110,8 +148,18 @@ class RandomAccessIndex
      *     sorted_desc: bool,
      *     blocks: list<array{min: float, max: float, sum: float, count: int, other: int}>
      * }>>  $columnStats  entry path => tracked columns (order must match $sheets)
+     * @param  array<string, list<int>>  $syncPointCrcs  entry path => running CRC32 per
+     *     sync point, aligned 1:1 with that sheet's sync_points. Pass [] to omit
+     *     the SCRC section entirely; when present every sheet's list length MUST
+     *     equal its sync_point count.
+     * @param  array<string, array<int, string>>  $columnDigests  entry path =>
+     *     1-based column => serialized TDigest payload. Pass [] to omit the
+     *     TDIG section entirely.
+     * @param  array<string, array<int, string>>  $columnHlls  entry path =>
+     *     1-based column => serialized HyperLogLog payload. Pass [] to omit
+     *     the CHLL section entirely.
      */
-    public static function encode(int $syncPeriod, array $sheets, array $columnStats = []): string
+    public static function encode(int $syncPeriod, array $sheets, array $columnStats = [], array $syncPointCrcs = [], array $columnDigests = [], array $columnHlls = []): string
     {
         $body = '';
         foreach ($sheets as $sheet) {
@@ -156,11 +204,63 @@ class RandomAccessIndex
             $body .= self::TAG_STATS.pack('V', strlen($stat)).$stat;
         }
 
+        if ($syncPointCrcs !== []) {
+            $scrc = '';
+            foreach ($sheets as $sheet) {
+                $crcs = $syncPointCrcs[$sheet['entry']] ?? [];
+                if (count($crcs) !== count($sheet['sync_points'])) {
+                    throw new \InvalidArgumentException(
+                        "SCRC list for '{$sheet['entry']}' has ".count($crcs).
+                        ' entries but the sheet has '.count($sheet['sync_points']).' sync points'
+                    );
+                }
+                $scrc .= pack('V', count($crcs));
+                foreach ($crcs as $crc) {
+                    $scrc .= pack('V', $crc);
+                }
+            }
+            $body .= self::TAG_SYNC_CRCS.pack('V', strlen($scrc)).$scrc;
+        }
+
+        if ($columnDigests !== []) {
+            $tdig = self::encodeSketchSection($sheets, $columnDigests);
+            $body .= self::TAG_TDIGEST.pack('V', strlen($tdig)).$tdig;
+        }
+
+        if ($columnHlls !== []) {
+            $chll = self::encodeSketchSection($sheets, $columnHlls);
+            $body .= self::TAG_HLL.pack('V', strlen($chll)).$chll;
+        }
+
         $header = self::MAGIC;
         $header .= pack('CCv', self::VERSION, 0, count($sheets));
         $header .= pack('V', $syncPeriod);
         $header .= pack('V', crc32($body));
 
         return $header.$body;
+    }
+
+    /**
+     * Shared frame for the TDIG and CHLL sections: one record per sheet
+     * in core-body order (positional alignment, like STAT/SCRC — sheets
+     * without sketches contribute a count-0 record), each record listing
+     * (column, payload_len, payload) triples in ascending column order.
+     *
+     * @param  list<array{entry: string}>  $sheets  core-body sheet order (extra keys ignored)
+     * @param  array<string, array<int, string>>  $byEntry  entry path => 1-based column => sketch payload
+     */
+    private static function encodeSketchSection(array $sheets, array $byEntry): string
+    {
+        $section = '';
+        foreach ($sheets as $sheet) {
+            $cols = $byEntry[$sheet['entry']] ?? [];
+            ksort($cols);
+            $section .= pack('v', count($cols));
+            foreach ($cols as $col => $payload) {
+                $section .= pack('vV', $col, strlen($payload)).$payload;
+            }
+        }
+
+        return $section;
     }
 }

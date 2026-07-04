@@ -1,0 +1,27 @@
+{
+    "sync_period": 100,
+    "sheets": [
+        {
+            "entry": "xl/worksheets/sheet1.xml",
+            "total_rows": 251,
+            "sheet_crc32": 1659890803,
+            "sync_points": [
+                {
+                    "row": 102,
+                    "comp_offset": 1423,
+                    "uncomp_offset": 10220
+                },
+                {
+                    "row": 202,
+                    "comp_offset": 2720,
+                    "uncomp_offset": 20720
+                }
+            ],
+            "sync_point_crcs": [
+                1372774634,
+                2635133833
+            ],
+            "column_stats": {}
+        }
+    ]
+}

@@ -1,0 +1,136 @@
+{
+    "sync_period": 100,
+    "sheets": [
+        {
+            "entry": "xl/worksheets/sheet1.xml",
+            "total_rows": 301,
+            "sheet_crc32": 1229517958,
+            "sync_points": [
+                {
+                    "row": 102,
+                    "comp_offset": 1836,
+                    "uncomp_offset": 11165
+                },
+                {
+                    "row": 202,
+                    "comp_offset": 3466,
+                    "uncomp_offset": 22555
+                },
+                {
+                    "row": 302,
+                    "comp_offset": 5096,
+                    "uncomp_offset": 33945
+                }
+            ],
+            "sync_point_crcs": [
+                1958395269,
+                2077870378,
+                1519316845
+            ],
+            "column_stats": {
+                "1": {
+                    "sorted_asc": true,
+                    "sorted_desc": false,
+                    "blocks": [
+                        {
+                            "min": 1,
+                            "max": 100,
+                            "sum": 5050,
+                            "count": 100,
+                            "other": 1
+                        },
+                        {
+                            "min": 101,
+                            "max": 200,
+                            "sum": 15050,
+                            "count": 100,
+                            "other": 0
+                        },
+                        {
+                            "min": 201,
+                            "max": 300,
+                            "sum": 25050,
+                            "count": 100,
+                            "other": 0
+                        },
+                        {
+                            "min": 0,
+                            "max": 0,
+                            "sum": 0,
+                            "count": 0,
+                            "other": 0
+                        }
+                    ]
+                },
+                "2": {
+                    "sorted_asc": false,
+                    "sorted_desc": true,
+                    "blocks": [
+                        {
+                            "min": 900,
+                            "max": 999,
+                            "sum": 94950,
+                            "count": 100,
+                            "other": 1
+                        },
+                        {
+                            "min": 800,
+                            "max": 899,
+                            "sum": 84950,
+                            "count": 100,
+                            "other": 0
+                        },
+                        {
+                            "min": 700,
+                            "max": 799,
+                            "sum": 74950,
+                            "count": 100,
+                            "other": 0
+                        },
+                        {
+                            "min": 0,
+                            "max": 0,
+                            "sum": 0,
+                            "count": 0,
+                            "other": 0
+                        }
+                    ]
+                },
+                "3": {
+                    "sorted_asc": false,
+                    "sorted_desc": false,
+                    "blocks": [
+                        {
+                            "min": 0,
+                            "max": 99,
+                            "sum": 4950,
+                            "count": 100,
+                            "other": 1
+                        },
+                        {
+                            "min": 0,
+                            "max": 99,
+                            "sum": 4950,
+                            "count": 100,
+                            "other": 0
+                        },
+                        {
+                            "min": 0,
+                            "max": 99,
+                            "sum": 4950,
+                            "count": 100,
+                            "other": 0
+                        },
+                        {
+                            "min": 0,
+                            "max": 0,
+                            "sum": 0,
+                            "count": 0,
+                            "other": 0
+                        }
+                    ]
+                }
+            }
+        }
+    ]
+}

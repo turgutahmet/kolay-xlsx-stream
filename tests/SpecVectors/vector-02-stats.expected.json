@@ -1,0 +1,68 @@
+{
+    "sync_period": 100,
+    "sheets": [
+        {
+            "entry": "xl/worksheets/sheet1.xml",
+            "total_rows": 301,
+            "sheet_crc32": 1488283984,
+            "sync_points": [
+                {
+                    "row": 102,
+                    "comp_offset": 1912,
+                    "uncomp_offset": 13516
+                },
+                {
+                    "row": 202,
+                    "comp_offset": 3629,
+                    "uncomp_offset": 27367
+                },
+                {
+                    "row": 302,
+                    "comp_offset": 5345,
+                    "uncomp_offset": 41218
+                }
+            ],
+            "sync_point_crcs": [
+                2858521370,
+                2981632674,
+                3201279831
+            ],
+            "column_stats": {
+                "2": {
+                    "sorted_asc": false,
+                    "sorted_desc": false,
+                    "blocks": [
+                        {
+                            "min": 1.5,
+                            "max": 99.5,
+                            "sum": 4545,
+                            "count": 90,
+                            "other": 11
+                        },
+                        {
+                            "min": 1.5,
+                            "max": 99.5,
+                            "sum": 4545,
+                            "count": 90,
+                            "other": 10
+                        },
+                        {
+                            "min": 1.5,
+                            "max": 99.5,
+                            "sum": 4545,
+                            "count": 90,
+                            "other": 10
+                        },
+                        {
+                            "min": 0,
+                            "max": 0,
+                            "sum": 0,
+                            "count": 0,
+                            "other": 0
+                        }
+                    ]
+                }
+            }
+        }
+    ]
+}
