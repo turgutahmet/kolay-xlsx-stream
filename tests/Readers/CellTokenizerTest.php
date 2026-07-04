@@ -113,6 +113,58 @@ class CellTokenizerTest extends TestCase
         $this->assertSame([''], CellTokenizer::tokenizeRow($row));
     }
 
+    /**
+     * The dense fast path (v3.2) returns $byIdx directly when cells
+     * arrive 0,1,2,… with no gaps — these cases pin the bail conditions
+     * so the fast path can never leak a mis-shaped row.
+     */
+    public function test_out_of_order_cells_rebuild_dense_row(): void
+    {
+        $row = '<row r="1">'
+            .'<c r="C1" t="n"><v>3</v></c>'
+            .'<c r="A1" t="n"><v>1</v></c>'
+            .'<c r="B1" t="n"><v>2</v></c>'
+            .'</row>';
+
+        $this->assertSame(['1', '2', '3'], CellTokenizer::tokenizeRow($row));
+    }
+
+    public function test_duplicate_cell_ref_last_write_wins(): void
+    {
+        $row = '<row r="1">'
+            .'<c r="A1" t="n"><v>old</v></c>'
+            .'<c r="A1" t="n"><v>new</v></c>'
+            .'</row>';
+
+        $this->assertSame(['new'], CellTokenizer::tokenizeRow($row));
+    }
+
+    public function test_refless_cell_after_gap_lands_on_next_index(): void
+    {
+        // First cell pins C1 (index 2); the ref-less cell that follows
+        // takes maxIdx+1 (index 3). Gap positions fill with ''.
+        $row = '<row r="1">'
+            .'<c r="C1" t="n"><v>7</v></c>'
+            .'<c t="n"><v>8</v></c>'
+            .'</row>';
+
+        $this->assertSame(['', '', '7', '8'], CellTokenizer::tokenizeRow($row));
+    }
+
+    public function test_inline_string_with_attribute_takes_generic_path(): void
+    {
+        // <t xml:space="preserve"> must NOT match the plain <is><t> fast
+        // path — the attribute shifts the body shape to the generic walk.
+        $row = '<row r="1"><c r="A1" t="inlineStr"><is><t xml:space="preserve">  a  </t></is></c></row>';
+        $this->assertSame(['  a  '], CellTokenizer::tokenizeRow($row));
+    }
+
+    public function test_error_cell_yields_literal(): void
+    {
+        $row = '<row r="1"><c r="A1" t="e"><v>#N/A</v></c></row>';
+        $this->assertSame(['#N/A'], CellTokenizer::tokenizeRow($row));
+    }
+
     public function test_multiple_cells_mixed_types(): void
     {
         $row = '<row r="1">'

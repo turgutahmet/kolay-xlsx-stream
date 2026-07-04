@@ -49,6 +49,7 @@ class StreamingSheetReader
     private string $sheetEntry;
     private int $chunkSize;
     private ?SharedStrings $sst;
+    private ?DateDetection $dates;
 
     public function __construct(
         Source $source,
@@ -56,12 +57,14 @@ class StreamingSheetReader
         string $sheetEntry = 'xl/worksheets/sheet1.xml',
         int $chunkSize = 65536,
         ?SharedStrings $sst = null,
+        ?DateDetection $dates = null,
     ) {
         $this->source = $source;
         $this->cd = $cd;
         $this->sheetEntry = $sheetEntry;
         $this->chunkSize = $chunkSize;
         $this->sst = $sst;
+        $this->dates = $dates;
     }
 
     /**
@@ -91,15 +94,71 @@ class StreamingSheetReader
      * convention. This gives callers a direct way to filter by row
      * range without re-deriving position.
      *
+     * $fastForwardTo skips every row BEFORE that row number without
+     * tokenizing it: the inflated stream is consumed in boundary-count
+     * mode — the same '</row>' counting countRows() uses, at the same
+     * ~35x speedup over tokenization — until the target's preceding
+     * boundary passes, then row assembly resumes from the byte after
+     * it. The first yield is row $fastForwardTo (or nothing when the
+     * sheet ends first). Correctness rides on the counting equivalence
+     * documented on countRows(): every yield of this generator consumes
+     * exactly one '</row>', self-closing empty rows included, so "skip
+     * K yields" and "skip K boundaries" are the same operation. Values
+     * at or below $startingRowNumber are a no-op — callers can pass
+     * their target row unconditionally.
+     *
      * @return \Generator<int, array<int, mixed>>
      */
-    public function rowsFromOffset(?int $compOffset, int $startingRowNumber): \Generator
+    public function rowsFromOffset(?int $compOffset, int $startingRowNumber, ?int $fastForwardTo = null): \Generator
     {
         $rowNumber = $startingRowNumber;
         $buffer = '';
 
+        // Boundaries (= yields, see above) still to skip before the
+        // tokenizer takes over. The 5-byte carry mirrors countRows():
+        // the needle is 6 bytes, so a carry alone can never complete a
+        // match (no double counting) while a boundary straddling two
+        // chunks is fully visible in carry+chunk.
+        $skipRemaining = $fastForwardTo !== null ? max(0, $fastForwardTo - $startingRowNumber) : 0;
+        $carry = '';
+
         foreach ($this->inflatedChunks($compOffset) as $inflated) {
-            $buffer .= $inflated;
+            if ($skipRemaining > 0) {
+                $scan = $carry.$inflated;
+                $found = substr_count($scan, '</row>');
+                if ($found < $skipRemaining) {
+                    $skipRemaining -= $found;
+                    $carry = substr($scan, -5);
+
+                    continue;
+                }
+
+                // The last boundary to skip closes inside this chunk.
+                // Locate it and hand everything after it to the row
+                // assembler: the bytes between that '</row>' and the
+                // next row opening are inter-row filler findRowOpen()
+                // skips naturally, so no re-alignment is needed. The
+                // carry bytes double as buffer prefix here — positions
+                // in $scan already account for them, and a match seen
+                // by substr_count can start in the carry, so the locate
+                // walk must run over the same string.
+                $pos = 0;
+                for ($i = 0; $i < $skipRemaining; $i++) {
+                    $next = strpos($scan, '</row>', $pos);
+                    if ($next === false) {
+                        break; // unreachable — substr_count counted >= $skipRemaining matches
+                    }
+                    $pos = $next + 6;
+                }
+                $buffer = substr($scan, $pos);
+                // Total boundaries skipped across all chunks is exactly
+                // ($fastForwardTo - $startingRowNumber), one per yield
+                // the tokenizer never saw.
+                $rowNumber = $fastForwardTo;
+                $skipRemaining = 0;
+            } else {
+                $buffer .= $inflated;
+            }
 
             $cursor = 0;
             while (true) {
@@ -113,7 +172,7 @@ class StreamingSheetReader
                 }
                 $rowXml = substr($buffer, $rowStart, $rowEnd + 6 - $rowStart);
                 $cursor = $rowEnd + 6;
-                yield $rowNumber => CellTokenizer::tokenizeRow($rowXml, $this->sst);
+                yield $rowNumber => CellTokenizer::tokenizeRow($rowXml, $this->sst, $this->dates);
                 $rowNumber++;
             }
 

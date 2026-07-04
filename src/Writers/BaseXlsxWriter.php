@@ -3,6 +3,8 @@
 namespace Kolay\XlsxStream\Writers;
 
 use Kolay\XlsxStream\Exceptions\XlsxStreamException;
+use Kolay\XlsxStream\Sketches\HyperLogLog;
+use Kolay\XlsxStream\Sketches\TDigest;
 use Kolay\XlsxStream\Styles\StyleRegistry;
 
 /**
@@ -197,6 +199,16 @@ abstract class BaseXlsxWriter
      */
     protected array $indexSyncPoints = [];
 
+    /**
+     * Running CRC32 of the sheet's uncompressed bytes at each sync point,
+     * keyed by sheet entry path and aligned 1:1 with $indexSyncPoints —
+     * value k covers exactly the first uncomp_offset bytes of sync point
+     * k. Serialized as the KXSI "SCRC" TLV section.
+     *
+     * @var array<string, list<int>>
+     */
+    protected array $indexSyncPointCrcs = [];
+
     // Column statistics (opt-in via withColumnStats). For each tracked
     // column the writer accumulates min/max/sum/count per index block —
     // the row span between two sync points — plus a per-sheet sorted
@@ -219,6 +231,47 @@ abstract class BaseXlsxWriter
 
     /** @var array<string, array<int, array{asc: bool, desc: bool}>> final sortedness per sheet: entry => col => flags */
     protected array $indexColumnSorted = [];
+
+    // Column sketches (opt-in via withColumnSketches, orthogonal to
+    // withColumnStats). For each tracked column the writer feeds one
+    // whole-sheet t-digest (numeric values, same inclusion rule as STAT)
+    // and one HyperLogLog (canonical string of every non-empty value).
+    // Serialized as the KXSI "TDIG" and "CHLL" TLV sections; the reader
+    // answers quantile/median/countDistinct from the sidecar alone.
+    // The header row is EXCLUDED — see withColumnSketches().
+
+    /** @var list<int> 1-based column indexes tracked for sketches */
+    protected array $sketchColumns = [];
+
+    /** @var array<int, TDigest> current-sheet t-digest per tracked column */
+    protected array $sketchDigestAccum = [];
+
+    /** @var array<int, HyperLogLog> current-sheet HLL per tracked column */
+    protected array $sketchHllAccum = [];
+
+    /**
+     * Row-side staging for the sketches: per tracked column, numeric
+     * values and canonical strings collect here and bulk-feed the
+     * sketches (addMany) every SKETCH_FLUSH_ROWS rows. Batching halves
+     * the measured per-cell cost versus per-value add() calls — the
+     * dominant expense was PHP call plumbing, not the sketch math.
+     *
+     * @var array<int, list<float>>
+     */
+    protected array $sketchNumBuffer = [];
+
+    /** @var array<int, list<string>> */
+    protected array $sketchStrBuffer = [];
+
+    protected int $sketchRowsBuffered = 0;
+
+    protected const SKETCH_FLUSH_ROWS = 512;
+
+    /** @var array<string, array<int, string>> finished sheets: entry => col => serialized TDigest */
+    protected array $indexColumnDigests = [];
+
+    /** @var array<string, array<int, string>> finished sheets: entry => col => serialized HyperLogLog */
+    protected array $indexColumnHlls = [];
 
     public function __construct()
     {
@@ -330,6 +383,66 @@ abstract class BaseXlsxWriter
         $columns = array_values(array_unique($columns));
         sort($columns);
         $this->statsColumns = $columns;
+
+        return $this;
+    }
+
+    /**
+     * Track file-level approximate-statistics sketches for the given
+     * 1-based columns and embed them in the random-access sidecar
+     * ("TDIG" + "CHLL" TLV sections older readers transparently ignore).
+     *
+     * Per sheet, per tracked column, the writer maintains:
+     *   - a merging t-digest (δ=100, ~1-4 KB serialized) over the
+     *     column's numeric values — the reader answers quantile() and
+     *     median() from the sidecar alone;
+     *   - a HyperLogLog (p=11, ~2 KB, ±~2.3%) over the canonical string
+     *     of every non-empty value — countDistinct() likewise. Text
+     *     columns are first-class here: non-numeric values are invisible
+     *     to the t-digest (like STAT) but fully counted by the HLL.
+     *
+     * Both sketches merge associatively, so per-sheet (and, later,
+     * per-segment) sketches can be combined without touching row data.
+     *
+     * The header row is EXCLUDED from both sketches — deliberately the
+     * opposite of withColumnStats(), which folds the header into block 0.
+     * Zone maps are pruning structures: missing a matchable row breaks
+     * query soundness, so STAT must over-include. Sketches are estimates
+     * of the DATA distribution: folding a header in cannot make any
+     * answer "safer", it can only bias quantiles and inflate distinct
+     * counts by one phantom value.
+     *
+     * Orthogonal to withColumnStats() — enable either or both; each
+     * implies withRandomAccessIndex() (default period if not already on).
+     *
+     * Cost: ~0.4 µs per tracked cell (one xxh64 hash + canonical string
+     * + a batched digest fold — measured ~10 % wall time with 2 tracked
+     * columns on a realistic 12-column export), and ~3-6 KB of sidecar
+     * per (sheet × column).
+     */
+    public function withColumnSketches(array $columns): self
+    {
+        if ($this->started) {
+            throw XlsxStreamException::alreadyStarted();
+        }
+        if ($columns === []) {
+            throw new XlsxStreamException('withColumnSketches() needs at least one column index.');
+        }
+        foreach ($columns as $col) {
+            if (! is_int($col) || $col < 1 || $col > self::MAX_COLUMNS) {
+                throw new XlsxStreamException(
+                    'withColumnSketches() expects 1-based integer column indexes; got: '.var_export($col, true)
+                );
+            }
+        }
+
+        if (! $this->randomAccessIndexEnabled) {
+            $this->withRandomAccessIndex();
+        }
+
+        $columns = array_values(array_unique($columns));
+        sort($columns);
+        $this->sketchColumns = $columns;
 
         return $this;
     }
@@ -717,6 +830,9 @@ abstract class BaseXlsxWriter
         if ($this->statsColumns !== []) {
             $this->accumulateColumnStats($row);
         }
+        if ($this->sketchColumns !== []) {
+            $this->accumulateColumnSketches($row);
+        }
 
         $rowXml = $this->buildRowXml($this->currentSheetRow, $row, $styleId);
 
@@ -976,6 +1092,14 @@ abstract class BaseXlsxWriter
         hash_update($this->crcContext, $this->rowBuffer);
         $this->sheetUncompressedSize += strlen($this->rowBuffer);
 
+        // Running CRC of the uncompressed prefix this sync point pins —
+        // exactly the first uncomp_offset bytes. hash_copy leaves the
+        // live context untouched (finalizing it would kill the sheet
+        // CRC); hexdec mirrors how finishCurrentSheet derives sheetCrc.
+        // Feeds the KXSI "SCRC" TLV section. Cost: ~70 ns per sync
+        // point, ~0.4 % of the hash_update it rides along with.
+        $runningCrc = hexdec(hash_final(hash_copy($this->crcContext)));
+
         $compressed = deflate_add($this->deflateCtx, $this->rowBuffer, ZLIB_FULL_FLUSH);
         if ($compressed !== false && strlen($compressed) > 0) {
             $this->writeToDest($compressed);
@@ -991,6 +1115,7 @@ abstract class BaseXlsxWriter
             'comp_offset' => $this->sheetCompressedSize,
             'uncomp_offset' => $this->sheetUncompressedSize,
         ];
+        $this->indexSyncPointCrcs[$entry][] = $runningCrc;
 
         // The rows flushed above complete an index block; snapshot the
         // column-stat accumulators so block k always spans exactly the
@@ -1073,6 +1198,139 @@ abstract class BaseXlsxWriter
     }
 
     /**
+     * Stage one data row's tracked-column values for the current sheet's
+     * sketches. Numeric interpretation for the t-digest is EXACTLY the
+     * STAT rule (statNumericValue), so quantiles describe the same value
+     * population columnStats() aggregates — except non-finite floats,
+     * which would poison every centroid mean and are skipped (STAT's
+     * min/max tolerate them; a t-digest cannot). The HLL hashes the
+     * canonical string of every non-empty value, numeric or not.
+     *
+     * Values are appended to per-column buffers and bulk-fed to the
+     * sketches every SKETCH_FLUSH_ROWS rows (flushSketchBuffers) — the
+     * common string/int/float cases are dispatched inline because the
+     * helper-method calls were the measured hot cost, not the sketch
+     * math; rare types (bool/DateTime/objects) take the readable path.
+     *
+     * Called only from writeRow() — never for the header row, which the
+     * preamble emits. That exclusion is the documented TDIG/CHLL
+     * semantic, not an accident of plumbing (see withColumnSketches).
+     */
+    protected function accumulateColumnSketches(array $row): void
+    {
+        if (! array_is_list($row)) {
+            $row = array_values($row);
+        }
+
+        foreach ($this->sketchColumns as $col) {
+            $value = $row[$col - 1] ?? null;
+
+            if ($value === null) {
+                continue;
+            }
+            if (is_string($value)) {
+                if ($value === '') {
+                    continue;
+                }
+                $this->sketchStrBuffer[$col][] = $value;
+                if (is_numeric($value)) {
+                    $v = (float) $value;
+                    if (is_finite($v)) { // '1e999' is numeric but overflows to INF
+                        $this->sketchNumBuffer[$col][] = $v;
+                    }
+                }
+                continue;
+            }
+            if (is_int($value)) {
+                $this->sketchNumBuffer[$col][] = (float) $value;
+                $this->sketchStrBuffer[$col][] = (string) $value;
+                continue;
+            }
+            if (is_float($value)) {
+                if (is_finite($value)) {
+                    $this->sketchNumBuffer[$col][] = $value;
+                }
+                $this->sketchStrBuffer[$col][] = (string) $value;
+                continue;
+            }
+
+            // Rare types: bool, DateTime, Stringable objects.
+            $v = $this->statNumericValue($value);
+            if ($v !== null && is_finite($v)) {
+                $this->sketchNumBuffer[$col][] = $v;
+            }
+            $canonical = $this->sketchCanonicalString($value);
+            if ($canonical !== null) {
+                $this->sketchStrBuffer[$col][] = $canonical;
+            }
+        }
+
+        if (++$this->sketchRowsBuffered >= self::SKETCH_FLUSH_ROWS) {
+            $this->flushSketchBuffers();
+        }
+    }
+
+    /**
+     * Drain the per-column staging buffers into the sheet's sketches.
+     * Runs every SKETCH_FLUSH_ROWS rows and right before the sheet's
+     * sketches are serialized (finishCurrentSheet).
+     */
+    protected function flushSketchBuffers(): void
+    {
+        foreach ($this->sketchColumns as $col) {
+            if (($this->sketchNumBuffer[$col] ?? []) !== []) {
+                $this->sketchDigestAccum[$col]->addMany($this->sketchNumBuffer[$col]);
+                $this->sketchNumBuffer[$col] = [];
+            }
+            if (($this->sketchStrBuffer[$col] ?? []) !== []) {
+                $this->sketchHllAccum[$col]->addMany($this->sketchStrBuffer[$col]);
+                $this->sketchStrBuffer[$col] = [];
+            }
+        }
+        $this->sketchRowsBuffered = 0;
+    }
+
+    /**
+     * Canonical string a cell value is hashed under for distinct
+     * counting (the KXSI "CHLL" canonicalization rule, SPEC.md §4.4):
+     *
+     *   - null and '' → excluded entirely (an empty cell is the absence
+     *     of a value, not a distinct value);
+     *   - strings → as-is, byte-exact, before any XML escaping;
+     *   - int/float → PHP's decimal rendering `(string) $value` — the
+     *     same text buildRowXml writes into the cell's <v>;
+     *   - bool → '1' / '0' (matches the <v> of a t="b" cell);
+     *   - DateTimeInterface → decimal rendering of its Excel serial
+     *     (matches the <v> of the date cell);
+     *   - other objects → `(string) $value` (the inlineStr rendering).
+     *
+     * countDistinct is therefore over canonical FORMS, not typed
+     * identity: int 7 and the string '7' collapse (both render '7'),
+     * while '1.50' stays distinct from 1.5 (strings hash as-is even
+     * though the number cell renders '1.5').
+     */
+    protected function sketchCanonicalString(mixed $value): ?string
+    {
+        if ($value === null) {
+            return null;
+        }
+        if (is_string($value)) {
+            return $value === '' ? null : $value;
+        }
+        if (is_int($value) || is_float($value)) {
+            return (string) $value;
+        }
+        if (is_bool($value)) {
+            return $value ? '1' : '0';
+        }
+        if ($value instanceof \DateTimeInterface) {
+            return (string) (($value->getTimestamp() - self::EXCEL_EPOCH_TIMESTAMP) / 86400);
+        }
+
+        return (string) $value;
+    }
+
+    /**
      * Numeric interpretation of a cell for statistics purposes, aligned
      * with how buildRowXml renders the value (DateTime -> Excel serial,
      * bool -> 0/1, numeric strings -> their numeric value). Null means
@@ -1117,6 +1375,7 @@ abstract class BaseXlsxWriter
     {
         $sheetSections = [];
         $columnStats = [];
+        $syncPointCrcs = [];
         foreach ($this->sheets as $sheet) {
             $entry = $sheet['filename'];
             $sheetSections[] = [
@@ -1125,6 +1384,10 @@ abstract class BaseXlsxWriter
                 'sheet_crc32' => $sheet['crc32'] ?? 0,
                 'sync_points' => $this->indexSyncPoints[$entry] ?? [],
             ];
+            // Always present when the index is enabled — a sheet without
+            // sync points contributes an empty (count = 0) SCRC record so
+            // the section stays aligned with the core body.
+            $syncPointCrcs[$entry] = $this->indexSyncPointCrcs[$entry] ?? [];
 
             if ($this->statsColumns !== []) {
                 $cols = [];
@@ -1141,7 +1404,14 @@ abstract class BaseXlsxWriter
             }
         }
 
-        return RandomAccessIndex::encode($this->indexSyncPeriod, $sheetSections, $columnStats);
+        return RandomAccessIndex::encode(
+            $this->indexSyncPeriod,
+            $sheetSections,
+            $columnStats,
+            $syncPointCrcs,
+            $this->indexColumnDigests,
+            $this->indexColumnHlls
+        );
     }
 
     /**
@@ -1218,6 +1488,22 @@ abstract class BaseXlsxWriter
             if ($this->columns !== []) {
                 $this->accumulateColumnStats($this->columns, trackOrder: false);
             }
+        }
+
+        // Fresh sheet -> fresh sketches (auto-split sheets each carry
+        // their own — the sections are per-sheet and merge-friendly).
+        // The header row is deliberately NOT folded in here: sketches
+        // estimate the data distribution, they prune nothing, so the
+        // STAT header-fold soundness argument does not apply and folding
+        // would only bias the estimates (see withColumnSketches).
+        if ($this->sketchColumns !== []) {
+            foreach ($this->sketchColumns as $col) {
+                $this->sketchDigestAccum[$col] = new TDigest();
+                $this->sketchHllAccum[$col] = new HyperLogLog();
+                $this->sketchNumBuffer[$col] = [];
+                $this->sketchStrBuffer[$col] = [];
+            }
+            $this->sketchRowsBuffered = 0;
         }
 
         [$mtime, $mdate] = $this->dosTimeParts(time());
@@ -1519,6 +1805,19 @@ abstract class BaseXlsxWriter
             foreach ($this->statsColumns as $col) {
                 $s = $this->statsSorted[$col];
                 $this->indexColumnSorted[$entry][$col] = ['asc' => $s['asc'], 'desc' => $s['desc']];
+            }
+        }
+
+        // Snapshot the sheet's sketches in serialized form — drain the
+        // row-side staging buffers first; serialize() then folds any
+        // values still buffered inside the digest, so the stored payload
+        // is the final canonical sketch for the sheet.
+        if ($this->sketchColumns !== []) {
+            $this->flushSketchBuffers();
+            $entry = $sheetInfo['filename'];
+            foreach ($this->sketchColumns as $col) {
+                $this->indexColumnDigests[$entry][$col] = $this->sketchDigestAccum[$col]->serialize();
+                $this->indexColumnHlls[$entry][$col] = $this->sketchHllAccum[$col]->serialize();
             }
         }
     }

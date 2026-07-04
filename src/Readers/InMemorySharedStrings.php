@@ -6,14 +6,14 @@ use Kolay\XlsxStream\Exceptions\XlsxReadException;
 
 /**
  * In-memory shared-strings lookup. Backed by a list<string> indexed
- * positionally. Construction is via SharedStringsParser::parseInMemory()
- * for production use; direct instantiation is for tests and
- * pre-resolved tables.
+ * positionally.
  *
- * Used when the archive's xl/sharedStrings.xml stays under the size
- * threshold the reader applies (default 20 MB compressed). Beyond that
- * threshold the reader refuses to load the table; an on-disk index
- * variant is tracked as a future addition.
+ * As of v3.2 the reader no longer constructs this class —
+ * SharedStringsParser builds a PackedSharedStrings instead, whose flat
+ * payload+offset buffers avoid the ~57 bytes/entry PHP-array overhead
+ * measured on large tables. This implementation is kept for callers
+ * (and tests) that hold a pre-resolved list<string> and want the
+ * simplest possible SharedStrings to hand to a StreamingSheetReader.
  */
 class InMemorySharedStrings implements SharedStrings
 {

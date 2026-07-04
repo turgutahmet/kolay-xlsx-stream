@@ -2,7 +2,23 @@
 
 namespace Kolay\XlsxStream\Readers;
 
+use function count;
+// Function imports matter here: unqualified calls from inside a namespace
+// pay a per-call namespace-fallback lookup when opcache can't specialize
+// them (CLI runs, disabled opcache). In this hot loop that lookup was a
+// measurable ~5-8% of tokenization.
+use function html_entity_decode;
+
 use Kolay\XlsxStream\Exceptions\XlsxReadException;
+
+use function ord;
+use function rtrim;
+use function str_starts_with;
+use function strcspn;
+use function strlen;
+use function strpos;
+use function substr;
+use function substr_compare;
 
 /**
  * @internal
@@ -46,14 +62,32 @@ class CellTokenizer
      * files written with a deduplicated string table). Files written by
      * SinkableXlsxWriter never use t="s", so $sst is optional.
      *
+     * Pass a DateDetection bundle (reader's autoDetectDates() opt-in)
+     * to convert numeric cells whose s="N" style renders as a date.
+     * Detection dispatches to a dedicated loop up front: folding the
+     * style checks into this loop cost the default path a consistent
+     * ~1% on the tokenizer A/B corpus (one extra null-compare and a
+     * wider destructure per CELL), so the two paths share their
+     * helpers but not their hot loop — a per-row ternary is the entire
+     * price of the feature when it's off.
+     *
      * @return array<int, mixed>
      */
-    public static function tokenizeRow(string $rowXml, ?SharedStrings $sst = null): array
+    public static function tokenizeRow(string $rowXml, ?SharedStrings $sst = null, ?DateDetection $dates = null): array
     {
+        if ($dates !== null) {
+            return self::tokenizeRowDetectingDates($rowXml, $sst, $dates);
+        }
+
         $byIdx = [];
         $maxIdx = -1;
         $cursor = 0;
         $len = strlen($rowXml);
+        // Writer-shaped rows arrive with cells in strictly increasing
+        // column order and no gaps; track that so the dense rebuild at
+        // the bottom (one array alloc + N writes per row) can be skipped
+        // for the overwhelmingly common case.
+        $dense = true;
 
         while (true) {
             $cellStart = strpos($rowXml, '<c', $cursor);
@@ -82,8 +116,16 @@ class CellTokenizer
                 $tagEnd - ($cellStart + 2) - ($isSelfClosing ? 1 : 0)
             );
 
-            $col = self::extractColumnRef($attrs);
-            $idx = $col !== null ? self::columnLettersToIndex($col) : ($maxIdx + 1);
+            // One left-to-right scan pulls r/t together — previously r
+            // and t each cost their own strpos walk over the attr blob.
+            // (s= is only captured by the date-detection twin of this
+            // loop; skipping it here preserves the scan's early exit.)
+            [$colLetters, $type] = self::extractCellAttrs($attrs);
+
+            $idx = $colLetters !== null ? self::columnLettersToIndex($colLetters) : ($maxIdx + 1);
+            if ($idx !== $maxIdx + 1) {
+                $dense = false;
+            }
             if ($idx > $maxIdx) {
                 $maxIdx = $idx;
             }
@@ -105,7 +147,6 @@ class CellTokenizer
             }
             $body = substr($rowXml, $bodyStart, $bodyEnd - $bodyStart);
 
-            $type = self::extractAttribute($attrs, 't');
             $byIdx[$idx] = self::parseCellBody($body, $type, $sst);
 
             $cursor = $bodyEnd + 4;
@@ -113,6 +154,118 @@ class CellTokenizer
 
         if ($maxIdx < 0) {
             return [];
+        }
+
+        // Dense fast path: cells arrived 0,1,2,…,maxIdx with no gaps and
+        // no duplicates, so $byIdx already IS the dense row (packed keys
+        // in insertion order). Duplicate refs or out-of-order cells clear
+        // $dense above and take the gap-filling rebuild below.
+        if ($dense && count($byIdx) === $maxIdx + 1) {
+            return $byIdx;
+        }
+
+        $row = [];
+        for ($i = 0; $i <= $maxIdx; $i++) {
+            $row[] = $byIdx[$i] ?? '';
+        }
+
+        return $row;
+    }
+
+    /**
+     * tokenizeRow's date-detecting twin — same scan, plus per-cell
+     * style capture and conversion. Structural duplication is the
+     * point, not an accident: any shared-loop formulation puts at
+     * least one detection branch inside the default path's per-cell
+     * hot loop, and that measured ~1% on the A/B corpus (see
+     * tokenizeRow). Keep the two loops in lockstep when touching
+     * either; the shared helpers (findTagEnd / extractCellAttrs /
+     * parseCellBody) carry all the actual parsing rules.
+     *
+     * A cell converts when ALL hold:
+     *   - it carries s= and the bitmap marks that style as a date
+     *   - its type is numeric (t="n" or no t at all — Excel's own
+     *     shape): shared/inline strings, booleans and error literals
+     *     keep their values no matter what the style claims
+     *   - its column is not in the bundle's skip set (explicit
+     *     castColumn precedence, query-path raw columns)
+     *
+     * @return array<int, mixed>
+     */
+    private static function tokenizeRowDetectingDates(string $rowXml, ?SharedStrings $sst, DateDetection $dates): array
+    {
+        $byIdx = [];
+        $maxIdx = -1;
+        $cursor = 0;
+        $len = strlen($rowXml);
+        $dense = true;
+
+        while (true) {
+            $cellStart = strpos($rowXml, '<c', $cursor);
+            if ($cellStart === false) {
+                break;
+            }
+
+            $next = $rowXml[$cellStart + 2] ?? '';
+            if ($next !== ' ' && $next !== '/' && $next !== '>' && $next !== "\t" && $next !== "\n") {
+                $cursor = $cellStart + 2;
+                continue;
+            }
+
+            $tagEnd = self::findTagEnd($rowXml, $cellStart + 2, $len);
+            if ($tagEnd === false) {
+                break;
+            }
+
+            $isSelfClosing = $rowXml[$tagEnd - 1] === '/';
+            $attrs = substr(
+                $rowXml,
+                $cellStart + 2,
+                $tagEnd - ($cellStart + 2) - ($isSelfClosing ? 1 : 0)
+            );
+
+            [$colLetters, $type, $style] = self::extractCellAttrs($attrs, true);
+
+            $idx = $colLetters !== null ? self::columnLettersToIndex($colLetters) : ($maxIdx + 1);
+            if ($idx !== $maxIdx + 1) {
+                $dense = false;
+            }
+            if ($idx > $maxIdx) {
+                $maxIdx = $idx;
+            }
+
+            if ($isSelfClosing) {
+                $byIdx[$idx] = '';
+                $cursor = $tagEnd + 1;
+                continue;
+            }
+
+            $bodyStart = $tagEnd + 1;
+            $bodyEnd = strpos($rowXml, '</c>', $bodyStart);
+            if ($bodyEnd === false) {
+                break;
+            }
+            $body = substr($rowXml, $bodyStart, $bodyEnd - $bodyStart);
+
+            $value = self::parseCellBody($body, $type, $sst);
+            if ($style !== null
+                && ($type === null || $type === 'n')
+                && ($dates->isDateByStyle[(int) $style] ?? false)
+                && ! isset($dates->skipColumns[$idx])
+            ) {
+                $value = ($dates->convert)($value);
+            }
+            $byIdx[$idx] = $value;
+
+            $cursor = $bodyEnd + 4;
+        }
+
+        if ($maxIdx < 0) {
+            return [];
+        }
+
+        if ($dense && count($byIdx) === $maxIdx + 1) {
+            return $byIdx;
         }
 
         $row = [];
@@ -127,28 +280,109 @@ class CellTokenizer
      * Walk forward from $start looking for the first '>' that closes the
      * tag. Quoted attribute values may contain '>', so respect quotes.
      * Returns the offset of '>' or false.
+     *
+     * strcspn jumps at C speed to the next interesting byte ('>', '"' or
+     * "'"), so the loop iterates once per quoted attribute value instead
+     * of once per character — this is the hottest inner loop of the read
+     * path and the char-by-char version dominated read CPU profiles.
      */
     private static function findTagEnd(string $s, int $start, int $len)
     {
-        $inQuote = '';
-        for ($i = $start; $i < $len; $i++) {
+        $i = $start;
+        while ($i < $len) {
+            $i += strcspn($s, '>"\'', $i);
+            if ($i >= $len) {
+                return false;
+            }
             $ch = $s[$i];
-            if ($inQuote !== '') {
-                if ($ch === $inQuote) {
-                    $inQuote = '';
-                }
-                continue;
-            }
-            if ($ch === '"' || $ch === "'") {
-                $inQuote = $ch;
-                continue;
-            }
             if ($ch === '>') {
                 return $i;
             }
+            // Quote — skip straight to its closing partner.
+            $close = strpos($s, $ch, $i + 1);
+            if ($close === false) {
+                return false;
+            }
+            $i = $close + 1;
         }
 
         return false;
+    }
+
+    /**
+     * Single pass over a cell's attribute blob extracting r="" and t=""
+     * (and, on request, s="") together. Attribute names are exact match
+     * on the full trimmed span before '=', so suffix collisions
+     * (xml:space= vs r=) cannot happen by construction — unlike a
+     * strpos-for-"r=" scan, which had to guard against them explicitly.
+     *
+     * $wantStyle is opt-in because writer-shaped cells carry no s= —
+     * demanding it would defeat the early exit and re-scan every attr
+     * blob to its end (measured ~8% of tokenization). The styles-aware
+     * date-detection layer passes true.
+     *
+     * @return array{0: ?string, 1: ?string, 2: ?string} [column letters, t, s]
+     */
+    private static function extractCellAttrs(string $attrs, bool $wantStyle = false): array
+    {
+        $r = null;
+        $t = null;
+        $s = null;
+        $pos = 0;
+        $len = strlen($attrs);
+
+        while ($pos < $len) {
+            $eq = strpos($attrs, '=', $pos);
+            if ($eq === false) {
+                break;
+            }
+            $nameStart = $pos;
+            while ($nameStart < $eq && ($attrs[$nameStart] === ' ' || $attrs[$nameStart] === "\t" || $attrs[$nameStart] === "\n")) {
+                $nameStart++;
+            }
+            $name = rtrim(substr($attrs, $nameStart, $eq - $nameStart));
+
+            $quote = $attrs[$eq + 1] ?? '';
+            if ($quote !== '"' && $quote !== "'") {
+                break;
+            }
+            $valEnd = strpos($attrs, $quote, $eq + 2);
+            if ($valEnd === false) {
+                break;
+            }
+            $val = substr($attrs, $eq + 2, $valEnd - $eq - 2);
+
+            if ($name === 'r') {
+                $r = $val;
+            } elseif ($name === 't') {
+                $t = $val;
+            } elseif ($wantStyle && $name === 's') {
+                $s = $val;
+            }
+            $pos = $valEnd + 1;
+            if ($r !== null && $t !== null && (! $wantStyle || $s !== null)) {
+                break;
+            }
+        }
+
+        if ($r === null) {
+            return [null, $t, $s];
+        }
+
+        // Pull the column letters off the front of "AB42".
+        $letters = '';
+        $rl = strlen($r);
+        for ($i = 0; $i < $rl; $i++) {
+            $c = $r[$i];
+            if ($c >= 'A' && $c <= 'Z') {
+                $letters .= $c;
+
+                continue;
+            }
+            break;
+        }
+
+        return [$letters === '' ? null : $letters, $t, $s];
     }
 
     /**
@@ -161,8 +395,21 @@ class CellTokenizer
         }
 
         if ($type === 'inlineStr') {
-            // Concatenate every <t>...</t> within the body (handles plain
-            // <is><t>x</t></is> and rich-text <is><r><t>a</t></r><r><t>b</t></r></is>).
+            // Fast path: the exact single-run shape this package's writer
+            // emits — <is><t>…</t></is> with no attributes. One substr
+            // instead of the generic <t>-collecting walk. (Length guard:
+            // substr_compare with a negative offset throws on strings
+            // shorter than the needle.)
+            if (strlen($body) >= 16
+                && str_starts_with($body, '<is><t>')
+                && substr_compare($body, '</t></is>', -9) === 0
+            ) {
+                return self::xmlDecode(substr($body, 7, -9));
+            }
+
+            // Generic path: concatenate every <t>...</t> within the body
+            // (handles <t xml:space="preserve"> and rich-text runs
+            // <is><r><t>a</t></r><r><t>b</t></r></is>).
             return self::xmlDecode(self::extractAllT($body));
         }
 
@@ -244,68 +491,6 @@ class CellTokenizer
         }
 
         return $out;
-    }
-
-    private static function extractAttribute(string $attrs, string $name): ?string
-    {
-        // Match: <space>name="value"  or starts of string.
-        // Scan linearly — attributes are short and we never backtrack.
-        $needle = $name.'=';
-        $pos = 0;
-        $len = strlen($attrs);
-
-        while ($pos < $len) {
-            $found = strpos($attrs, $needle, $pos);
-            if ($found === false) {
-                return null;
-            }
-            // Must be at start of $attrs OR preceded by whitespace; otherwise
-            // it's a suffix of another attribute name (e.g. xml:space=).
-            $prev = $found > 0 ? $attrs[$found - 1] : ' ';
-            if ($prev !== ' ' && $prev !== "\t" && $prev !== "\n" && $found !== 0) {
-                $pos = $found + strlen($needle);
-                continue;
-            }
-
-            $valStart = $found + strlen($needle);
-            $quote = $attrs[$valStart] ?? '';
-            if ($quote !== '"' && $quote !== "'") {
-                return null;
-            }
-            $valEnd = strpos($attrs, $quote, $valStart + 1);
-            if ($valEnd === false) {
-                return null;
-            }
-
-            return substr($attrs, $valStart + 1, $valEnd - $valStart - 1);
-        }
-
-        return null;
-    }
-
-    /**
-     * Pull the column letters out of an r="A1" / r="AB42" attribute.
-     */
-    private static function extractColumnRef(string $attrs): ?string
-    {
-        $r = self::extractAttribute($attrs, 'r');
-        if ($r === null) {
-            return null;
-        }
-
-        $letters = '';
-        $len = strlen($r);
-        for ($i = 0; $i < $len; $i++) {
-            $c = $r[$i];
-            if ($c >= 'A' && $c <= 'Z') {
-                $letters .= $c;
-
-                continue;
-            }
-            break;
-        }
-
-        return $letters === '' ? null : $letters;
     }
 
     /**
