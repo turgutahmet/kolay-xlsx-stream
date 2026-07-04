@@ -108,7 +108,9 @@ fwrite(STDERR, "Reading '{$mode}' x{$runs} ({$rows} rows)...\n");
 for ($r = 1; $r <= $runs; $r++) {
     $out = shell_exec(sprintf(
         '%s %s --child %s 2>/dev/null',
-        escapeshellarg($php), escapeshellarg($self), escapeshellarg($fixture)
+        escapeshellarg($php),
+        escapeshellarg($self),
+        escapeshellarg($fixture)
     ));
     $data = json_decode(trim((string) $out), true);
     if (! is_array($data) || ! isset($data['seconds'])) {

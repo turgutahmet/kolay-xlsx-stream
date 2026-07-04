@@ -174,7 +174,11 @@ foreach ($ops as $op) {
     foreach (range(1, $runs) as $r) {
         $out = shell_exec(sprintf(
             '%s %s --child %s %s %d 2>/dev/null',
-            escapeshellarg($php), escapeshellarg($self), escapeshellarg($op), escapeshellarg($fixture), $rows
+            escapeshellarg($php),
+            escapeshellarg($self),
+            escapeshellarg($op),
+            escapeshellarg($fixture),
+            $rows
         ));
         $data = json_decode(trim((string) $out), true);
         if (! is_array($data)) {
