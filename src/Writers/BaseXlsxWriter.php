@@ -68,6 +68,24 @@ abstract class BaseXlsxWriter
     // Using 1899-12-30 as base so Unix timestamps map correctly for all post-1900 dates.
     public const EXCEL_EPOCH_TIMESTAMP = -2209161600; // 1899-12-30 00:00:00 UTC
 
+    // XML escaping (hot path). PCRE with a JIT-compiled character class is
+    // used as the "does this string need work?" gate instead of strpbrk:
+    // strpbrk is a naive O(n*m) double loop and the 34-char needle (escape
+    // chars + control bytes) makes clean strings — the overwhelming common
+    // case — pay ~5x more than a JIT class, which compiles to a 256-bit
+    // bitmap and scans O(n) with a flat constant. Both patterns must cover
+    // exactly: & < > " ' plus XML-1.0-invalid control bytes (0x00-0x08,
+    // 0x0B, 0x0C, 0x0E-0x1F — tab/LF/CR excluded, they are legal).
+    private const XML_ESCAPE_NEEDED = '/[&<>"\'\x00-\x08\x0B\x0C\x0E-\x1F]/';
+    private const XML_CTRL_BYTES = '/[\x00-\x08\x0B\x0C\x0E-\x1F]/';
+    private const XML_ESCAPE_MAP = [
+        '&' => '&amp;',
+        '<' => '&lt;',
+        '>' => '&gt;',
+        '"' => '&quot;',
+        "'" => '&apos;',
+    ];
+
     // Sheet management
     protected array $sheets = [];
     protected int $currentSheetIndex = 0;
@@ -91,7 +109,11 @@ abstract class BaseXlsxWriter
     protected int $bufferFlushInterval = 1000;
     protected string $rowBuffer = '';
     protected int $rowBufferCount = 0;
-    protected int $deflateLevel = 6;
+    // Level 5 is the measured knee of the speed/size curve for XLSX-shaped
+    // XML: on a 300K-row mixed workload it produced a file within 0.2% of
+    // level 6's size at ~22% less total wall time (level 6 spends its extra
+    // effort on entropy — unique cell refs — that doesn't compress anyway).
+    protected int $deflateLevel = 5;
 
     // Column letter cache for performance
     protected array $colLetterCache = [];
@@ -175,6 +197,29 @@ abstract class BaseXlsxWriter
      */
     protected array $indexSyncPoints = [];
 
+    // Column statistics (opt-in via withColumnStats). For each tracked
+    // column the writer accumulates min/max/sum/count per index block —
+    // the row span between two sync points — plus a per-sheet sorted
+    // flag. Serialized as a KXSI "STAT" TLV section; enables the reader to
+    // skip whole blocks for range predicates (zone maps, à la Parquet
+    // row-group stats), answer column aggregates from the sidecar alone,
+    // and binary-search sorted key columns in O(log blocks).
+
+    /** @var list<int> 1-based column indexes tracked for stats */
+    protected array $statsColumns = [];
+
+    /** @var array<int, array{min: float, max: float, sum: float, count: int, other: int}> current-block accumulator per column */
+    protected array $statsAccum = [];
+
+    /** @var array<int, array{asc: bool, desc: bool, prev: float|null}> per-sheet sortedness tracker per column */
+    protected array $statsSorted = [];
+
+    /** @var array<string, array<int, list<array{min: float, max: float, sum: float, count: int, other: int}>>> closed blocks: entry => col => blocks */
+    protected array $indexColumnBlocks = [];
+
+    /** @var array<string, array<int, array{asc: bool, desc: bool}>> final sortedness per sheet: entry => col => flags */
+    protected array $indexColumnSorted = [];
+
     public function __construct()
     {
         $this->styles = new StyleRegistry();
@@ -187,9 +232,10 @@ abstract class BaseXlsxWriter
 
     /**
      * Set deflate compression level (1-9)
-     * 3 = fast (20-35% speed boost, larger files)
-     * 6 = balanced (default)
-     * 9 = best compression (slower)
+     * 3 = fast (larger files)
+     * 5 = balanced (default — within ~0.2% of level 6's size at ~20% less wall time)
+     * 6 = marginally smaller, measurably slower
+     * 9 = best compression (much slower, ~6% smaller)
      */
     public function setCompressionLevel(int $level): self
     {
@@ -229,6 +275,61 @@ abstract class BaseXlsxWriter
 
         $this->randomAccessIndexEnabled = true;
         $this->indexSyncPeriod = $every;
+
+        return $this;
+    }
+
+    /**
+     * Track per-block column statistics (zone maps) for the given 1-based
+     * columns and embed them in the random-access sidecar (a "STAT" TLV
+     * section pre-v3.1 readers transparently ignore).
+     *
+     * What the matched reader gains, all without scanning row data:
+     *   - rowsWhere() skips every block whose [min,max] cannot satisfy
+     *     the predicate (exports are usually ID/date-sorted, so range
+     *     queries typically touch a handful of blocks);
+     *   - columnStats() answers min/max/sum/count for the whole sheet
+     *     from the ~KB sidecar alone — on S3 that is one range request
+     *     for a multi-GB file;
+     *   - findRow() binary-searches a column the writer observed to be
+     *     monotonically sorted, resolving a point lookup by reading a
+     *     single block.
+     *
+     * Statistics cover values that render as numeric cells: int/float,
+     * numeric strings, DateTime (as Excel serial), bool (as 0/1).
+     * Anything else counts toward the block's "other" tally and never
+     * causes a block to be skipped incorrectly — stats widen, never
+     * narrow, so pruning stays sound.
+     *
+     * Cost: a few comparisons per tracked cell and 32 bytes per
+     * (block × column) in the sidecar — ~13 KB for 4M rows / 10K period.
+     *
+     * Implies withRandomAccessIndex() (blocks are the spans between its
+     * sync points); enables it with the default period if not already on.
+     */
+    public function withColumnStats(array $columns): self
+    {
+        if ($this->started) {
+            throw XlsxStreamException::alreadyStarted();
+        }
+        if ($columns === []) {
+            throw new XlsxStreamException('withColumnStats() needs at least one column index.');
+        }
+        foreach ($columns as $col) {
+            if (! is_int($col) || $col < 1 || $col > self::MAX_COLUMNS) {
+                throw new XlsxStreamException(
+                    'withColumnStats() expects 1-based integer column indexes; got: '.var_export($col, true)
+                );
+            }
+        }
+
+        if (! $this->randomAccessIndexEnabled) {
+            $this->withRandomAccessIndex();
+        }
+
+        $columns = array_values(array_unique($columns));
+        sort($columns);
+        $this->statsColumns = $columns;
 
         return $this;
     }
@@ -474,11 +575,19 @@ abstract class BaseXlsxWriter
      *   $writer->setColumnFormat(3, 'currency_try');                        // #,##0.00 ₺
      *   $writer->setColumnFormat(4, '0.000');                               // raw code
      *   $writer->setColumnFormat(5, BaseXlsxWriter::BUILTIN_NUMFMT_DATE);   // locale-aware
+     *   $writer->setColumnFormat(6, 'General', raw: true);                  // verbatim, skip preset lookup
+     *
+     * Unknown preset-shaped strings throw (a typo'd preset written as a
+     * literal formatCode sends Excel into repair mode); pure date-token
+     * runs like 'dddd'/'mmss' pass as raw codes, and $raw = true skips
+     * preset resolution and the guard entirely — the escape hatch for
+     * arbitrary codes coming from external constant tables (e.g.
+     * PhpSpreadsheet NumberFormat values).
      *
      * Numeric values in that column are wrapped with the chosen format.
      * String values pass through unchanged.
      */
-    public function setColumnFormat(int $column, string|int $format): self
+    public function setColumnFormat(int $column, string|int $format, bool $raw = false): self
     {
         if ($this->closed) {
             throw XlsxStreamException::writerAlreadyClosed();
@@ -505,7 +614,7 @@ abstract class BaseXlsxWriter
             return $this;
         }
 
-        $this->columnStyleIds[$column] = $this->styles->registerColumnFormat($format);
+        $this->columnStyleIds[$column] = $this->styles->registerColumnFormat($format, $raw);
         // Stored separately so the auto-width heuristic can pick a sensible
         // minimum based on the format (e.g. currency cells need ~14 chars
         // even when the header is shorter).
@@ -604,6 +713,10 @@ abstract class BaseXlsxWriter
 
         $this->currentSheetRow++;
         $this->totalRows++;
+
+        if ($this->statsColumns !== []) {
+            $this->accumulateColumnStats($row);
+        }
 
         $rowXml = $this->buildRowXml($this->currentSheetRow, $row, $styleId);
 
@@ -879,6 +992,13 @@ abstract class BaseXlsxWriter
             'uncomp_offset' => $this->sheetUncompressedSize,
         ];
 
+        // The rows flushed above complete an index block; snapshot the
+        // column-stat accumulators so block k always spans exactly the
+        // rows between sync points k-1 and k.
+        if ($this->statsColumns !== []) {
+            $this->closeStatsBlock($entry);
+        }
+
         $this->rowsSinceSync = 0;
         $this->rowBuffer = '';
         $this->rowBufferCount = 0;
@@ -893,6 +1013,102 @@ abstract class BaseXlsxWriter
     }
 
     /**
+     * Fold one row's tracked-column values into the current block's
+     * accumulators and (for data rows) the per-sheet sortedness tracker.
+     *
+     * Inclusion rule mirrors what a reader will see as a numeric cell —
+     * over-inclusion is deliberate: a value that widens min/max can only
+     * make block pruning less selective, never incorrect, whereas a
+     * value the stats missed could cause a matching block to be skipped.
+     *
+     * $trackOrder is false for the header row: it participates in the
+     * block stats (a numeric-looking header is matchable by rowsWhere's
+     * full-scan path, so pruning must account for it) but says nothing
+     * about the DATA ordering the sorted flag describes.
+     */
+    protected function accumulateColumnStats(array $row, bool $trackOrder = true): void
+    {
+        if (! array_is_list($row)) {
+            $row = array_values($row);
+        }
+
+        foreach ($this->statsColumns as $col) {
+            $v = $this->statNumericValue($row[$col - 1] ?? null);
+            $acc = &$this->statsAccum[$col];
+
+            if ($v === null) {
+                $acc['other']++;
+                continue;
+            }
+
+            if ($acc['count'] === 0) {
+                $acc['min'] = $v;
+                $acc['max'] = $v;
+            } else {
+                if ($v < $acc['min']) {
+                    $acc['min'] = $v;
+                }
+                if ($v > $acc['max']) {
+                    $acc['max'] = $v;
+                }
+            }
+            $acc['sum'] += $v;
+            $acc['count']++;
+
+            if (! $trackOrder) {
+                continue;
+            }
+
+            $s = &$this->statsSorted[$col];
+            if ($s['prev'] !== null) {
+                if ($v < $s['prev']) {
+                    $s['asc'] = false;
+                }
+                if ($v > $s['prev']) {
+                    $s['desc'] = false;
+                }
+            }
+            $s['prev'] = $v;
+        }
+    }
+
+    /**
+     * Numeric interpretation of a cell for statistics purposes, aligned
+     * with how buildRowXml renders the value (DateTime -> Excel serial,
+     * bool -> 0/1, numeric strings -> their numeric value). Null means
+     * "not numeric" and lands in the block's `other` count.
+     */
+    protected function statNumericValue(mixed $value): ?float
+    {
+        if (is_int($value) || is_float($value)) {
+            return (float) $value;
+        }
+        if (is_string($value)) {
+            return is_numeric($value) ? (float) $value : null;
+        }
+        if ($value instanceof \DateTimeInterface) {
+            return ($value->getTimestamp() - self::EXCEL_EPOCH_TIMESTAMP) / 86400;
+        }
+        if (is_bool($value)) {
+            return $value ? 1.0 : 0.0;
+        }
+
+        return null;
+    }
+
+    /**
+     * Snapshot the per-column accumulators as one closed index block for
+     * the sheet and reset them for the next block.
+     */
+    protected function closeStatsBlock(string $entry): void
+    {
+        foreach ($this->statsColumns as $col) {
+            $this->indexColumnBlocks[$entry][$col][] = $this->statsAccum[$col];
+            $this->statsAccum[$col] = ['min' => 0.0, 'max' => 0.0, 'sum' => 0.0, 'count' => 0, 'other' => 0];
+        }
+    }
+
+    /**
      * Serialize the per-sheet sync points into the binary sidecar payload.
      * Sheets are written in workbook order so the sidecar's section order
      * matches the workbook.xml sheet listing.
@@ -900,6 +1116,7 @@ abstract class BaseXlsxWriter
     protected function buildRandomAccessIndexPayload(): string
     {
         $sheetSections = [];
+        $columnStats = [];
         foreach ($this->sheets as $sheet) {
             $entry = $sheet['filename'];
             $sheetSections[] = [
@@ -908,9 +1125,23 @@ abstract class BaseXlsxWriter
                 'sheet_crc32' => $sheet['crc32'] ?? 0,
                 'sync_points' => $this->indexSyncPoints[$entry] ?? [],
             ];
+
+            if ($this->statsColumns !== []) {
+                $cols = [];
+                foreach ($this->statsColumns as $col) {
+                    $sorted = $this->indexColumnSorted[$entry][$col] ?? ['asc' => false, 'desc' => false];
+                    $cols[] = [
+                        'col' => $col,
+                        'sorted_asc' => $sorted['asc'],
+                        'sorted_desc' => $sorted['desc'],
+                        'blocks' => $this->indexColumnBlocks[$entry][$col] ?? [],
+                    ];
+                }
+                $columnStats[$entry] = $cols;
+            }
         }
 
-        return RandomAccessIndex::encode($this->indexSyncPeriod, $sheetSections);
+        return RandomAccessIndex::encode($this->indexSyncPeriod, $sheetSections, $columnStats);
     }
 
     /**
@@ -967,6 +1198,27 @@ abstract class BaseXlsxWriter
 
         $this->sheetOffset = $this->currentOffset;
         $this->currentSheetRow = 0;
+
+        // Fresh sheet -> fresh stat accumulators and sortedness trackers
+        // (sortedness is a per-sheet property; auto-split sheets each get
+        // their own verdict).
+        if ($this->statsColumns !== []) {
+            foreach ($this->statsColumns as $col) {
+                $this->statsAccum[$col] = ['min' => 0.0, 'max' => 0.0, 'sum' => 0.0, 'count' => 0, 'other' => 0];
+                $this->statsSorted[$col] = ['asc' => true, 'desc' => true, 'prev' => null];
+            }
+
+            // The header row is emitted via the sheet preamble, never
+            // through writeRow() — but it IS a row the reader's
+            // full-scan path can match (a numeric-looking header passes
+            // is_numeric). Fold it into block 0 so zone-map pruning can
+            // never hide a row the un-pruned path would return; without
+            // this, rowsWhere() gave different results with and without
+            // stats for out-of-data-range values matching the header.
+            if ($this->columns !== []) {
+                $this->accumulateColumnStats($this->columns, trackOrder: false);
+            }
+        }
 
         [$mtime, $mdate] = $this->dosTimeParts(time());
 
@@ -1257,6 +1509,18 @@ abstract class BaseXlsxWriter
         // with the live CD CRC at open time and silently invalidates the
         // index when an external editor rewrote the sheet.
         $this->sheets[count($this->sheets) - 1]['crc32'] = $this->sheetCrc;
+
+        // Close the tail block (rows after the last sync point — possibly
+        // empty, still emitted so block_count == sync_count + 1 holds for
+        // every sheet) and pin the sheet's sortedness verdict.
+        if ($this->statsColumns !== []) {
+            $entry = $sheetInfo['filename'];
+            $this->closeStatsBlock($entry);
+            foreach ($this->statsColumns as $col) {
+                $s = $this->statsSorted[$col];
+                $this->indexColumnSorted[$entry][$col] = ['asc' => $s['asc'], 'desc' => $s['desc']];
+            }
+        }
     }
 
     /**
@@ -1273,26 +1537,78 @@ abstract class BaseXlsxWriter
             return $this->buildStyledRowXml($rowIndex, $data, $rowStyleId);
         }
 
-        $cells = [];
-        $colIndex = 1;
-        // Hoist the styles-empty check so the fast (unstyled) path skips the
-        // per-cell lookup entirely — matches v2.0.1 hot-path cost.
-        $hasColumnStyles = ! empty($this->columnStyleIds);
+        // Hot-path shape (measured, output byte-identical to the previous
+        // array+implode form):
+        // - strings are dispatched first — they are the most common cell
+        //   type and previously paid four failed type checks per cell;
+        // - the column-letter cache is pre-filled once and read through a
+        //   local (COW copy, no per-cell method call + property deref);
+        // - cells append straight onto one string; PHP reallocs a
+        //   refcount-1 string in place, which beats array insert + implode.
+        $count = count($data);
+        if ($count > 0 && ! isset($this->colLetterCache[$count])) {
+            for ($c = 1; $c <= $count; $c++) {
+                $this->getColumnLetter($c);
+            }
+        }
+        $letters = $this->colLetterCache;
+        $columnStyleIds = $this->columnStyleIds;
+        $hasColumnStyles = ! empty($columnStyleIds);
+
+        $xml = '<row r="' . $rowIndex . '">';
+        $col = 0;
 
         foreach ($data as $value) {
-            $cellRef = $this->getColumnLetter($colIndex) . $rowIndex;
-            $col = $colIndex;
-            $colIndex++;
+            $cellRef = $letters[++$col] . $rowIndex;
 
-            // Null / empty string -> empty cell
-            if ($value === null || $value === '') {
-                $cells[] = '<c r="' . $cellRef . '"/>';
+            if (is_string($value)) {
+                // Empty string -> empty cell (matches the null cell below)
+                if ($value === '') {
+                    $xml .= '<c r="' . $cellRef . '"/>';
+                    continue;
+                }
+
+                // Numeric strings: preserve as string when precision/format would be lost
+                if (is_numeric($value)) {
+                    if ($this->shouldPreserveNumericString($value)) {
+                        $xml .= '<c r="' . $cellRef . '" t="inlineStr"><is><t>' . $this->fastXmlEscape($value) . '</t></is></c>';
+                    } elseif ($hasColumnStyles && isset($columnStyleIds[$col])) {
+                        $xml .= '<c r="' . $cellRef . '" s="' . $columnStyleIds[$col] . '" t="n"><v>' . (0 + $value) . '</v></c>';
+                    } else {
+                        $xml .= '<c r="' . $cellRef . '" t="n"><v>' . (0 + $value) . '</v></c>';
+                    }
+                    continue;
+                }
+
+                $escaped = $this->fastXmlEscape($value);
+                if ($escaped !== '' && ($escaped[0] === ' ' || $escaped[0] === "\t" ||
+                    $escaped[strlen($escaped) - 1] === ' ' || $escaped[strlen($escaped) - 1] === "\t")) {
+                    $xml .= '<c r="' . $cellRef . '" t="inlineStr"><is><t xml:space="preserve">' . $escaped . '</t></is></c>';
+                } else {
+                    $xml .= '<c r="' . $cellRef . '" t="inlineStr"><is><t>' . $escaped . '</t></is></c>';
+                }
+                continue;
+            }
+
+            // Numeric values — split fast/slow so unstyled exports keep v2.0.1 cost
+            if (is_int($value) || is_float($value)) {
+                if ($hasColumnStyles && isset($columnStyleIds[$col])) {
+                    $xml .= '<c r="' . $cellRef . '" s="' . $columnStyleIds[$col] . '" t="n"><v>' . $value . '</v></c>';
+                } else {
+                    $xml .= '<c r="' . $cellRef . '" t="n"><v>' . $value . '</v></c>';
+                }
+                continue;
+            }
+
+            // Null -> empty cell
+            if ($value === null) {
+                $xml .= '<c r="' . $cellRef . '"/>';
                 continue;
             }
 
             // Boolean -> native Excel boolean cell
             if (is_bool($value)) {
-                $cells[] = '<c r="' . $cellRef . '" t="b"><v>' . ($value ? 1 : 0) . '</v></c>';
+                $xml .= '<c r="' . $cellRef . '" t="b"><v>' . ($value ? 1 : 0) . '</v></c>';
                 continue;
             }
 
@@ -1300,48 +1616,25 @@ abstract class BaseXlsxWriter
             // (column-specific format wins if set, else fallback to legacy STYLE_DATETIME)
             if ($value instanceof \DateTimeInterface) {
                 $serial = ($value->getTimestamp() - self::EXCEL_EPOCH_TIMESTAMP) / 86400;
-                $styleId = $hasColumnStyles && isset($this->columnStyleIds[$col])
-                    ? $this->columnStyleIds[$col]
+                $styleId = $hasColumnStyles && isset($columnStyleIds[$col])
+                    ? $columnStyleIds[$col]
                     : self::STYLE_DATETIME;
-                $cells[] = '<c r="' . $cellRef . '" s="' . $styleId . '" t="n"><v>' . $serial . '</v></c>';
+                $xml .= '<c r="' . $cellRef . '" s="' . $styleId . '" t="n"><v>' . $serial . '</v></c>';
                 continue;
             }
 
-            // Numeric values — split fast/slow so unstyled exports keep v2.0.1 cost
-            if (is_int($value) || is_float($value)) {
-                if ($hasColumnStyles && isset($this->columnStyleIds[$col])) {
-                    $cells[] = '<c r="' . $cellRef . '" s="' . $this->columnStyleIds[$col] . '" t="n"><v>' . $value . '</v></c>';
-                } else {
-                    $cells[] = '<c r="' . $cellRef . '" t="n"><v>' . $value . '</v></c>';
-                }
-                continue;
-            }
-
-            // Numeric strings: preserve as string when precision/format would be lost
-            if (is_string($value) && is_numeric($value)) {
-                if ($this->shouldPreserveNumericString($value)) {
-                    $escaped = $this->fastXmlEscape($value);
-                    $cells[] = '<c r="' . $cellRef . '" t="inlineStr"><is><t>' . $escaped . '</t></is></c>';
-                } elseif ($hasColumnStyles && isset($this->columnStyleIds[$col])) {
-                    $cells[] = '<c r="' . $cellRef . '" s="' . $this->columnStyleIds[$col] . '" t="n"><v>' . (0 + $value) . '</v></c>';
-                } else {
-                    $cells[] = '<c r="' . $cellRef . '" t="n"><v>' . (0 + $value) . '</v></c>';
-                }
-                continue;
-            }
-
-            // String / Stringable / other -> inlineStr
-            $escaped = $this->fastXmlEscape((string)$value);
+            // Stringable / other -> inlineStr
+            $escaped = $this->fastXmlEscape((string) $value);
 
             if ($escaped !== '' && ($escaped[0] === ' ' || $escaped[0] === "\t" ||
                 $escaped[strlen($escaped) - 1] === ' ' || $escaped[strlen($escaped) - 1] === "\t")) {
-                $cells[] = '<c r="' . $cellRef . '" t="inlineStr"><is><t xml:space="preserve">' . $escaped . '</t></is></c>';
+                $xml .= '<c r="' . $cellRef . '" t="inlineStr"><is><t xml:space="preserve">' . $escaped . '</t></is></c>';
             } else {
-                $cells[] = '<c r="' . $cellRef . '" t="inlineStr"><is><t>' . $escaped . '</t></is></c>';
+                $xml .= '<c r="' . $cellRef . '" t="inlineStr"><is><t>' . $escaped . '</t></is></c>';
             }
         }
 
-        return '<row r="' . $rowIndex . '">' . implode('', $cells) . '</row>';
+        return $xml . '</row>';
     }
 
     /**
@@ -1356,28 +1649,79 @@ abstract class BaseXlsxWriter
      */
     protected function buildStyledRowXml(int $rowIndex, array $data, int $rowStyleId): string
     {
-        $cells = [];
-        $colIndex = 1;
-        $hasColumnStyles = ! empty($this->columnStyleIds);
+        // Mirrors buildRowXml's flattened hot-path shape (string-first
+        // dispatch, local letter cache, direct string append) — see the
+        // comment there. Only the s="N" handling differs.
+        $count = count($data);
+        if ($count > 0 && ! isset($this->colLetterCache[$count])) {
+            for ($c = 1; $c <= $count; $c++) {
+                $this->getColumnLetter($c);
+            }
+        }
+        $letters = $this->colLetterCache;
+        $columnStyleIds = $this->columnStyleIds;
+        $hasColumnStyles = ! empty($columnStyleIds);
         // Hoist the row's style attribute so it's stringified once per row,
         // not once per cell. Cells that need a merged (column-format) style
         // build their own; everything else reuses this.
         $sAttr = ' s="' . $rowStyleId . '"';
 
-        foreach ($data as $value) {
-            $cellRef = $this->getColumnLetter($colIndex) . $rowIndex;
-            $col = $colIndex;
-            $colIndex++;
+        $xml = '<row r="' . $rowIndex . '">';
+        $col = 0;
 
-            // Null / empty string -> empty but still filled cell
-            if ($value === null || $value === '') {
-                $cells[] = '<c r="' . $cellRef . '"' . $sAttr . '/>';
+        foreach ($data as $value) {
+            $cellRef = $letters[++$col] . $rowIndex;
+
+            if (is_string($value)) {
+                // Empty string -> empty but still filled cell
+                if ($value === '') {
+                    $xml .= '<c r="' . $cellRef . '"' . $sAttr . '/>';
+                    continue;
+                }
+
+                // Numeric strings: preserve as string when precision/format would be lost
+                if (is_numeric($value)) {
+                    if ($this->shouldPreserveNumericString($value)) {
+                        $xml .= '<c r="' . $cellRef . '"' . $sAttr . ' t="inlineStr"><is><t>' . $this->fastXmlEscape($value) . '</t></is></c>';
+                    } elseif ($hasColumnStyles && isset($columnStyleIds[$col])) {
+                        $styleId = $this->mergeRowStyleWithColumnStyle($rowStyleId, $columnStyleIds[$col]);
+                        $xml .= '<c r="' . $cellRef . '" s="' . $styleId . '" t="n"><v>' . (0 + $value) . '</v></c>';
+                    } else {
+                        $xml .= '<c r="' . $cellRef . '"' . $sAttr . ' t="n"><v>' . (0 + $value) . '</v></c>';
+                    }
+                    continue;
+                }
+
+                $escaped = $this->fastXmlEscape($value);
+                if ($escaped !== '' && ($escaped[0] === ' ' || $escaped[0] === "\t" ||
+                    $escaped[strlen($escaped) - 1] === ' ' || $escaped[strlen($escaped) - 1] === "\t")) {
+                    $xml .= '<c r="' . $cellRef . '"' . $sAttr . ' t="inlineStr"><is><t xml:space="preserve">' . $escaped . '</t></is></c>';
+                } else {
+                    $xml .= '<c r="' . $cellRef . '"' . $sAttr . ' t="inlineStr"><is><t>' . $escaped . '</t></is></c>';
+                }
+                continue;
+            }
+
+            // Numeric values
+            if (is_int($value) || is_float($value)) {
+                if ($hasColumnStyles && isset($columnStyleIds[$col])) {
+                    $styleId = $this->mergeRowStyleWithColumnStyle($rowStyleId, $columnStyleIds[$col]);
+                    $xml .= '<c r="' . $cellRef . '" s="' . $styleId . '" t="n"><v>' . $value . '</v></c>';
+                } else {
+                    $xml .= '<c r="' . $cellRef . '"' . $sAttr . ' t="n"><v>' . $value . '</v></c>';
+                }
+                continue;
+            }
+
+            // Null -> empty but still filled cell
+            if ($value === null) {
+                $xml .= '<c r="' . $cellRef . '"' . $sAttr . '/>';
                 continue;
             }
 
             // Boolean -> native Excel boolean cell
             if (is_bool($value)) {
-                $cells[] = '<c r="' . $cellRef . '"' . $sAttr . ' t="b"><v>' . ($value ? 1 : 0) . '</v></c>';
+                $xml .= '<c r="' . $cellRef . '"' . $sAttr . ' t="b"><v>' . ($value ? 1 : 0) . '</v></c>';
                 continue;
             }
 
@@ -1385,51 +1729,26 @@ abstract class BaseXlsxWriter
             // column's date format (or the legacy datetime style as fallback).
             if ($value instanceof \DateTimeInterface) {
                 $serial = ($value->getTimestamp() - self::EXCEL_EPOCH_TIMESTAMP) / 86400;
-                $columnStyleId = $hasColumnStyles && isset($this->columnStyleIds[$col])
-                    ? $this->columnStyleIds[$col]
+                $columnStyleId = $hasColumnStyles && isset($columnStyleIds[$col])
+                    ? $columnStyleIds[$col]
                     : self::STYLE_DATETIME;
                 $styleId = $this->mergeRowStyleWithColumnStyle($rowStyleId, $columnStyleId);
-                $cells[] = '<c r="' . $cellRef . '" s="' . $styleId . '" t="n"><v>' . $serial . '</v></c>';
+                $xml .= '<c r="' . $cellRef . '" s="' . $styleId . '" t="n"><v>' . $serial . '</v></c>';
                 continue;
             }
 
-            // Numeric values
-            if (is_int($value) || is_float($value)) {
-                if ($hasColumnStyles && isset($this->columnStyleIds[$col])) {
-                    $styleId = $this->mergeRowStyleWithColumnStyle($rowStyleId, $this->columnStyleIds[$col]);
-                    $cells[] = '<c r="' . $cellRef . '" s="' . $styleId . '" t="n"><v>' . $value . '</v></c>';
-                } else {
-                    $cells[] = '<c r="' . $cellRef . '"' . $sAttr . ' t="n"><v>' . $value . '</v></c>';
-                }
-                continue;
-            }
-
-            // Numeric strings: preserve as string when precision/format would be lost
-            if (is_string($value) && is_numeric($value)) {
-                if ($this->shouldPreserveNumericString($value)) {
-                    $escaped = $this->fastXmlEscape($value);
-                    $cells[] = '<c r="' . $cellRef . '"' . $sAttr . ' t="inlineStr"><is><t>' . $escaped . '</t></is></c>';
-                } elseif ($hasColumnStyles && isset($this->columnStyleIds[$col])) {
-                    $styleId = $this->mergeRowStyleWithColumnStyle($rowStyleId, $this->columnStyleIds[$col]);
-                    $cells[] = '<c r="' . $cellRef . '" s="' . $styleId . '" t="n"><v>' . (0 + $value) . '</v></c>';
-                } else {
-                    $cells[] = '<c r="' . $cellRef . '"' . $sAttr . ' t="n"><v>' . (0 + $value) . '</v></c>';
-                }
-                continue;
-            }
-
-            // String / Stringable / other -> inlineStr
-            $escaped = $this->fastXmlEscape((string)$value);
+            // Stringable / other -> inlineStr
+            $escaped = $this->fastXmlEscape((string) $value);
 
             if ($escaped !== '' && ($escaped[0] === ' ' || $escaped[0] === "\t" ||
                 $escaped[strlen($escaped) - 1] === ' ' || $escaped[strlen($escaped) - 1] === "\t")) {
-                $cells[] = '<c r="' . $cellRef . '"' . $sAttr . ' t="inlineStr"><is><t xml:space="preserve">' . $escaped . '</t></is></c>';
+                $xml .= '<c r="' . $cellRef . '"' . $sAttr . ' t="inlineStr"><is><t xml:space="preserve">' . $escaped . '</t></is></c>';
             } else {
-                $cells[] = '<c r="' . $cellRef . '"' . $sAttr . ' t="inlineStr"><is><t>' . $escaped . '</t></is></c>';
+                $xml .= '<c r="' . $cellRef . '"' . $sAttr . ' t="inlineStr"><is><t>' . $escaped . '</t></is></c>';
             }
         }
 
-        return '<row r="' . $rowIndex . '">' . implode('', $cells) . '</row>';
+        return $xml . '</row>';
     }
 
     /**
@@ -1500,27 +1819,17 @@ abstract class BaseXlsxWriter
      */
     protected function fastXmlEscape(string $str): string
     {
-        static $trans = [
-            '&' => '&amp;',
-            '<' => '&lt;',
-            '>' => '&gt;',
-            '"' => '&quot;',
-            "'" => '&apos;',
-        ];
-
-        // Double-quoted needle so \xNN escape sequences resolve to the
-        // actual control bytes (0x00..0x1F minus \t \n \r). The previous
-        // single-quoted form embedded the literal characters \, x, 0..9,
-        // A..F instead, which let pure-lowercase strings with embedded
-        // nulls bypass sanitization entirely — Excel rejects the workbook
-        // because XML 1.0 forbids those bytes.
-        if (strpbrk($str, "&<>\"'\x00\x01\x02\x03\x04\x05\x06\x07\x08\x0B\x0C\x0E\x0F\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1A\x1B\x1C\x1D\x1E\x1F") === false) {
+        if (! preg_match(self::XML_ESCAPE_NEEDED, $str)) {
             return $str;
         }
 
-        $str = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F]/', '', $str);
+        // Only pay the control-byte strip when a control byte is actually
+        // present — the usual dirty string just has an '&' or a quote.
+        if (preg_match(self::XML_CTRL_BYTES, $str)) {
+            $str = preg_replace(self::XML_CTRL_BYTES, '', $str);
+        }
 
-        return strtr($str, $trans);
+        return strtr($str, self::XML_ESCAPE_MAP);
     }
 
     /**

@@ -54,8 +54,17 @@ class WorkbookResolver
             return false;
         }
 
-        $xml = $cd->readEntry($source, 'xl/workbook.xml');
+        return self::parseDate1904Xml($cd->readEntry($source, 'xl/workbook.xml'));
+    }
 
+    /**
+     * Variant of parseDate1904() for callers that already hold the
+     * workbook.xml bytes — StreamingXlsxReader fetches the part once
+     * during construction and feeds it to both resolve() and this,
+     * instead of paying a second fetch+inflate per open.
+     */
+    public static function parseDate1904Xml(string $xml): bool
+    {
         // Single linear regex — workbookPr usually appears once near
         // the top of the file. Spec-compliant values are "1" and "true";
         // anything else (including missing) means 1900 epoch.
@@ -67,9 +76,13 @@ class WorkbookResolver
     }
 
     /**
+     * Pass $workbookXml when the caller already fetched xl/workbook.xml
+     * (see parseDate1904Xml) — resolve() then skips its own fetch. The
+     * .rels part is always read here; nothing else needs it.
+     *
      * @return list<array{name: string, sheetId: int, entry: string}>
      */
-    public static function resolve(Source $source, ZipDirectory $cd): array
+    public static function resolve(Source $source, ZipDirectory $cd, ?string $workbookXml = null): array
     {
         if (! $cd->has('xl/workbook.xml')) {
             throw XlsxReadException::corruptCentralDirectory('xl/workbook.xml is missing');
@@ -78,7 +91,7 @@ class WorkbookResolver
             throw XlsxReadException::corruptCentralDirectory('xl/_rels/workbook.xml.rels is missing');
         }
 
-        $workbookXml = $cd->readEntry($source, 'xl/workbook.xml');
+        $workbookXml ??= $cd->readEntry($source, 'xl/workbook.xml');
         $relsXml = $cd->readEntry($source, 'xl/_rels/workbook.xml.rels');
 
         $sheets = self::parseSheets($workbookXml);

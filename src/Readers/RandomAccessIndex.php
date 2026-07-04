@@ -27,6 +27,11 @@ class RandomAccessIndex
     public const VERSION = 2;
     public const ENTRY_PATH = 'xl/_kxs/index.bin';
 
+    public const TAG_STATS = 'STAT';
+
+    public const SORTED_ASC = 0x01;
+    public const SORTED_DESC = 0x02;
+
     private const HEADER_SIZE = 16;
 
     /**
@@ -50,12 +55,26 @@ class RandomAccessIndex
     /** @var array<string, list<array{row: int, comp_offset: int, uncomp_offset: int}>> */
     private array $syncPointsByEntry = [];
 
-    private function __construct(int $syncPeriod, array $totals, array $crcs, array $syncs)
+    /**
+     * Per-block column statistics (zone maps) from the KXSI "STAT"
+     * TLV section. Block k spans the rows between sync points k-1 and k;
+     * the final block is the tail after the last sync point.
+     *
+     * @var array<string, array<int, array{
+     *     sorted_asc: bool,
+     *     sorted_desc: bool,
+     *     blocks: list<array{min: float, max: float, sum: float, count: int, other: int}>
+     * }>> entry path => 1-based column => stats
+     */
+    private array $columnStatsByEntry = [];
+
+    private function __construct(int $syncPeriod, array $totals, array $crcs, array $syncs, array $columnStats = [])
     {
         $this->syncPeriod = $syncPeriod;
         $this->totalRowsByEntry = $totals;
         $this->sheetCrc32ByEntry = $crcs;
         $this->syncPointsByEntry = $syncs;
+        $this->columnStatsByEntry = $columnStats;
     }
 
     public static function decode(string $payload): self
@@ -217,7 +236,112 @@ class RandomAccessIndex
             $syncs[$entry] = $points;
         }
 
-        return new self($syncPeriod, $totals, $crcs, $syncs);
+        // Optional TLV sections may follow the core body (the version
+        // stays 2 — pre-v3.1 decoders parse exactly sheet_count core
+        // sections and ignore trailing bytes, so extensions degrade to
+        // invisible instead of fatal for them; see the writer-side
+        // encoder docblock). Unknown tags are skipped by design —
+        // that's what lets future writers add sections without
+        // stranding this reader.
+        $columnStats = [];
+        $entryOrder = array_keys($totals);
+        while ($cursor + 8 <= $bodyLen) {
+            $tag = substr($body, $cursor, 4);
+            $length = unpack('V', substr($body, $cursor + 4, 4))[1];
+            $cursor += 8;
+
+            if ($cursor + $length > $bodyLen) {
+                throw XlsxReadException::corruptCentralDirectory(
+                    "random-access index TLV section '{$tag}' overruns the payload"
+                );
+            }
+
+            if ($tag === self::TAG_STATS) {
+                $columnStats = self::decodeStatsSection(
+                    substr($body, $cursor, $length),
+                    $entryOrder,
+                    $syncs
+                );
+            }
+
+            $cursor += $length;
+        }
+
+        return new self($syncPeriod, $totals, $crcs, $syncs, $columnStats);
+    }
+
+    /**
+     * Parse the "STAT" TLV payload — per-block column statistics in
+     * core-body sheet order. Enforces the structural invariant
+     * block_count == sync_count + 1 so a mismatched sidecar surfaces
+     * loudly instead of mis-mapping blocks to row ranges.
+     *
+     * @param  list<string>  $entryOrder  sheet entries in core-body order
+     * @param  array<string, list<array{row: int, comp_offset: int, uncomp_offset: int}>>  $syncs
+     * @return array<string, array<int, array{sorted_asc: bool, sorted_desc: bool, blocks: list<array{min: float, max: float, sum: float, count: int, other: int}>}>>
+     */
+    private static function decodeStatsSection(string $stat, array $entryOrder, array $syncs): array
+    {
+        $result = [];
+        $cursor = 0;
+        $len = strlen($stat);
+
+        foreach ($entryOrder as $entry) {
+            if ($cursor + 2 > $len) {
+                throw XlsxReadException::corruptCentralDirectory('truncated STAT section sheet header');
+            }
+            $colCount = unpack('v', substr($stat, $cursor, 2))[1];
+            $cursor += 2;
+
+            $expectedBlocks = count($syncs[$entry] ?? []) + 1;
+
+            for ($c = 0; $c < $colCount; $c++) {
+                if ($cursor + 7 > $len) {
+                    throw XlsxReadException::corruptCentralDirectory('truncated STAT column header');
+                }
+                $col = unpack('v', substr($stat, $cursor, 2))[1];
+                $flags = ord($stat[$cursor + 2]);
+                $blockCount = unpack('V', substr($stat, $cursor + 3, 4))[1];
+                $cursor += 7;
+
+                if ($col < 1) {
+                    throw XlsxReadException::corruptCentralDirectory(
+                        'STAT section column index must be 1-based'
+                    );
+                }
+                if ($blockCount !== $expectedBlocks) {
+                    throw XlsxReadException::corruptCentralDirectory(
+                        "STAT section block count {$blockCount} does not match sync points + 1 ({$expectedBlocks}) for sheet '{$entry}'"
+                    );
+                }
+                if ($cursor + 32 * $blockCount > $len) {
+                    throw XlsxReadException::corruptCentralDirectory(
+                        "truncated STAT block list for sheet '{$entry}' column {$col}"
+                    );
+                }
+
+                $blocks = [];
+                for ($b = 0; $b < $blockCount; $b++) {
+                    $vals = unpack('emin/emax/esum/Vcount/Vother', substr($stat, $cursor, 32));
+                    $blocks[] = [
+                        'min' => $vals['min'],
+                        'max' => $vals['max'],
+                        'sum' => $vals['sum'],
+                        'count' => $vals['count'],
+                        'other' => $vals['other'],
+                    ];
+                    $cursor += 32;
+                }
+
+                $result[$entry][$col] = [
+                    'sorted_asc' => (bool) ($flags & self::SORTED_ASC),
+                    'sorted_desc' => (bool) ($flags & self::SORTED_DESC),
+                    'blocks' => $blocks,
+                ];
+            }
+        }
+
+        return $result;
     }
 
     /**
@@ -248,6 +372,76 @@ class RandomAccessIndex
     public function syncPoints(string $sheetEntry): array
     {
         return $this->syncPointsByEntry[$sheetEntry] ?? [];
+    }
+
+    /**
+     * Column statistics for one sheet (KXSI "STAT" section), or null
+     * when the sidecar carries none for that entry/column.
+     *
+     * @return array{sorted_asc: bool, sorted_desc: bool, blocks: list<array{min: float, max: float, sum: float, count: int, other: int}>}|null
+     */
+    public function columnStats(string $sheetEntry, int $column): ?array
+    {
+        return $this->columnStatsByEntry[$sheetEntry][$column] ?? null;
+    }
+
+    /** @return list<int> 1-based columns that carry stats for the sheet */
+    public function statsColumns(string $sheetEntry): array
+    {
+        return array_keys($this->columnStatsByEntry[$sheetEntry] ?? []);
+    }
+
+    /**
+     * Row span + seek target for each index block of a sheet, aligned
+     * with the STAT section's block order:
+     *
+     *   block 0            rows 1 .. sync[0].row - 1, streamed from the
+     *                      sheet start (no seek — offsets null)
+     *   block k (1..K-1)   rows sync[k-1].row .. sync[k].row - 1
+     *   block K            rows sync[K-1].row .. totalRows (tail)
+     *
+     * first_row/last_row are 1-based sheet rows including the header row
+     * (data starts at row 2 when the sheet has headers, matching what
+     * rows() yields). last_row of the tail block is totalRows.
+     *
+     * @return list<array{first_row: int, last_row: int, comp_offset: int|null, uncomp_offset: int|null, start_row_at_offset: int|null}>
+     */
+    public function blockRanges(string $sheetEntry): array
+    {
+        $points = $this->syncPointsByEntry[$sheetEntry] ?? [];
+        $totalRows = $this->totalRowsByEntry[$sheetEntry] ?? 0;
+
+        $ranges = [];
+        $firstRow = 1;
+        $offset = null;      // block 0 streams from the sheet start
+        $uncomp = null;
+        $rowAtOffset = null;
+
+        foreach ($points as $sp) {
+            $ranges[] = [
+                'first_row' => $firstRow,
+                'last_row' => $sp['row'] - 1,
+                'comp_offset' => $offset,
+                'uncomp_offset' => $uncomp,
+                'start_row_at_offset' => $rowAtOffset,
+            ];
+            $firstRow = $sp['row'];
+            $offset = $sp['comp_offset'];
+            $uncomp = $sp['uncomp_offset'];
+            $rowAtOffset = $sp['row'];
+        }
+
+        // Tail block after the last sync point (or the whole sheet when
+        // no sync points exist).
+        $ranges[] = [
+            'first_row' => $firstRow,
+            'last_row' => $totalRows,
+            'comp_offset' => $offset,
+            'uncomp_offset' => $uncomp,
+            'start_row_at_offset' => $rowAtOffset,
+        ];
+
+        return $ranges;
     }
 
     /**

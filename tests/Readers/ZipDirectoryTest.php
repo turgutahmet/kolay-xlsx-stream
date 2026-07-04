@@ -166,6 +166,113 @@ class ZipDirectoryTest extends TestCase
         $this->assertSame('0123456789', $tail);
     }
 
+    public function test_local_file_source_tail_returns_suffix_and_size(): void
+    {
+        file_put_contents($this->testFile, str_repeat('abcdefghij', 1000)); // 10000 bytes
+
+        $source = new LocalFileSource($this->testFile);
+
+        ['data' => $data, 'size' => $size] = $source->tail(10);
+        $this->assertSame('abcdefghij', $data);
+        $this->assertSame(10000, $size);
+
+        // Suffix larger than the file returns the whole content.
+        ['data' => $all, 'size' => $size2] = $source->tail(1_000_000);
+        $this->assertSame(10000, strlen($all));
+        $this->assertSame(10000, $size2);
+    }
+
+    public function test_read_entry_coalesces_lfh_and_body_into_one_range_fetch(): void
+    {
+        $writer = new SinkableXlsxWriter(new FileSink($this->testFile));
+        $writer->startFile(['a', 'b']);
+        $writer->writeRow(['x', 'y']);
+        $writer->finishFile();
+
+        $inner = new LocalFileSource($this->testFile);
+        $spy = new RangeCountingSource($inner);
+        $cd = ZipDirectory::fromSource($spy);
+
+        $spy->resetRangeCalls();
+
+        // First read: LFH + body must arrive in a single range() call —
+        // the old flow paid a 30-byte LFH fetch plus a body fetch.
+        $xml = $cd->readEntry($spy, 'xl/workbook.xml');
+        $this->assertStringContainsString('<sheets>', $xml);
+        $this->assertSame(1, $spy->rangeCallCount(), 'coalesced read must be one range fetch');
+        $this->assertSame(0, $spy->lfhRangeCallCount(), 'no separate 30-byte LFH fetch expected');
+
+        // The coalesced read populates the dataOffset cache, so a
+        // later dataOffset() is free and a re-read costs one body fetch.
+        $spy->resetRangeCalls();
+        $cd->dataOffset($spy, 'xl/workbook.xml');
+        $this->assertSame(0, $spy->rangeCallCount(), 'dataOffset must come from the coalesced read cache');
+
+        $cd->readEntry($spy, 'xl/workbook.xml');
+        $this->assertSame(1, $spy->rangeCallCount(), 'cached-offset re-read is a single body fetch');
+    }
+
+    public function test_read_entry_above_coalesce_cap_falls_back_to_two_step(): void
+    {
+        // Incompressible payload > 1 MB: compressed_size exceeds the
+        // coalesce cap, so the coalesced prefetch must NOT trigger —
+        // big bodies keep the lazy LFH + body flow.
+        $big = random_bytes(1_200_000);
+
+        $zip = new \ZipArchive();
+        $this->assertTrue($zip->open($this->testFile, \ZipArchive::CREATE | \ZipArchive::OVERWRITE) === true);
+        $zip->addFromString('big.bin', $big);
+        $zip->close();
+
+        $inner = new LocalFileSource($this->testFile);
+        $spy = new RangeCountingSource($inner);
+        $cd = ZipDirectory::fromSource($spy);
+
+        $this->assertGreaterThan(1024 * 1024, $cd->entry('big.bin')['compressed_size']);
+
+        $spy->resetRangeCalls();
+        $payload = $cd->readEntry($spy, 'big.bin');
+
+        $this->assertSame($big, $payload);
+        $this->assertSame(2, $spy->rangeCallCount(), 'oversize entry must use LFH fetch + body fetch');
+        $this->assertSame(1, $spy->lfhRangeCallCount());
+    }
+
+    public function test_reader_construction_costs_three_range_fetches(): void
+    {
+        // Static RTT budget for opening a workbook on a range source
+        // without suffix support: 1 tail read (EOCD + CD) + 1 coalesced
+        // workbook.xml + 1 coalesced workbook.xml.rels. Guards against
+        // regressions re-introducing the duplicate workbook.xml fetch
+        // or the separate LFH fetches. (Suffix-capable sources also
+        // fold the size() lookup into the tail read.)
+        $writer = new SinkableXlsxWriter(new FileSink($this->testFile));
+        $writer->startFile(['a']);
+        $writer->writeRow(['x']);
+        $writer->finishFile();
+
+        $spy = new RangeCountingSource(new LocalFileSource($this->testFile));
+        \Kolay\XlsxStream\Readers\StreamingXlsxReader::from($spy);
+
+        $this->assertSame(3, $spy->rangeCallCount());
+    }
+
+    public function test_s3_range_source_returns_empty_string_for_non_positive_length(): void
+    {
+        // length <= 0 would render as `bytes=X-(X-1)` — an unsatisfiable
+        // range S3 answers with 416. The guard must return '' without
+        // ever touching the network (the fake client would fail loudly).
+        $s3 = new \Aws\S3\S3Client([
+            'region' => 'eu-west-1',
+            'version' => 'latest',
+            'credentials' => ['key' => 'test', 'secret' => 'test'],
+        ]);
+        $source = new \Kolay\XlsxStream\Sources\S3RangeSource($s3, 'bucket', 'key');
+
+        $this->assertSame('', $source->range(100, 0));
+        $this->assertSame('', $source->range(100, -5));
+    }
+
     public function test_data_offset_is_cached_per_entry(): void
     {
         $writer = new SinkableXlsxWriter(new FileSink($this->testFile));
@@ -193,13 +300,17 @@ class ZipDirectoryTest extends TestCase
 }
 
 /**
- * Counts the number of 30-byte range() calls (the Local File Header
- * fetch path used by ZipDirectory::dataOffset). Other range sizes are
- * passed through untouched so EOCD/CD parsing continues to work.
+ * Counts range() calls — every call, plus the 30-byte fetches
+ * specifically (the Local File Header path used by
+ * ZipDirectory::dataOffset). Deliberately does NOT implement
+ * SupportsSuffixRange so the two-step size()+range tail flow stays
+ * exercised.
  */
 class RangeCountingSource implements \Kolay\XlsxStream\Contracts\Source
 {
     private int $lfhCalls = 0;
+
+    private int $rangeCalls = 0;
 
     public function __construct(private LocalFileSource $inner) {}
 
@@ -210,6 +321,7 @@ class RangeCountingSource implements \Kolay\XlsxStream\Contracts\Source
 
     public function range(int $offset, int $length): string
     {
+        $this->rangeCalls++;
         if ($length === 30) {
             $this->lfhCalls++;
         }
@@ -230,10 +342,16 @@ class RangeCountingSource implements \Kolay\XlsxStream\Contracts\Source
     public function resetRangeCalls(): void
     {
         $this->lfhCalls = 0;
+        $this->rangeCalls = 0;
     }
 
     public function lfhRangeCallCount(): int
     {
         return $this->lfhCalls;
+    }
+
+    public function rangeCallCount(): int
+    {
+        return $this->rangeCalls;
     }
 }

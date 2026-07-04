@@ -95,6 +95,98 @@ class StreamingSheetReader
      */
     public function rowsFromOffset(?int $compOffset, int $startingRowNumber): \Generator
     {
+        $rowNumber = $startingRowNumber;
+        $buffer = '';
+
+        foreach ($this->inflatedChunks($compOffset) as $inflated) {
+            $buffer .= $inflated;
+
+            $cursor = 0;
+            while (true) {
+                $rowStart = self::findRowOpen($buffer, $cursor);
+                if ($rowStart < 0) {
+                    break;
+                }
+                $rowEnd = strpos($buffer, '</row>', $rowStart);
+                if ($rowEnd === false) {
+                    break;
+                }
+                $rowXml = substr($buffer, $rowStart, $rowEnd + 6 - $rowStart);
+                $cursor = $rowEnd + 6;
+                yield $rowNumber => CellTokenizer::tokenizeRow($rowXml, $this->sst);
+                $rowNumber++;
+            }
+
+            if ($cursor > 0) {
+                $buffer = substr($buffer, $cursor);
+            }
+
+            // After draining every complete row, anything left in
+            // $buffer is one in-progress row's prefix. A pathological
+            // sheet that opens <row> and never closes it would let
+            // the buffer grow to GB scale and OOM the process. Cap
+            // it loudly instead.
+            if (strlen($buffer) > self::MAX_ROW_XML_BYTES) {
+                throw XlsxReadException::corruptCentralDirectory(
+                    'in-progress row XML exceeds '.(self::MAX_ROW_XML_BYTES / 1024 / 1024).
+                    ' MB without a closing tag — sheet is malformed or malicious'
+                );
+            }
+        }
+    }
+
+    /**
+     * Count the rows that rows() would yield — without tokenizing a
+     * single cell.
+     *
+     * rows() consumes the sheet as "row-open … next '</row>'" slices:
+     * every yield consumes exactly one '</row>', and every '</row>' in
+     * well-formed sheetData belongs to exactly one yield. Counting
+     * '</row>' occurrences in the inflated byte stream therefore gives
+     * the same number as iterator_count(rows()) while skipping the
+     * per-cell tokenization entirely.
+     *
+     * Why '</row>' and not row openings: self-closing rows
+     * (<row r="5"/>, legal in external files for empty rows) produce
+     * no yield of their own in rows() — the slice runs from their
+     * opening to the *next* row's closing tag — and they emit no
+     * '</row>' either, so the counts still agree. Counting openings
+     * would overcount relative to rows() for exactly that shape.
+     *
+     * '</row>' cannot occur inside cell text ('<' is always escaped as
+     * &lt; in XML content) and no other worksheet element matches the
+     * full 6-byte pattern ('</rowBreaks>' fails the trailing '>').
+     *
+     * Chunk boundaries: the last 5 bytes of the previous chunk are
+     * prepended before counting. The needle is 6 bytes, so the carry
+     * alone can never hold a complete match (no double counting), while
+     * any match straddling the boundary is fully visible in carry+chunk.
+     */
+    public function countRows(): int
+    {
+        $count = 0;
+        $carry = '';
+
+        foreach ($this->inflatedChunks(null) as $chunk) {
+            $buf = $carry.$chunk;
+            $count += substr_count($buf, '</row>');
+            $carry = substr($buf, -5);
+        }
+
+        return $count;
+    }
+
+    /**
+     * Stream the sheet entry's inflated bytes as string chunks. Shared
+     * engine behind rowsFromOffset() (row assembly) and countRows()
+     * (boundary counting): entry validation, the ranged read loop, the
+     * inflate context and the stalled-source backoff all live here so
+     * both consumers stay in lockstep.
+     *
+     * @return \Generator<int, string>
+     */
+    private function inflatedChunks(?int $compOffset): \Generator
+    {
         $entry = $this->cd->entry($this->sheetEntry);
         if ($entry === null) {
             throw XlsxReadException::entryNotFound($this->sheetEntry);
@@ -125,8 +217,6 @@ class StreamingSheetReader
             }
         }
 
-        $rowNumber = $startingRowNumber;
-        $buffer = '';
         // STORED has no deflate state to flush — treat the FINISH step
         // as already done so the loop exits cleanly when input runs out.
         $finishedFlush = $method === self::METHOD_STORED;
@@ -178,39 +268,7 @@ class StreamingSheetReader
                 }
 
                 if ($inflated !== '') {
-                    $buffer .= $inflated;
-                }
-
-                $cursor = 0;
-                while (true) {
-                    $rowStart = self::findRowOpen($buffer, $cursor);
-                    if ($rowStart < 0) {
-                        break;
-                    }
-                    $rowEnd = strpos($buffer, '</row>', $rowStart);
-                    if ($rowEnd === false) {
-                        break;
-                    }
-                    $rowXml = substr($buffer, $rowStart, $rowEnd + 6 - $rowStart);
-                    $cursor = $rowEnd + 6;
-                    yield $rowNumber => CellTokenizer::tokenizeRow($rowXml, $this->sst);
-                    $rowNumber++;
-                }
-
-                if ($cursor > 0) {
-                    $buffer = substr($buffer, $cursor);
-                }
-
-                // After draining every complete row, anything left in
-                // $buffer is one in-progress row's prefix. A pathological
-                // sheet that opens <row> and never closes it would let
-                // the buffer grow to GB scale and OOM the process. Cap
-                // it loudly instead.
-                if (strlen($buffer) > self::MAX_ROW_XML_BYTES) {
-                    throw XlsxReadException::corruptCentralDirectory(
-                        'in-progress row XML exceeds '.(self::MAX_ROW_XML_BYTES / 1024 / 1024).
-                        ' MB without a closing tag — sheet is malformed or malicious'
-                    );
+                    yield $inflated;
                 }
 
                 if ($compRemaining === 0 && $finishedFlush) {

@@ -5,6 +5,126 @@ All notable changes to `kolay/xlsx-stream` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.0] — 2026-07-04
+
+### Added — Queryable XLSX (KXSI "STAT" sidecar extension)
+
+- **`withColumnStats(array $columns)`** on the writer: track per-block
+  min/max/sum/count statistics (zone maps) for chosen 1-based columns,
+  plus a per-sheet sorted-ascending/descending verdict, embedded in the
+  random-access sidecar. Implies `withRandomAccessIndex()`. Cost: a few
+  comparisons per tracked cell and ~13 KB of sidecar per column at
+  4M rows / 10K sync period.
+- **TLV extension framing**: optional tagged sections (`STAT` today)
+  appended after the v2 core body — the version byte stays 2 on
+  purpose. The v3.0.x decoder parses exactly `sheet_count` core
+  sections and ignores trailing bytes, so **old readers keep full
+  random access on stats-bearing files** (they just can't see the
+  stats), and future sections ship without a version bump that would
+  strand older readers. Stats-less files remain byte-identical to
+  v3.0.x output.
+- **`columnStats(int $column)`** on the reader: whole-sheet
+  min/max/sum/avg/count + sortedness answered from the sidecar alone —
+  on S3, one range request against a multi-GB file.
+- **`rowsWhere(int $column, string $op, $value, $value2 = null)`**:
+  numeric predicate scan (`=`, `<`, `<=`, `>`, `>=`, `between`) that
+  uses zone maps to skip every block whose `[min,max]` provably cannot
+  match — Parquet-style row-group pruning inside a spreadsheet Excel
+  still opens normally. Degrades to a full-scan filter (same results)
+  when stats are absent.
+- **`findRow(int $column, $value)`**: point lookup; on a column the
+  writer observed to be sorted this reads a single block — two S3
+  round trips end to end.
+- **`shards(int $count)` / `rowsForShard(array $shard)`**: split a
+  born-indexed sheet into independently decompressible, JSON-serializable
+  row ranges for queue fan-out — N workers each stream 1/N of the file
+  with zero coordination. Non-indexed files degrade to a single
+  whole-sheet shard.
+- **`SupportsSuffixRange`** optional Source capability (implemented by
+  `LocalFileSource` and `S3RangeSource`) — fetch the ZIP tail and learn
+  the object size in one request.
+
+### Performance
+
+- **Writer +55 % throughput** (500K-row mixed bench, apples-to-apples
+  with generation cost excluded: median 2.68s → 1.73s, ~289K rows/s,
+  peak RAM unchanged at 6 MB):
+  - `fastXmlEscape` gate switched from a 34-char `strpbrk` needle to a
+    PCRE-JIT character class (~5× cheaper on clean strings, which are
+    the overwhelming majority);
+  - `buildRowXml`/`buildStyledRowXml` flattened — string-first type
+    dispatch, column-letter cache hoisted to a local, direct string
+    append instead of array + implode. Sheet XML verified
+    **byte-identical** against v3.0.2 on an edge-case corpus;
+  - default deflate level 6 → 5 — measured knee of the curve for
+    XLSX-shaped XML: ~0.2 % larger file, ~20 % less wall time. Call
+    `setCompressionLevel(6)` to restore the old bytes.
+- **Reader open on S3: 7 → 3 round trips** — single suffix-range GET
+  replaces HEAD + tail GET, LFH + body fetches coalesced for small
+  entries (≤ 1 MB), `xl/workbook.xml` fetched + inflated once instead
+  of twice (it fed both sheet resolution and date1904 detection).
+- **`rowCount()` fast path** without an index: counts `</row>`
+  boundaries on the inflated stream instead of tokenizing every cell
+  (5–10× faster), skips shared-strings resolution entirely (and its S3
+  fetch), and no longer refuses files whose SST exceeds the RAM
+  thresholds — counting never needed it.
+- **`castDate` timezone cache** — one `DateTimeZone` construction per
+  configuration instead of per date cell (2–3× faster date casting).
+- EOCD scan uses `strrpos` instead of a byte-wise backward loop;
+  `S3RangeSource::range()` guards zero/negative lengths.
+
+### Fixed
+
+- **`rowsForShard()` implicit sheet switch left stale per-sheet state.**
+  A shard addressing a different worksheet switched the reader's
+  current entry without the resets `onSheet()`/`onSheetIndex()`
+  perform: `header()` kept returning the previous sheet's cached
+  header, and `castColumn()` registrations from the previous sheet
+  were applied to the new sheet's rows. The implicit switch now runs
+  the same resets. Found by adversarial audit with reproduction.
+- **Preset-name guard rejected valid pure-lowercase format codes.**
+  Date-token runs like `'dddd'` (weekday) or `'mmss'` are legitimate
+  Excel format codes but matched the typo-guard's preset-name shape.
+  Strings built only from the `d/m/y/h/s` token letters now pass, and
+  `setColumnFormat($col, $code, raw: true)` skips preset resolution
+  and the guard entirely — the escape hatch for arbitrary codes from
+  external constant tables (e.g. PhpSpreadsheet `NumberFormat`).
+- **Zone-map pruning could hide a numeric-looking header row.** The
+  header is emitted via the sheet preamble, not `writeRow()`, so it
+  wasn't folded into block 0's stats — `rowsWhere()`/`findRow()` for a
+  value matching the header but outside the data range returned the
+  header on the full-scan path and nothing on the pruned path. The
+  writer now folds header cells into block 0 (min/max/sum/count; the
+  sortedness verdict deliberately stays data-only), restoring the
+  "stats widen, never narrow" invariant. Found by adversarial oracle
+  testing; regression-tested against both paths.
+- **`rowsWhere()` fallback path yielded 0-based keys.** Without stats
+  the full-scan filter iterated a key-stripping wrapper, so the same
+  query yielded sequential 0-based keys instead of the documented
+  1-based sheet row numbers the pruned path emits. Both paths now
+  yield identical keys.
+- **`findRow()` docblock overstated its mechanism.** It performs
+  zone-map pruning with first-match early exit, not a binary search;
+  on sorted columns the prune alone bounds the lookup to typically one
+  block, so the cost claim was right and the wording now matches the
+  implementation. The sidecar's sorted flag remains informational
+  (surfaced via `columnStats()['sorted']`).
+- **Unknown format-preset names now throw at write time.**
+  `setColumnFormat($col, 'currency')` — a typo'd or guessed preset
+  name — used to fall through as a literal `formatCode="currency"`,
+  producing a styles.xml that MS Excel refuses to open without repair
+  (verified against real Excel). A lowercase-letters string that isn't
+  a known preset is rejected with the preset list in the message; raw
+  Excel format codes (`"#,##0.000"` etc.) are unaffected.
+
+### Benchmarks
+
+- `bench/row_style_bench.php` now measures row-generation cost in a
+  calibration pass and subtracts it (previous published numbers
+  understated writer throughput by ~10–13 %); DateTime test data comes
+  from a pre-built pool. `bench/results.json` carries re-measured
+  v3.0.2 and v3.1.0 numbers side by side.
+
 ## [3.0.2] — 2026-06-26
 
 ### Added — Per-row styling

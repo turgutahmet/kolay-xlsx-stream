@@ -78,10 +78,37 @@ class StyleRegistry
      *
      * Accepts a preset name (e.g. "date", "currency_try") or a raw Excel
      * format code (e.g. "0.000"). Same code → same style id (idempotent).
+     * Pass $raw = true to skip preset resolution AND the typo guard —
+     * the string is taken verbatim as an Excel format code.
      */
-    public function registerColumnFormat(string $presetOrCode): int
+    public function registerColumnFormat(string $presetOrCode, bool $raw = false): int
     {
-        $code = self::PRESETS[$presetOrCode] ?? $presetOrCode;
+        $code = $raw ? $presetOrCode : (self::PRESETS[$presetOrCode] ?? $presetOrCode);
+
+        // A string made purely of lowercase letters/underscores is a
+        // preset NAME shape, almost never a raw format code (real codes
+        // carry #, 0, %, punctuation or quoting). Letting a typo like
+        // "currency" fall through as a literal formatCode produces a
+        // file MS Excel refuses to open without repair — fail loudly at
+        // write time instead of corrupting the workbook silently.
+        //
+        // The one legitimate pure-lowercase family: date-token runs like
+        // "dddd" (weekday), "mmmm" (month name), "mmss", "yyyymmdd" —
+        // strings built ONLY from the d/m/y/h/s token letters. Those are
+        // valid codes and pass through; anything else lowercase either
+        // names a preset or is a typo. $raw bypasses the whole check.
+        if (! $raw
+            && $code === $presetOrCode
+            && preg_match('/^[a-z_]+$/', $presetOrCode)
+            && ! preg_match('/^[dmyhs]+$/', $presetOrCode)
+        ) {
+            throw new \Kolay\XlsxStream\Exceptions\XlsxStreamException(
+                "Unknown format preset '{$presetOrCode}'. Available presets: ".
+                implode(', ', array_keys(self::PRESETS)).
+                '. To use a raw Excel format code, pass the code itself (e.g. "#,##0.00") '.
+                'or call setColumnFormat($col, $code, raw: true).'
+            );
+        }
 
         $numFmtId = $this->resolveNumFmtId($code);
 

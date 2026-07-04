@@ -86,6 +86,59 @@ class V22StylingTest extends TestCase
         $this->assertStringContainsString('formatCode="yyyy-mm-dd"', $styles);
     }
 
+    public function test_unknown_preset_name_throws_instead_of_corrupting_styles(): void
+    {
+        // A lowercase-letters string that isn't a known preset ("currency",
+        // "money", a typo of "currency_try"…) must fail at write time.
+        // Passed through as a literal formatCode it produces a styles.xml
+        // that MS Excel refuses to open without repair — verified against
+        // real Excel, which flagged 'formatCode="currency"' as corrupt.
+        $writer = new SinkableXlsxWriter(new FileSink($this->testFile));
+
+        $this->expectException(\Kolay\XlsxStream\Exceptions\XlsxStreamException::class);
+        $this->expectExceptionMessageMatches('/Unknown format preset .currency./');
+        $writer->setColumnFormat(1, 'currency');
+    }
+
+    public function test_raw_format_codes_still_accepted(): void
+    {
+        $writer = new SinkableXlsxWriter(new FileSink($this->testFile));
+        $writer->setColumnFormat(1, '#,##0.000');
+        $writer->startFile(['Qty']);
+        $writer->writeRow([1.5]);
+        $writer->finishFile();
+
+        $this->assertStringContainsString('formatCode="#,##0.000"', $this->extract('xl/styles.xml'));
+    }
+
+    public function test_pure_date_token_codes_pass_the_preset_guard(): void
+    {
+        // 'dddd' (weekday name), 'mmss' etc. are VALID Excel format codes
+        // that happen to be pure lowercase — the typo guard must not eat
+        // them (it did briefly; caught by the bridge design review).
+        $writer = new SinkableXlsxWriter(new FileSink($this->testFile));
+        $writer->setColumnFormat(1, 'dddd');
+        $writer->startFile(['Day']);
+        $writer->writeRow([new \DateTime('2026-01-15', new \DateTimeZone('UTC'))]);
+        $writer->finishFile();
+
+        $this->assertStringContainsString('formatCode="dddd"', $this->extract('xl/styles.xml'));
+    }
+
+    public function test_raw_flag_bypasses_preset_guard_entirely(): void
+    {
+        // Escape hatch for arbitrary codes from external constant tables
+        // (e.g. PhpSpreadsheet NumberFormat values) — even preset-shaped
+        // strings go through verbatim with raw: true.
+        $writer = new SinkableXlsxWriter(new FileSink($this->testFile));
+        $writer->setColumnFormat(1, 'zzz', raw: true);
+        $writer->startFile(['X']);
+        $writer->writeRow([1]);
+        $writer->finishFile();
+
+        $this->assertStringContainsString('formatCode="zzz"', $this->extract('xl/styles.xml'));
+    }
+
     public function test_set_column_format_preset_currency_try()
     {
         $writer = new SinkableXlsxWriter(new FileSink($this->testFile));

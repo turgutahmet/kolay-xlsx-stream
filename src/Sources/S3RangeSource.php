@@ -5,6 +5,7 @@ namespace Kolay\XlsxStream\Sources;
 use Aws\S3\S3Client;
 use GuzzleHttp\Psr7\StreamWrapper;
 use Kolay\XlsxStream\Contracts\Source;
+use Kolay\XlsxStream\Contracts\SupportsSuffixRange;
 use Kolay\XlsxStream\Exceptions\XlsxReadException;
 
 /**
@@ -18,7 +19,7 @@ use Kolay\XlsxStream\Exceptions\XlsxReadException;
  * getObject call — without it the SDK spills bodies >2 MB to php://temp,
  * which would defeat the bounded-memory goal of the reader.
  */
-class S3RangeSource implements Source
+class S3RangeSource implements Source, SupportsSuffixRange
 {
     private S3Client $s3;
     private string $bucket;
@@ -54,6 +55,13 @@ class S3RangeSource implements Source
 
     public function range(int $offset, int $length): string
     {
+        // A zero/negative length would render as `bytes=X-(X-1)` — an
+        // unsatisfiable range S3 rejects with 416. An empty read has an
+        // empty result; skip the request.
+        if ($length <= 0) {
+            return '';
+        }
+
         try {
             $r = $this->s3->getObject([
                 'Bucket' => $this->bucket,
@@ -67,6 +75,51 @@ class S3RangeSource implements Source
         }
 
         return (string) $r['Body'];
+    }
+
+    /**
+     * Suffix-range read: `Range: bytes=-N` returns the last N bytes in
+     * one GET, and the 206 response's `Content-Range: bytes X-Y/total`
+     * header carries the object size — so this replaces the HEAD +
+     * ranged-tail pair ZipDirectory used to need with a single request.
+     *
+     * @return array{data: string, size: int}
+     */
+    public function tail(int $length): array
+    {
+        // `bytes=-0` is an unsatisfiable range (416); an empty suffix
+        // has an empty result, so only the size needs resolving.
+        if ($length < 1) {
+            return ['data' => '', 'size' => $this->size()];
+        }
+
+        try {
+            $r = $this->s3->getObject([
+                'Bucket' => $this->bucket,
+                'Key' => $this->key,
+                'Range' => sprintf('bytes=-%d', $length),
+            ]);
+        } catch (\Throwable $e) {
+            throw XlsxReadException::sourceUnreadable(
+                "GET suffix range s3://{$this->bucket}/{$this->key}: ".$e->getMessage()
+            );
+        }
+
+        $data = (string) $r['Body'];
+
+        // AWS answers a suffix range with 206 + Content-Range (also when
+        // the suffix covers the whole object). Some S3-compatible stores
+        // reply 200 without Content-Range in the covers-everything case —
+        // the body then IS the whole object, so its length is the size.
+        $size = strlen($data);
+        if (isset($r['ContentRange']) && preg_match('~/(\d+)$~', (string) $r['ContentRange'], $m)) {
+            $size = (int) $m[1];
+        }
+
+        // Cache so a later size() call (e.g. streamFrom) skips the HEAD.
+        $this->size = $size;
+
+        return ['data' => $data, 'size' => $size];
     }
 
     public function streamFrom(int $offset)

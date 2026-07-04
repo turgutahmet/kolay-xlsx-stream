@@ -97,6 +97,33 @@ class CastColumnTest extends TestCase
         );
     }
 
+    public function test_castTimezone_change_invalidates_cached_timezone(): void
+    {
+        // castDate caches the DateTimeZone instance to avoid a tz
+        // database lookup per date cell. Reconfiguring the timezone
+        // after rows have already been cast must swap that cache —
+        // a stale instance would silently keep the old offset.
+        $this->writeNumericRows([46148.5]); // 2026-05-06 12:00 UTC
+        $reader = StreamingXlsxReader::fromFile($this->testFile)->castColumn(0, 'datetime');
+
+        // First pass primes the cache with the UTC default.
+        $rows = iterator_to_array($reader->rows(), false);
+        $this->assertSame('UTC', $rows[1][0]->getTimezone()->getName());
+        $this->assertSame('2026-05-06 12:00:00', $rows[1][0]->format('Y-m-d H:i:s'));
+
+        // Second pass after the override must use the new zone.
+        $reader->castTimezone('Europe/Istanbul');
+        $rows = iterator_to_array($reader->rows(), false);
+        $this->assertSame('Europe/Istanbul', $rows[1][0]->getTimezone()->getName());
+        $this->assertSame('2026-05-06 15:00:00', $rows[1][0]->format('Y-m-d H:i:s'));
+
+        // And overriding twice keeps tracking the latest setting.
+        $reader->castTimezone('America/New_York');
+        $rows = iterator_to_array($reader->rows(), false);
+        $this->assertSame('America/New_York', $rows[1][0]->getTimezone()->getName());
+        $this->assertSame('2026-05-06 08:00:00', $rows[1][0]->format('Y-m-d H:i:s'));
+    }
+
     public function test_castTimezone_rejects_invalid_tz(): void
     {
         $this->writeNumericRows([1]);

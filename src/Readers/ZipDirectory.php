@@ -3,6 +3,7 @@
 namespace Kolay\XlsxStream\Readers;
 
 use Kolay\XlsxStream\Contracts\Source;
+use Kolay\XlsxStream\Contracts\SupportsSuffixRange;
 use Kolay\XlsxStream\Exceptions\XlsxReadException;
 
 /**
@@ -29,6 +30,25 @@ class ZipDirectory
     private const CD_ENTRY_SIGNATURE = "PK\x01\x02";
     private const LFH_SIGNATURE = 0x04034b50;
     private const TAIL_PREFETCH = 65557; // 22 EOCD record + max 65535 ZIP comment
+
+    /**
+     * Compressed-size ceiling for the coalesced LFH+body fetch in
+     * readEntry(). Metadata parts (workbook.xml, .rels, the index
+     * sidecar, most shared-strings tables) sit far below this and get
+     * their header and body in one round-trip; anything larger — sheet
+     * bodies can be hundreds of MB — keeps the lazy two-step flow so
+     * the bounded-RAM contract holds.
+     */
+    private const COALESCE_CAP = 1024 * 1024;
+
+    /**
+     * Slack for the LFH extra field in the coalesced fetch. Its true
+     * length is only known after parsing the header, so the one-shot
+     * read over-fetches by this much; real-world writers emit 0-36
+     * bytes of extra data. A larger field just degrades to a second
+     * ranged read for the body remainder — never to a wrong result.
+     */
+    private const LFH_EXTRA_HEADROOM = 64;
 
     /**
      * @var array<string, array{
@@ -65,9 +85,17 @@ class ZipDirectory
 
     public static function fromSource(Source $source): self
     {
-        $size = $source->size();
-        $tailLen = (int) min(self::TAIL_PREFETCH, $size);
-        $tail = $source->range($size - $tailLen, $tailLen);
+        // Sources with suffix-range support deliver the tail bytes and
+        // the total size in one round-trip (`Range: bytes=-N` on S3);
+        // others pay the size() lookup plus a ranged read.
+        if ($source instanceof SupportsSuffixRange) {
+            ['data' => $tail, 'size' => $size] = $source->tail(self::TAIL_PREFETCH);
+            $tailLen = strlen($tail);
+        } else {
+            $size = $source->size();
+            $tailLen = (int) min(self::TAIL_PREFETCH, $size);
+            $tail = $source->range($size - $tailLen, $tailLen);
+        }
 
         $eocdPos = self::findEocd($tail);
         if ($eocdPos < 0) {
@@ -109,14 +137,17 @@ class ZipDirectory
     private static function findEocd(string $tail): int
     {
         // EOCD is 22 bytes minimum; comment field can push it earlier.
-        // Scan backwards for the signature.
-        for ($i = strlen($tail) - 22; $i >= 0; $i--) {
-            if (substr($tail, $i, 4) === self::EOCD_SIGNATURE) {
-                return $i;
-            }
+        // The last signature whose record still fits (start <= len-22)
+        // wins. strrpos with a negative offset caps the match start at
+        // exactly that position — same semantics as the previous
+        // byte-by-byte reverse scan, without a substr per position.
+        if (strlen($tail) < 22) {
+            return -1;
         }
 
-        return -1;
+        $pos = strrpos($tail, self::EOCD_SIGNATURE, -22);
+
+        return $pos === false ? -1 : $pos;
     }
 
     private static function parseCentralDirectory(string $cdBytes, int $count): self
@@ -176,6 +207,21 @@ class ZipDirectory
         }
 
         $lfhBytes = $source->range($entry['offset'], 30);
+        $lfh = self::parseLfh($lfhBytes, $name);
+
+        return $this->dataOffsetCache[$name] =
+            $entry['offset'] + 30 + $lfh['fnameLen'] + $lfh['extraLen'];
+    }
+
+    /**
+     * Unpack and validate a 30-byte Local File Header. The CD carries
+     * its own copy of most fields; the LFH is only consulted for the
+     * name/extra lengths that position the entry body.
+     *
+     * @return array{fnameLen: int, extraLen: int}
+     */
+    private static function parseLfh(string $lfhBytes, string $name): array
+    {
         $lfh = unpack(
             'Vsig/vverNeed/vflags/vmethod/vmtime/vmdate/Vcrc/VcompSize/VuncompSize/'.
             'vfnameLen/vextraLen',
@@ -185,8 +231,7 @@ class ZipDirectory
             throw XlsxReadException::badLocalFileHeader($name);
         }
 
-        return $this->dataOffsetCache[$name] =
-            $entry['offset'] + 30 + $lfh['fnameLen'] + $lfh['extraLen'];
+        return ['fnameLen' => (int) $lfh['fnameLen'], 'extraLen' => (int) $lfh['extraLen']];
     }
 
     /**
@@ -206,8 +251,7 @@ class ZipDirectory
             throw XlsxReadException::entryNotFound($name);
         }
 
-        $offset = $this->dataOffset($source, $name);
-        $compressed = $source->range($offset, $entry['compressed_size']);
+        $compressed = $this->fetchEntryBody($source, $name, $entry);
 
         if ($entry['method'] === 0) {
             return $compressed;
@@ -230,5 +274,56 @@ class ZipDirectory
         }
 
         return $inflated;
+    }
+
+    /**
+     * Fetch an entry's compressed body, coalescing the Local File
+     * Header lookup and the body read into a single ranged fetch for
+     * small entries.
+     *
+     * The two-step flow (30-byte LFH read to learn fnameLen/extraLen,
+     * then a body read) costs two round-trips per entry — noticeable on
+     * S3 where each is a full HTTP request. For entries at or below
+     * COALESCE_CAP a single over-fetch covers everything:
+     *
+     *     [ LFH 30 ][ name ][ extra ≤ headroom ][ body compressed_size ]
+     *
+     * The real extra length is parsed out of the fetched LFH bytes; if
+     * a writer used an extra field larger than the headroom, only the
+     * missing body tail is fetched separately — a rare shape that
+     * degrades to the old two-request cost, never to a wrong result.
+     *
+     * @param  array{compressed_size: int, offset: int}  $entry
+     */
+    private function fetchEntryBody(Source $source, string $name, array $entry): string
+    {
+        // Offset already known (nothing to coalesce) or body too large
+        // to prefetch — plain two-step read.
+        if (isset($this->dataOffsetCache[$name]) || $entry['compressed_size'] > self::COALESCE_CAP) {
+            $offset = $this->dataOffset($source, $name);
+
+            return $source->range($offset, $entry['compressed_size']);
+        }
+
+        $want = 30 + strlen($name) + self::LFH_EXTRA_HEADROOM + $entry['compressed_size'];
+        $buf = $source->range($entry['offset'], $want);
+
+        $lfh = self::parseLfh(substr($buf, 0, 30), $name);
+        $dataStart = 30 + $lfh['fnameLen'] + $lfh['extraLen'];
+
+        // Populate the shared cache so later dataOffset()/readEntry()
+        // calls for this entry skip the LFH fetch entirely.
+        $this->dataOffsetCache[$name] = $entry['offset'] + $dataStart;
+
+        if ($dataStart + $entry['compressed_size'] <= strlen($buf)) {
+            return substr($buf, $dataStart, $entry['compressed_size']);
+        }
+
+        // Extra field exceeded the headroom: keep what the over-fetch
+        // already delivered and pull only the remainder.
+        $have = substr($buf, $dataStart);
+        $missing = $entry['compressed_size'] - strlen($have);
+
+        return $have.$source->range($entry['offset'] + $dataStart + strlen($have), $missing);
     }
 }

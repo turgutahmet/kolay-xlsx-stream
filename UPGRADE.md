@@ -1,5 +1,30 @@
 # Upgrade Guide
 
+## Upgrading from v3.0.x to v3.1
+
+No breaking API changes — every v3.0 call site works unchanged. Two
+behavioral notes:
+
+### 1. Default compression level is now 5 (was 6)
+
+Output **bytes** change (the ZIP stays fully valid and Excel-compatible);
+file size grows ~0.2 % while writes get ~20 % faster. If anything in your
+pipeline compares file hashes or you want the exact old bytes back:
+
+```php
+$writer->setCompressionLevel(6);
+```
+
+### 2. Column stats ride the sidecar without breaking old readers
+
+Files written **without** `withColumnStats()` keep emitting the KXSI
+sidecar byte-identically. Files written **with** it append a TLV
+"STAT" section after the core body while the version byte stays 2 —
+the v3.0.x decoder parses the core and ignores trailing bytes, so
+older readers keep full `rowAt`/`rowRange`/`rowCount` random access on
+stats-bearing files; only the new `columnStats()`/`rowsWhere()`/
+`findRow()` surface requires v3.1 on the reading side.
+
 ## Upgrading from v1.x to v2.0
 
 v2.0 fixes data-corruption bugs and modernizes the dependency matrix. Below is
