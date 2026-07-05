@@ -276,6 +276,65 @@ abstract class BaseXlsxWriter
     public function __construct()
     {
         $this->styles = new StyleRegistry();
+
+        // Laravel-published config defaults. Guarded so the package
+        // stays framework-optional: outside Laravel config() either
+        // does not exist or has no container behind it (the helper is
+        // defined by illuminate/support even without an app booted —
+        // hence the try/catch, not just function_exists).
+        if (\function_exists('config')) {
+            try {
+                $cfg = config('xlsx-stream');
+            } catch (\Throwable) {
+                $cfg = null;
+            }
+            $this->applyConfigDefaults(is_array($cfg) ? $cfg : null);
+        }
+    }
+
+    /**
+     * Fold the published config's writer defaults into this instance.
+     *
+     * Precedence: code-level setters > config > package defaults. The
+     * config is applied once at construction, so any setter the caller
+     * invokes afterwards naturally overrides it.
+     *
+     * Version gate: copies of config/xlsx-stream.php published before
+     * v3.2.2 carried keys the package never read, with stale values
+     * that contradict the code defaults (compression_level 1 vs the
+     * writer's real default 5). Honouring them retroactively would
+     * silently change existing applications' output, so only configs
+     * declaring `'version' => 2` (the v3.2.2+ file) are applied —
+     * older published copies stay inert, exactly as they always were.
+     *
+     * Invalid values are silently ignored rather than thrown: this
+     * runs in the constructor, and a config file is environment data,
+     * not code — a bad env var must not turn every `new Writer` into
+     * a 500. The setters keep throwing for code-level misuse.
+     */
+    protected function applyConfigDefaults(?array $config): void
+    {
+        if ((int) ($config['version'] ?? 0) < 2) {
+            return;
+        }
+
+        $level = $config['writer']['compression_level'] ?? null;
+        if (is_numeric($level)) {
+            try {
+                $this->setCompressionLevel((int) $level);
+            } catch (\Throwable) {
+                // out-of-range config value — keep the package default
+            }
+        }
+
+        $interval = $config['writer']['buffer_flush_interval'] ?? null;
+        if (is_numeric($interval)) {
+            try {
+                $this->setBufferFlushInterval((int) $interval);
+            } catch (\Throwable) {
+                // out-of-range config value — keep the package default
+            }
+        }
     }
 
     /**
