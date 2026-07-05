@@ -5,6 +5,8 @@ namespace Kolay\XlsxStream\Readers;
 use Aws\S3\S3Client;
 use Kolay\XlsxStream\Contracts\Source;
 use Kolay\XlsxStream\Exceptions\XlsxReadException;
+use Kolay\XlsxStream\Sketches\HyperLogLog;
+use Kolay\XlsxStream\Sketches\TDigest;
 use Kolay\XlsxStream\Sources\LocalFileSource;
 use Kolay\XlsxStream\Sources\S3RangeSource;
 
@@ -105,6 +107,48 @@ class StreamingXlsxReader
      * @var array<string, list<array{first_row: int, last_row: int, comp_offset: int|null, uncomp_offset: int|null, start_row_at_offset: int|null}>>
      */
     private array $blockRangesByEntry = [];
+
+    /**
+     * Physical row count (header included) of a sheet the writer filled
+     * to Excel's split threshold before rolling to a continuation sheet
+     * (BaseXlsxWriter::ROWS_PER_SHEET). A non-final sheet of an
+     * auto-split chain has EXACTLY this many rows by construction —
+     * that near-impossible-by-hand precision is what makes fullness a
+     * reliable continuation signal.
+     */
+    private const FULL_SHEET_ROWS = 1_048_575;
+
+    /**
+     * Continuation-chain map: entry => ordered members of the chain the
+     * entry belongs to. A chain is a maximal run of consecutive sheets
+     * where every non-final member is exactly full and every member
+     * carries an identical header row — i.e. ONE logical table the
+     * writer split only because of Excel's row ceiling. Populated
+     * lazily by resolveChains(); single-sheet workbooks and files
+     * without a usable sidecar never build it.
+     *
+     * Member shape: entry, total (physical rows incl. header),
+     * dataStartLocal (1 for the first member, 2 for continuations —
+     * their repeated header row does not exist logically), globalStart
+     * (global row number of local row dataStartLocal).
+     *
+     * @var array<string, list<array{entry: string, total: int, dataStartLocal: int, globalStart: int}>>|null
+     */
+    private ?array $chainByEntry = null;
+
+    /**
+     * Raw (cast-free) header rows read for chain detection, memoized so
+     * each candidate sheet pays its one small read at most once.
+     *
+     * @var array<string, array<int, mixed>>
+     */
+    private array $headerByEntry = [];
+
+    /** @var array<string, TDigest|null> merged chain digests, keyed chain-head|column */
+    private array $chainDigestCache = [];
+
+    /** @var array<string, HyperLogLog|null> merged chain HLLs, keyed chain-head|column */
+    private array $chainHllCache = [];
 
     /** @var array<int, callable> */
     private array $columnCasts = [];
@@ -271,6 +315,27 @@ class StreamingXlsxReader
             return;
         }
 
+        // Chain: iterate the logical table across every member via the
+        // chain-aware rowRange (casts applied there), re-keying to this
+        // generator's documented 0-based emitted count.
+        $chain = $this->chain();
+        if ($chain !== null) {
+            $globalEnd = $this->chainTotalRows($chain);
+            if ($skip + 1 > $globalEnd) {
+                return;
+            }
+            $emitted = 0;
+            foreach ($this->rowRange($skip + 1, $globalEnd) as $row) {
+                yield $row;
+                $emitted++;
+                if ($limit !== null && $emitted >= $limit) {
+                    return;
+                }
+            }
+
+            return;
+        }
+
         if ($skip > 0) {
             // rows() counts yields, and rowsFromOffset() yields exactly
             // one row per '</row>' boundary from its starting row — so
@@ -340,6 +405,15 @@ class StreamingXlsxReader
      */
     public function rowCount(): int
     {
+        // Auto-split continuation chain: the file is ONE logical table,
+        // so the count spans every member (continuation headers do not
+        // exist logically). Pre-v3.2.2 this silently returned the
+        // active sheet's count alone.
+        $chain = $this->chain();
+        if ($chain !== null) {
+            return $this->chainTotalRows($chain);
+        }
+
         $index = $this->loadRandomAccessIndex();
         if ($index !== null) {
             $total = $index->totalRows($this->currentEntry);
@@ -380,6 +454,32 @@ class StreamingXlsxReader
             return null;
         }
 
+        // Chain: $rowNumber is a GLOBAL row — map it to (member, local)
+        // and read from that member's entry directly. State (casts,
+        // current sheet) is never touched: chain members share one
+        // schema by construction.
+        $chain = $this->chain();
+        if ($chain !== null) {
+            $loc = $this->chainLocate($chain, $rowNumber);
+            if ($loc === null) {
+                return null;
+            }
+            [$memberIdx, $local] = $loc;
+            $entry = $chain[$memberIdx]['entry'];
+            [$compOffset, $startingRow] = $this->seekTarget($local, $entry);
+
+            foreach ($this->openSheetReader([], $entry)->rowsFromOffset($compOffset, $startingRow, $local) as $rn => $row) {
+                if ($rn === $local) {
+                    return $this->applyCasts($row);
+                }
+                if ($rn > $local) {
+                    return null;
+                }
+            }
+
+            return null;
+        }
+
         [$compOffset, $startingRow] = $this->seekTarget($rowNumber);
 
         foreach ($this->openSheetReader()->rowsFromOffset($compOffset, $startingRow, $rowNumber) as $rn => $row) {
@@ -408,6 +508,52 @@ class StreamingXlsxReader
             $from = 1;
         }
         if ($to < $from) {
+            return;
+        }
+
+        // Chain: [from, to] are GLOBAL rows — walk the overlapping
+        // members in order, translating each member's local rows back
+        // to global keys. Continuation headers (local row 1) are below
+        // every member's dataStartLocal and never surface.
+        $chain = $this->chain();
+        if ($chain !== null) {
+            $globalEnd = $this->chainTotalRows($chain);
+            if ($from > $globalEnd) {
+                return;
+            }
+            $to = min($to, $globalEnd);
+
+            $loc = $this->chainLocate($chain, $from);
+            if ($loc === null) {
+                return;
+            }
+            [$memberIdx, $localFrom] = $loc;
+
+            for ($i = $memberIdx, $n = count($chain); $i <= $n - 1; $i++) {
+                $m = $chain[$i];
+                $coverEnd = $m['globalStart'] + $m['total'] - $m['dataStartLocal'];
+                if ($m['globalStart'] > $to && $i > $memberIdx) {
+                    return;
+                }
+                $startLocal = $i === $memberIdx ? $localFrom : $m['dataStartLocal'];
+                $stopLocal = $m['dataStartLocal'] + (min($to, $coverEnd) - $m['globalStart']);
+
+                [$compOffset, $startingRow] = $this->seekTarget($startLocal, $m['entry']);
+                foreach ($this->openSheetReader([], $m['entry'])->rowsFromOffset($compOffset, $startingRow, $startLocal) as $rn => $row) {
+                    if ($rn < $startLocal) {
+                        continue;
+                    }
+                    if ($rn > $stopLocal) {
+                        break;
+                    }
+                    yield $m['globalStart'] + ($rn - $m['dataStartLocal']) => $this->applyCasts($row);
+                }
+
+                if ($coverEnd >= $to) {
+                    return;
+                }
+            }
+
             return;
         }
 
@@ -450,6 +596,78 @@ class StreamingXlsxReader
     public function columnStats(int $column): ?array
     {
         $index = $this->loadRandomAccessIndex();
+
+        // Chain: fold every member's blocks — the sidecar carries each
+        // physical sheet's stats separately and sums/min/max compose
+        // exactly. All-or-nothing: if any member lacks the column, the
+        // chain answer would silently cover part of the table (the very
+        // bug this path fixes), so return null instead. `other` keeps
+        // its documented per-physical-sheet header contribution — one
+        // header cell per member for the usual text header.
+        $chain = $this->chain();
+        if ($chain !== null && $index !== null) {
+            $min = null;
+            $max = null;
+            $sum = 0.0;
+            $count = 0;
+            $other = 0;
+            $allAsc = true;
+            $allDesc = true;
+            $prevMemberMin = null;
+            $prevMemberMax = null;
+            $boundariesAsc = true;
+            $boundariesDesc = true;
+
+            foreach ($chain as $m) {
+                $stats = $index->columnStats($m['entry'], $column);
+                if ($stats === null) {
+                    return null;
+                }
+
+                $mMin = null;
+                $mMax = null;
+                foreach ($stats['blocks'] as $block) {
+                    if ($block['count'] > 0) {
+                        $mMin = $mMin === null ? $block['min'] : min($mMin, $block['min']);
+                        $mMax = $mMax === null ? $block['max'] : max($mMax, $block['max']);
+                        $sum += $block['sum'];
+                        $count += $block['count'];
+                    }
+                    $other += $block['other'];
+                }
+
+                $allAsc = $allAsc && $stats['sorted_asc'];
+                $allDesc = $allDesc && $stats['sorted_desc'];
+
+                // Chain-level sortedness needs the member boundaries in
+                // order too. Member min/max include the header folded
+                // into block 0, which can only turn a true verdict into
+                // null (conservative-safe), never the reverse.
+                if ($mMin !== null) {
+                    if ($prevMemberMax !== null && $mMin < $prevMemberMax) {
+                        $boundariesAsc = false;
+                    }
+                    if ($prevMemberMin !== null && $mMax > $prevMemberMin) {
+                        $boundariesDesc = false;
+                    }
+                    $prevMemberMin = $mMin;
+                    $prevMemberMax = $mMax;
+                    $min = $min === null ? $mMin : min($min, $mMin);
+                    $max = $max === null ? $mMax : max($max, $mMax);
+                }
+            }
+
+            return [
+                'min' => $min,
+                'max' => $max,
+                'sum' => $sum,
+                'avg' => $count > 0 ? $sum / $count : null,
+                'count' => $count,
+                'other' => $other,
+                'sorted' => ($allAsc && $boundariesAsc) ? 'asc' : (($allDesc && $boundariesDesc) ? 'desc' : null),
+            ];
+        }
+
         $stats = $index?->columnStats($this->currentEntry, $column);
         if ($stats === null) {
             return null;
@@ -506,9 +724,49 @@ class StreamingXlsxReader
             throw new \InvalidArgumentException("quantile must be within [0, 1]; got {$q}");
         }
 
+        $chain = $this->chain();
+        if ($chain !== null) {
+            return $this->chainDigest($chain, $column)?->quantile($q);
+        }
+
         $digest = $this->loadRandomAccessIndex()?->columnDigest($this->currentEntry, $column);
 
         return $digest?->quantile($q);
+    }
+
+    /**
+     * Merged t-digest across a chain's members — the sketches' merge
+     * associativity is exactly what makes per-sheet sections compose
+     * into one logical-table answer. All-or-nothing like columnStats:
+     * a member without the sketch would make the merged answer cover
+     * part of the table, so the result is null instead. Memoized per
+     * (chain, column); the first member's digest is cloned so the
+     * sidecar's cached instances are never mutated.
+     *
+     * @param  list<array{entry: string, total: int, dataStartLocal: int, globalStart: int}>  $chain
+     */
+    private function chainDigest(array $chain, int $column): ?TDigest
+    {
+        $key = $chain[0]['entry'].'|'.$column;
+        if (array_key_exists($key, $this->chainDigestCache)) {
+            return $this->chainDigestCache[$key];
+        }
+
+        $index = $this->loadRandomAccessIndex();
+        $merged = null;
+        foreach ($chain as $m) {
+            $digest = $index?->columnDigest($m['entry'], $column);
+            if ($digest === null) {
+                return $this->chainDigestCache[$key] = null;
+            }
+            if ($merged === null) {
+                $merged = clone $digest;
+            } else {
+                $merged->merge($digest);
+            }
+        }
+
+        return $this->chainDigestCache[$key] = $merged;
     }
 
     /**
@@ -536,9 +794,51 @@ class StreamingXlsxReader
      */
     public function countDistinct(int $column): ?int
     {
+        $chain = $this->chain();
+        if ($chain !== null) {
+            return $this->chainHll($chain, $column)?->count();
+        }
+
         $hll = $this->loadRandomAccessIndex()?->columnHll($this->currentEntry, $column);
 
         return $hll?->count();
+    }
+
+    /**
+     * Merged HyperLogLog across a chain's members — register-wise max,
+     * the union sketch. Same all-or-nothing and clone-first rules as
+     * chainDigest(); a precision mismatch between members (impossible
+     * from one writer run, conceivable from a crafted sidecar) answers
+     * null rather than throwing mid-query.
+     *
+     * @param  list<array{entry: string, total: int, dataStartLocal: int, globalStart: int}>  $chain
+     */
+    private function chainHll(array $chain, int $column): ?HyperLogLog
+    {
+        $key = $chain[0]['entry'].'|'.$column;
+        if (array_key_exists($key, $this->chainHllCache)) {
+            return $this->chainHllCache[$key];
+        }
+
+        $index = $this->loadRandomAccessIndex();
+        $merged = null;
+        foreach ($chain as $m) {
+            $hll = $index?->columnHll($m['entry'], $column);
+            if ($hll === null) {
+                return $this->chainHllCache[$key] = null;
+            }
+            if ($merged === null) {
+                $merged = clone $hll;
+            } else {
+                try {
+                    $merged->merge($hll);
+                } catch (\InvalidArgumentException) {
+                    return $this->chainHllCache[$key] = null;
+                }
+            }
+        }
+
+        return $this->chainHllCache[$key] = $merged;
     }
 
     /**
@@ -561,26 +861,61 @@ class StreamingXlsxReader
      */
     public function rowsWhere(int $column, string $op, int|float $value, int|float|null $value2 = null): \Generator
     {
-        [$lo, $hi] = $this->pruneBounds($op, $value, $value2);
-
-        $index = $this->loadRandomAccessIndex();
-        $stats = $index?->columnStats($this->currentEntry, $column);
-
-        if ($stats === null) {
-            // No zone maps — scan everything, filter per row. NOT via
-            // rows(): that wrapper re-keys sequentially from 0, while
-            // this generator's contract (and the pruned path below) is
-            // 1-based sheet row numbers.
-            foreach ($this->openSheetReader([$column - 1])->rowsFromOffset(null, 1) as $rn => $row) {
-                if ($this->cellMatches($row[$column - 1] ?? null, $op, $value, $value2)) {
-                    yield $rn => $this->applyCasts($row);
+        // Chain: run the per-sheet matcher over every member in order,
+        // remapping local row numbers to the chain's global numbering.
+        // Continuation members' repeated header row (local 1) is
+        // filtered — it does not exist logically, and its local number
+        // would collide with the previous member's last data row after
+        // remapping.
+        $chain = $this->chain();
+        if ($chain !== null) {
+            foreach ($chain as $i => $m) {
+                foreach ($this->matchRowsIn($m['entry'], $column, $op, $value, $value2) as $rn => $row) {
+                    if ($i > 0 && $rn === 1) {
+                        continue;
+                    }
+                    yield $m['globalStart'] + ($rn - $m['dataStartLocal']) => $this->applyCasts($row);
                 }
             }
 
             return;
         }
 
-        $ranges = $this->blockRanges($index);
+        foreach ($this->matchRowsIn($this->currentEntry, $column, $op, $value, $value2) as $rn => $row) {
+            yield $rn => $this->applyCasts($row);
+        }
+    }
+
+    /**
+     * Single-sheet predicate matcher behind rowsWhere(): zone-map
+     * pruning + run-merged scans over one entry, yielding LOCAL 1-based
+     * row number => raw matched row (casts belong to the caller). This
+     * is the pre-v3.2.2 rowsWhere body parameterized by entry.
+     *
+     * @return \Generator<int, array<int, mixed>>
+     */
+    private function matchRowsIn(string $entry, int $column, string $op, int|float $value, int|float|null $value2): \Generator
+    {
+        [$lo, $hi] = $this->pruneBounds($op, $value, $value2);
+
+        $index = $this->loadRandomAccessIndex();
+        $stats = $index?->columnStats($entry, $column);
+
+        if ($stats === null) {
+            // No zone maps — scan everything, filter per row. NOT via
+            // rows(): that wrapper re-keys sequentially from 0, while
+            // this generator's contract (and the pruned path below) is
+            // 1-based sheet row numbers.
+            foreach ($this->openSheetReader([$column - 1], $entry)->rowsFromOffset(null, 1) as $rn => $row) {
+                if ($this->cellMatches($row[$column - 1] ?? null, $op, $value, $value2)) {
+                    yield $rn => $row;
+                }
+            }
+
+            return;
+        }
+
+        $ranges = $this->blockRanges($index, $entry);
 
         // Prune, then merge surviving adjacent blocks into runs so each
         // run costs one seek + one linear scan instead of per-block seeks.
@@ -603,7 +938,7 @@ class StreamingXlsxReader
             $start = $ranges[$firstBlock];
             $stopRow = $ranges[$lastBlock]['last_row'];
 
-            foreach ($this->openSheetReader([$column - 1])->rowsFromOffset($start['comp_offset'], $start['start_row_at_offset'] ?? 1, $start['first_row']) as $rn => $row) {
+            foreach ($this->openSheetReader([$column - 1], $entry)->rowsFromOffset($start['comp_offset'], $start['start_row_at_offset'] ?? 1, $start['first_row']) as $rn => $row) {
                 if ($rn < $start['first_row']) {
                     continue;
                 }
@@ -611,7 +946,7 @@ class StreamingXlsxReader
                     break;
                 }
                 if ($this->cellMatches($row[$column - 1] ?? null, $op, $value, $value2)) {
-                    yield $rn => $this->applyCasts($row);
+                    yield $rn => $row;
                 }
             }
         }
@@ -690,6 +1025,12 @@ class StreamingXlsxReader
      * Groups are returned in first-encounter sheet order — ascending
      * group keys for an asc-sorted column, descending for desc.
      *
+     * On an auto-split continuation chain the aggregation covers the
+     * whole logical table: members fold in workbook order, the same
+     * group key accumulates across members, and group order stays
+     * first-encounter across the chain. Each member keeps its own
+     * pushdown verdict (an unsorted member degrades to a scan alone).
+     *
      * @param  callable(float): (int|float)  $bucket
      * @return list<array{group: int|float, sum: float, count: int, min: float|null, max: float|null}>
      */
@@ -702,29 +1043,53 @@ class StreamingXlsxReader
         }
         $bucket ??= static fn (float $v): float => $v;
 
-        $index = $this->loadRandomAccessIndex();
-        $groupCol = $index?->columnStats($this->currentEntry, $groupBy);
-        $aggCol = $index?->columnStats($this->currentEntry, $aggregate);
-
         /** @var array<string, array{group: int|float, sum: float, count: int, min: float|null, max: float|null}> $groups */
         $groups = [];
+
+        $chain = $this->chain();
+        if ($chain !== null) {
+            foreach ($chain as $m) {
+                $this->foldGroupStatsFor($m['entry'], $groupBy, $aggregate, $bucket, $groups);
+            }
+        } else {
+            $this->foldGroupStatsFor($this->currentEntry, $groupBy, $aggregate, $bucket, $groups);
+        }
+
+        return array_values($groups);
+    }
+
+    /**
+     * Single-sheet engine behind groupStats(): the pre-v3.2.2 body
+     * parameterized by entry, folding into the caller's group map so
+     * chain members compose. The rn === 1 exclusions double as the
+     * continuation-header filter — a member's repeated header row is
+     * its local row 1.
+     *
+     * @param  callable(float): (int|float)  $bucket
+     * @param  array<string, array{group: int|float, sum: float, count: int, min: float|null, max: float|null}>  $groups
+     */
+    private function foldGroupStatsFor(string $entry, int $groupBy, int $aggregate, callable $bucket, array &$groups): void
+    {
+        $index = $this->loadRandomAccessIndex();
+        $groupCol = $index?->columnStats($entry, $groupBy);
+        $aggCol = $index?->columnStats($entry, $aggregate);
 
         if ($index === null || $groupCol === null || $aggCol === null
             || (! $groupCol['sorted_asc'] && ! $groupCol['sorted_desc'])) {
             // No pushdown basis — honest full scan with the same
             // grouping. Not via rows(): the scan must see 1-based row
             // numbers to exclude exactly the header.
-            foreach ($this->openSheetReader([$groupBy - 1, $aggregate - 1])->rowsFromOffset(null, 1) as $rn => $row) {
+            foreach ($this->openSheetReader([$groupBy - 1, $aggregate - 1], $entry)->rowsFromOffset(null, 1) as $rn => $row) {
                 if ($rn === 1) {
                     continue;
                 }
                 $this->foldRowIntoGroups($groups, $row, $groupBy, $aggregate, $bucket);
             }
 
-            return array_values($groups);
+            return;
         }
 
-        $ranges = $this->blockRanges($index);
+        $ranges = $this->blockRanges($index, $entry);
         $aggBlocks = $aggCol['blocks'];
 
         // Plan pass: classify every block in sheet order. Adjacent scan
@@ -785,7 +1150,7 @@ class StreamingXlsxReader
             [$first, $last] = $step['scan'];
             $start = $ranges[$first];
             $stopRow = $ranges[$last]['last_row'];
-            foreach ($this->openSheetReader([$groupBy - 1, $aggregate - 1])->rowsFromOffset($start['comp_offset'], $start['start_row_at_offset'] ?? 1, $start['first_row']) as $rn => $row) {
+            foreach ($this->openSheetReader([$groupBy - 1, $aggregate - 1], $entry)->rowsFromOffset($start['comp_offset'], $start['start_row_at_offset'] ?? 1, $start['first_row']) as $rn => $row) {
                 if ($rn > $stopRow) {
                     break;
                 }
@@ -795,8 +1160,6 @@ class StreamingXlsxReader
                 $this->foldRowIntoGroups($groups, $row, $groupBy, $aggregate, $bucket);
             }
         }
-
-        return array_values($groups);
     }
 
     /**
@@ -906,6 +1269,13 @@ class StreamingXlsxReader
      * The header row (row 1) rides in the first shard; skip $rn === 1
      * in workers if headers are handled elsewhere.
      *
+     * On an auto-split continuation chain the plan covers EVERY member
+     * sheet (pre-v3.2.2 it silently sharded the active sheet alone) —
+     * $count splits proportionally across members, at least one shard
+     * each. Shard row numbers stay local to their sheet, and every
+     * member's first shard carries that sheet's repeated header at
+     * local row 1, so the "skip $rn === 1" guidance applies per sheet.
+     *
      * @return list<array{sheet: string, comp_offset: int|null, start_row: int, first_row: int, last_row: int}>
      */
     public function shards(int $count): array
@@ -915,6 +1285,61 @@ class StreamingXlsxReader
         }
 
         $index = $this->loadRandomAccessIndex();
+
+        // Chain: fan-out must cover the whole logical table, so shards
+        // tile EVERY member sheet — each member gets a slice of the
+        // requested count proportional to its rows (never less than
+        // one), and workers cross sheets through rowsForShard()'s
+        // existing entry switch. Shard row numbers stay LOCAL to their
+        // sheet (the rowsForShard contract): each member's first shard
+        // carries that sheet's (repeated) header at local row 1, so the
+        // documented "skip rn === 1" worker guidance applies per sheet.
+        $chain = $this->chain();
+        if ($chain !== null && $index !== null) {
+            $memberCount = count($chain);
+            $effective = max($count, $memberCount);
+            $totals = array_column($chain, 'total');
+            $sumTotals = array_sum($totals);
+
+            // Largest-remainder allocation, floor-based with a 1-shard
+            // minimum per member; converges to exactly $effective.
+            $alloc = [];
+            $fracs = [];
+            $assigned = 0;
+            foreach ($totals as $i => $t) {
+                $exact = $sumTotals > 0 ? $effective * $t / $sumTotals : 1.0;
+                $alloc[$i] = max(1, (int) floor($exact));
+                $fracs[$i] = $exact - floor($exact);
+                $assigned += $alloc[$i];
+            }
+            while ($assigned < $effective) {
+                $best = array_search(max($fracs), $fracs, true);
+                $alloc[$best]++;
+                $fracs[$best] = -1.0;
+                $assigned++;
+            }
+            while ($assigned > $effective) {
+                $worst = null;
+                foreach ($alloc as $i => $a) {
+                    if ($a > 1 && ($worst === null || $a > $alloc[$worst])) {
+                        $worst = $i;
+                    }
+                }
+                if ($worst === null) {
+                    break; // every member at the 1-shard floor already
+                }
+                $alloc[$worst]--;
+                $assigned--;
+            }
+
+            $out = [];
+            foreach ($chain as $i => $m) {
+                $out = array_merge($out, $this->shardsFor($index, $m['entry'], $alloc[$i]));
+            }
+
+            return $out;
+        }
+
         $total = $index?->totalRows($this->currentEntry);
 
         $wholeSheet = [[
@@ -929,7 +1354,34 @@ class StreamingXlsxReader
             return $wholeSheet;
         }
 
-        $points = $index->syncPoints($this->currentEntry);
+        return $this->shardsFor($index, $this->currentEntry, $count);
+    }
+
+    /**
+     * Single-sheet shard planner behind shards(): the pre-v3.2.2 body
+     * parameterized by entry. Cut points snap to the entry's sync
+     * points; duplicate picks collapse, so tiny sheets yield fewer
+     * shards than requested.
+     *
+     * @return list<array{sheet: string, comp_offset: int|null, start_row: int, first_row: int, last_row: int}>
+     */
+    private function shardsFor(RandomAccessIndex $index, string $entry, int $count): array
+    {
+        $total = $index->totalRows($entry);
+
+        $wholeSheet = [[
+            'sheet' => $entry,
+            'comp_offset' => null,
+            'start_row' => 1,
+            'first_row' => 1,
+            'last_row' => $total ?? PHP_INT_MAX,
+        ]];
+
+        if ($total === null || $count === 1) {
+            return $wholeSheet;
+        }
+
+        $points = $index->syncPoints($entry);
         if ($points === []) {
             return $wholeSheet;
         }
@@ -959,7 +1411,7 @@ class StreamingXlsxReader
                 continue; // collapsed duplicate — would create an empty shard
             }
             $shards[] = [
-                'sheet' => $this->currentEntry,
+                'sheet' => $entry,
                 'comp_offset' => $compOffset,
                 'start_row' => $startRow,
                 'first_row' => $firstRow,
@@ -970,7 +1422,7 @@ class StreamingXlsxReader
             $startRow = $cut['row'];
         }
         $shards[] = [
-            'sheet' => $this->currentEntry,
+            'sheet' => $entry,
             'comp_offset' => $compOffset,
             'start_row' => $startRow,
             'first_row' => $firstRow,
@@ -1104,9 +1556,11 @@ class StreamingXlsxReader
      *
      * @return list<array{first_row: int, last_row: int, comp_offset: int|null, uncomp_offset: int|null, start_row_at_offset: int|null}>
      */
-    private function blockRanges(RandomAccessIndex $index): array
+    private function blockRanges(RandomAccessIndex $index, ?string $entry = null): array
     {
-        return $this->blockRangesByEntry[$this->currentEntry] ??= $index->blockRanges($this->currentEntry);
+        $entry ??= $this->currentEntry;
+
+        return $this->blockRangesByEntry[$entry] ??= $index->blockRanges($entry);
     }
 
     /**
@@ -1117,13 +1571,13 @@ class StreamingXlsxReader
      *
      * @return array{0: int|null, 1: int}
      */
-    private function seekTarget(int $rowNumber): array
+    private function seekTarget(int $rowNumber, ?string $entry = null): array
     {
         $index = $this->loadRandomAccessIndex();
         if ($index === null) {
             return [null, 1];
         }
-        $sp = $index->findSyncPoint($this->currentEntry, $rowNumber);
+        $sp = $index->findSyncPoint($entry ?? $this->currentEntry, $rowNumber);
         if ($sp === null) {
             return [null, 1];
         }
@@ -1327,12 +1781,12 @@ class StreamingXlsxReader
      *                                 aggregation semantics don't change
      *                                 underneath them
      */
-    private function openSheetReader(array $rawColumns = []): StreamingSheetReader
+    private function openSheetReader(array $rawColumns = [], ?string $entry = null): StreamingSheetReader
     {
         return new StreamingSheetReader(
             $this->source,
             $this->cd,
-            $this->currentEntry,
+            $entry ?? $this->currentEntry,
             65536,
             $this->resolveSharedStrings(),
             $this->buildDateDetection($rawColumns),
@@ -1401,6 +1855,142 @@ class StreamingXlsxReader
         return $this->dateStyleBitmap = StylesParser::dateStyleBitmap(
             $this->cd->readEntry($this->source, 'xl/styles.xml')
         );
+    }
+
+    /**
+     * The continuation chain containing the current sheet, or null when
+     * the sheet stands alone (single-sheet workbook, no usable sidecar,
+     * or a chain of one). Every query API branches on this ONCE — the
+     * null path is the pre-v3.2.2 code, byte-for-byte.
+     *
+     * @return list<array{entry: string, total: int, dataStartLocal: int, globalStart: int}>|null
+     */
+    private function chain(): ?array
+    {
+        if (count($this->sheets) < 2) {
+            return null;
+        }
+        $index = $this->loadRandomAccessIndex();
+        if ($index === null) {
+            return null;
+        }
+
+        $this->resolveChains($index);
+
+        $chain = $this->chainByEntry[$this->currentEntry] ?? null;
+
+        return $chain !== null && count($chain) > 1 ? $chain : null;
+    }
+
+    /**
+     * Partition the workbook's sheets into continuation chains. Runs at
+     * most once per reader. Header reads happen ONLY for sheets
+     * adjacent to an exactly-full one (the && short-circuit), so
+     * workbooks without any full sheet — the overwhelming majority —
+     * never pay a single extra read here.
+     */
+    private function resolveChains(RandomAccessIndex $index): void
+    {
+        if ($this->chainByEntry !== null) {
+            return;
+        }
+        $this->chainByEntry = [];
+
+        $runs = [];
+        $run = [$this->sheets[0]['entry']];
+        for ($i = 1, $n = count($this->sheets); $i < $n; $i++) {
+            $prev = $this->sheets[$i - 1]['entry'];
+            $cur = $this->sheets[$i]['entry'];
+
+            $continues = $index->totalRows($prev) === self::FULL_SHEET_ROWS
+                && $index->totalRows($cur) !== null
+                && $this->rawHeaderOf($prev) !== []
+                && $this->rawHeaderOf($cur) === $this->rawHeaderOf($prev);
+
+            if ($continues) {
+                $run[] = $cur;
+            } else {
+                $runs[] = $run;
+                $run = [$cur];
+            }
+        }
+        $runs[] = $run;
+
+        foreach ($runs as $entries) {
+            $members = [];
+            $globalStart = 1;
+            foreach ($entries as $j => $entry) {
+                $total = $index->totalRows($entry) ?? 0;
+                $dataStartLocal = $j === 0 ? 1 : 2;
+                $members[] = [
+                    'entry' => $entry,
+                    'total' => $total,
+                    'dataStartLocal' => $dataStartLocal,
+                    'globalStart' => $globalStart,
+                ];
+                $globalStart += $total - $dataStartLocal + 1;
+            }
+            foreach ($entries as $entry) {
+                $this->chainByEntry[$entry] = $members;
+            }
+        }
+    }
+
+    /**
+     * Raw tokenized header row of an arbitrary entry — casts and date
+     * detection deliberately bypassed so equality means "same bytes on
+     * disk", the only sound continuation test.
+     *
+     * @return array<int, mixed>
+     */
+    private function rawHeaderOf(string $entry): array
+    {
+        if (! array_key_exists($entry, $this->headerByEntry)) {
+            $this->headerByEntry[$entry] = [];
+            $reader = new StreamingSheetReader($this->source, $this->cd, $entry, 65536, $this->resolveSharedStrings(), null);
+            foreach ($reader->rows() as $row) {
+                $this->headerByEntry[$entry] = $row;
+                break;
+            }
+        }
+
+        return $this->headerByEntry[$entry];
+    }
+
+    /**
+     * Global logical row count of a chain: member 1 in full, plus every
+     * continuation member's rows minus its repeated header.
+     *
+     * @param  list<array{entry: string, total: int, dataStartLocal: int, globalStart: int}>  $chain
+     */
+    private function chainTotalRows(array $chain): int
+    {
+        $last = end($chain);
+
+        return $last['globalStart'] + $last['total'] - $last['dataStartLocal'];
+    }
+
+    /**
+     * Map a global row number to [member index, local row] — the
+     * inverse of the member globalStart/dataStartLocal bookkeeping.
+     * Null when the target lies past the chain's end (or below 1).
+     *
+     * @param  list<array{entry: string, total: int, dataStartLocal: int, globalStart: int}>  $chain
+     * @return array{0: int, 1: int}|null
+     */
+    private function chainLocate(array $chain, int $globalRow): ?array
+    {
+        if ($globalRow < 1) {
+            return null;
+        }
+        foreach ($chain as $i => $m) {
+            $coverEnd = $m['globalStart'] + $m['total'] - $m['dataStartLocal'];
+            if ($globalRow <= $coverEnd) {
+                return [$i, $m['dataStartLocal'] + ($globalRow - $m['globalStart'])];
+            }
+        }
+
+        return null;
     }
 
     /**
