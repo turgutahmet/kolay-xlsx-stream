@@ -1,5 +1,68 @@
 # Upgrade Guide
 
+## Upgrading from v3.2.0 / v3.2.1 to v3.2.2
+
+No breaking API changes — every call site works unchanged. One
+correctness change you should know about, and one opt-in.
+
+### 1. Queries on auto-split workbooks now cover the whole table
+
+If a file was written past Excel's 1,048,576-row sheet ceiling (the
+writer auto-splits it into continuation sheets), the query surface —
+`rowCount()`, `rows()`, `rowAt()`, `rowRange()`, `rowsWhere()`,
+`findRow()`, `columnStats()`, `groupStats()`, `quantile()`/`median()`,
+`countDistinct()`, `shards()` — now answers for the whole continuation
+chain with continuous global row numbers, instead of silently covering
+only the active sheet.
+
+- If you never exceed one sheet, nothing changes (verified within ±1 %
+  of v3.2.1 on every single-sheet read path).
+- Intentional multi-sheet workbooks (`newSheet()` tables with different
+  headers, or same-schema sheets that aren't exactly full) keep their
+  per-sheet semantics.
+- If you had built a workaround that loops `onSheetIndex(...)` over an
+  auto-split file and sums per-sheet answers yourself, remove it —
+  you would now be double-counting: one plain `columnStats()` call is
+  the whole table.
+- `shards()` on an auto-split file now returns shards for every chain
+  sheet (previously only the first). Workers using `rowsForShard()`
+  need no changes — keys stay local to each shard's sheet, and the
+  documented "skip `$rn === 1`" header guidance now simply applies per
+  sheet.
+
+### 2. Opt in to the config file actually working
+
+Published `config/xlsx-stream.php` keys were never read before v3.2.2.
+They now apply at writer construction — but only when the config
+carries `'version' => 2`, so existing published copies stay inert and
+nothing changes until you opt in.
+
+**The safe way to opt in** is re-publishing the file, which ships the
+new defaults (they match the code: compression level 5, flush interval
+10,000, part size 8 MB, concurrency 4):
+
+```bash
+php artisan vendor:publish --tag=xlsx-stream-config --force
+```
+
+Then set the env vars you actually want (`XLSX_STREAM_COMPRESSION_LEVEL`,
+`XLSX_STREAM_BUFFER_FLUSH_INTERVAL`, `XLSX_STREAM_S3_PART_SIZE`,
+`XLSX_STREAM_S3_CONCURRENCY`). Code-level setters always override
+config values.
+
+> **Do NOT just add `'version' => 2` to your old published file.** The
+> pre-3.2.2 file shipped stale defaults that contradict the code —
+> `compression_level => 1` while the writer's real default has been 5
+> since v3.1. Adding the marker to that file as-is would activate
+> level 1 and silently change your output size/speed. Re-publish with
+> `--force` (or review every value first, then add the marker).
+
+Keys that had no implementation behind them are gone from the file:
+`logging.*` (use the `onProgress()` callback), `memory.file_buffer_size`
+and `max_rows_per_sheet` (never configurable). Transient S3 retries are
+configured on your own `S3Client` (`'retries' => N`) — the AWS SDK's
+retry middleware owns them; the sink adds one last-resort re-dispatch.
+
 ## Upgrading from v3.0.x to v3.1
 
 No breaking API changes — every v3.0 call site works unchanged. Two
