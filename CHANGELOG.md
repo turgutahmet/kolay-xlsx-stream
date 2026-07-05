@@ -7,12 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [3.2.2] — 2026-07-05
 
-Correctness patch. No new public API. The writer's output path is
-untouched — the only writer change is constructor-time config-defaults
-wiring (below); the bytes it produces are the 3.2.1 bytes, and the
-single-sheet read path measures within ±1 % of 3.2.1 (A/B, five-run
-medians) — the auto-split fix costs nothing unless a file actually has
-a continuation chain.
+Correctness patch. No new public API. Row/cell bytes are unchanged
+(pinned by test — every `s=` style id and cell body is byte-identical
+to 3.2.1); the writer changes are constructor-time config wiring and
+two `<cols>`/preamble metadata fixes, all below. The single-sheet read
+path measures within ±1 % of 3.2.1 (A/B, five-run medians) — the
+auto-split fix costs nothing unless a file actually has a continuation
+chain.
 
 ### Fixed — auto-split workbooks now answer queries for the WHOLE table
 
@@ -56,6 +57,34 @@ continuation chain:
   `onSheet()`/`onSheetIndex()` still answers for the whole chain — a
   physical continuation sheet is not a meaningful query target. Sheets
   outside the chain are unaffected.
+
+### Fixed — sample-mode auto width: config mutations no longer act retroactively
+
+With sample-based auto column width (`setAutoColumnWidth(N)`), the
+active sheet's preamble is deferred until the sample finalizes. Config
+mutations issued while a sample was pending — the natural
+"prepare-the-next-sheet, then `newSheet()`" sequence — leaked backwards
+into that deferred preamble: `clearColumnFormats()` erased the pending
+sheet's explicit `setColumnWidths()` entries (a user width of 40 lost
+to a sampled 131), and `setHeaderStyle()` repainted the pending sheet's
+header with the NEXT sheet's style. Reordering didn't help: calling
+`clearColumnFormats()` after `newSheet()` instead tripped the
+format-vs-header-count validation. The rule is now enforced in one
+place: **a config mutation never acts retroactively** — mutators that
+feed the preamble (`setHeaderStyle`, `setColumnFormat`,
+`clearColumnFormats`, `setColumnWidths`, `setAutoColumnWidth`, freeze
+panes) finalize a pending sample first, with the state it was sampled
+under. Found by a real-Excel manual test; regression-tested red→green.
+
+### Fixed — builtin numFmt ids now get sensible minimum column widths
+
+Heuristic auto width (`setAutoColumnWidth(true)`) knew format-aware
+minimum widths only for named format presets; columns formatted with
+the `BUILTIN_NUMFMT_*` id constants (date, datetime, currency, …) fell
+back to width 8 and rendered as `#######` in Excel. All thirteen
+builtin ids now map to the same minimums their named counterparts use
+(date 12, datetime 20, currency 14, …). Cell bytes are untouched —
+this only changes the `<cols>` width hints of heuristic-width files.
 
 ### Fixed — the published config now actually applies (versioned)
 

@@ -571,6 +571,7 @@ abstract class BaseXlsxWriter
         if ($this->closed) {
             throw XlsxStreamException::writerAlreadyClosed();
         }
+        $this->finalizePendingSample();
         // Allowed before startFile() (for sheet 1) and between newSheet() calls
         // (to give each manually-rotated sheet its own header style).
         $this->headerStyleId = $this->styles->registerHeaderStyle($options);
@@ -630,6 +631,7 @@ abstract class BaseXlsxWriter
         if ($this->closed) {
             throw XlsxStreamException::writerAlreadyClosed();
         }
+        $this->finalizePendingSample();
         if ($rows < 0 || $columns < 0) {
             throw new XlsxStreamException('Freeze rows/columns must be >= 0.');
         }
@@ -656,6 +658,7 @@ abstract class BaseXlsxWriter
         if ($this->closed) {
             throw XlsxStreamException::writerAlreadyClosed();
         }
+        $this->finalizePendingSample();
         foreach ($widths as $col => $width) {
             if ($col < 1) {
                 throw new XlsxStreamException("Column index must be >= 1, got {$col}.");
@@ -697,6 +700,7 @@ abstract class BaseXlsxWriter
         if ($this->closed) {
             throw XlsxStreamException::writerAlreadyClosed();
         }
+        $this->finalizePendingSample();
 
         if (is_int($sample)) {
             if ($sample < 0) {
@@ -764,6 +768,7 @@ abstract class BaseXlsxWriter
         if ($this->closed) {
             throw XlsxStreamException::writerAlreadyClosed();
         }
+        $this->finalizePendingSample();
         if ($column < 1) {
             throw new XlsxStreamException("Column index must be >= 1, got {$column}.");
         }
@@ -807,6 +812,7 @@ abstract class BaseXlsxWriter
         if ($this->closed) {
             throw XlsxStreamException::writerAlreadyClosed();
         }
+        $this->finalizePendingSample();
         $this->columnStyleIds = [];
         $this->columnFormatNames = [];
         $this->columnWidths = [];
@@ -991,6 +997,28 @@ abstract class BaseXlsxWriter
      * Sample size reached — compute widths, emit preamble (now with the
      * computed <cols>) + header, drain the sample buffer.
      */
+    /**
+     * Finalize the active sheet's pending auto-width sample, if any.
+     *
+     * Config mutations must never act retroactively on an already-
+     * written (or pending) sheet preamble. In sample mode the preamble
+     * is deferred until the sample drains — without this guard, a
+     * mutator called while the sample is pending (the natural "prepare
+     * the NEXT sheet, then newSheet()" flow) would rewrite the CURRENT
+     * sheet's header style, wipe its explicit widths, or leak the next
+     * sheet's formats into it. Every config mutator that feeds the
+     * preamble calls this first, so a pending sample is finalized with
+     * exactly the state it was sampled under before the mutation lands.
+     *
+     * Cost when no sample is pending: three property reads.
+     */
+    protected function finalizePendingSample(): void
+    {
+        if ($this->started && $this->inSampleMode && ! $this->autoWidthFinalized) {
+            $this->finalizeAutoWidthSample();
+        }
+    }
+
     protected function finalizeAutoWidthSample(): void
     {
         foreach ($this->autoWidthMaxLengths as $col => $maxLen) {
@@ -1775,6 +1803,19 @@ abstract class BaseXlsxWriter
             'percent' => 10,                 // 100.00%
             'decimal' => 14,                 // 1,234,567.89
             'integer' => 14,                 // 1,234,567,890 (10-digit grouped)
+            'builtin:'.self::BUILTIN_NUMFMT_INTEGER => 14,       // 1
+            'builtin:'.self::BUILTIN_NUMFMT_DECIMAL_2 => 14,     // 2
+            'builtin:'.self::BUILTIN_NUMFMT_THOUSANDS => 14,     // 3
+            'builtin:'.self::BUILTIN_NUMFMT_CURRENCY => 14,      // 5
+            'builtin:'.self::BUILTIN_NUMFMT_PERCENT => 10,       // 9
+            'builtin:'.self::BUILTIN_NUMFMT_PERCENT_2 => 10,     // 10
+            'builtin:'.self::BUILTIN_NUMFMT_EXPONENT => 11,      // 11
+            'builtin:'.self::BUILTIN_NUMFMT_FRACTION => 10,      // 12
+            'builtin:'.self::BUILTIN_NUMFMT_DATE => 12,          // 14
+            'builtin:'.self::BUILTIN_NUMFMT_DATE_LONG => 13,     // 15
+            'builtin:'.self::BUILTIN_NUMFMT_TIME_AMPM => 11,     // 18
+            'builtin:'.self::BUILTIN_NUMFMT_TIME => 10,          // 20
+            'builtin:'.self::BUILTIN_NUMFMT_DATETIME => 20,      // 22
             default => 0,
         };
     }
