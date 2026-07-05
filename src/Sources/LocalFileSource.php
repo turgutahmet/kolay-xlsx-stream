@@ -80,10 +80,15 @@ class LocalFileSource implements Source, SupportsSuffixRange
         ];
     }
 
-    public function streamFrom(int $offset)
+    public function streamFrom(int $offset, ?int $length = null)
     {
         $this->guardOpen();
 
+        // $length is ignored: local fread is lazy and the sheet reader
+        // already caps how many compressed bytes it pulls (bounded scans
+        // stop at a sync boundary via inflatedChunks' compLength), so a
+        // plain seeked handle over-reads nothing. Bounding only pays on
+        // remote sources where the range is an HTTP fetch size.
         $h = @fopen($this->path, 'rb');
         if ($h === false) {
             throw XlsxReadException::sourceUnreadable("cannot reopen file: {$this->path}");

@@ -336,7 +336,7 @@ class StallingSource implements Source
         return $this->inner->range($offset, $length);
     }
 
-    public function streamFrom(int $offset)
+    public function streamFrom(int $offset, ?int $length = null)
     {
         // Buffer remaining bytes so the stalling wrapper can replay them
         // after the empty-read streak. Fine for test fixtures.

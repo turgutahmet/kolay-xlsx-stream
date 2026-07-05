@@ -170,11 +170,11 @@ class QueryPushdownTest extends TestCase
                 return $this->inner->range($offset, $length);
             }
 
-            public function streamFrom(int $offset)
+            public function streamFrom(int $offset, ?int $length = null)
             {
                 $this->streamOffsets[] = $offset;
 
-                return $this->inner->streamFrom($offset);
+                return $this->inner->streamFrom($offset, $length);
             }
 
             public function close(): void

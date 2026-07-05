@@ -917,6 +917,156 @@ class StreamingXlsxReader
     }
 
     /**
+     * Yield rows satisfying EVERY predicate (a conjunction / AND), pruned
+     * by intersecting each predicate's surviving-block set. Because zone
+     * maps are sound, a row matching all predicates lives in a block that
+     * survives all of them, so the intersection can only shrink the
+     * candidate blocks — a query filtering on two differently-clustered
+     * columns reads far fewer blocks than either predicate alone.
+     *
+     * Each predicate is `[column, op, value, value2?]`: column is a
+     * 1-based index or a header name (resolved like rowsWhere), op is one
+     * of '=', '<', '<=', '>', '>=', 'between' ($value2 = inclusive upper
+     * bound). Predicates on columns without zone maps prune nothing but
+     * still filter per row. With no statful predicate at all it degrades
+     * to a full-scan filter. Yields 1-based row number => row (casts
+     * applied), chain-aware exactly like rowsWhere.
+     *
+     * @param  list<array{0: int|string, 1: string, 2: int|float, 3?: int|float|null}>  $predicates
+     * @return \Generator<int, array<int, mixed>>
+     */
+    public function rowsWhereAll(array $predicates): \Generator
+    {
+        if ($predicates === []) {
+            throw new \InvalidArgumentException('rowsWhereAll() requires at least one predicate');
+        }
+
+        $preds = [];
+        foreach ($predicates as $p) {
+            $col = $p[0];
+            if (\is_string($col)) {
+                $col = $this->resolveColumnName($col) + 1;
+            }
+            $preds[] = ['col' => $col, 'op' => $p[1], 'value' => $p[2], 'value2' => $p[3] ?? null];
+        }
+
+        $chain = $this->chain();
+        if ($chain !== null) {
+            foreach ($chain as $i => $m) {
+                foreach ($this->matchRowsAllIn($m['entry'], $preds) as $rn => $row) {
+                    if ($i > 0 && $rn === 1) {
+                        continue;
+                    }
+                    yield $m['globalStart'] + ($rn - $m['dataStartLocal']) => $this->applyCasts($row);
+                }
+            }
+
+            return;
+        }
+
+        foreach ($this->matchRowsAllIn($this->currentEntry, $preds) as $rn => $row) {
+            yield $rn => $this->applyCasts($row);
+        }
+    }
+
+    /**
+     * Estimate how many rows a single predicate selects — WITHOUT reading
+     * a row (answered entirely from the sidecar). Returns:
+     *   - upper: the summed value-count of the zone-map surviving blocks,
+     *     a HARD upper bound (never below the true match count);
+     *   - estimate: an approximate count from the t-digest (range ops:
+     *     count × ΔCDF, inverted from the in-memory digest by bisection)
+     *     or the HLL for '=' (count ÷ distinct), or null when the column
+     *     carries no sketch.
+     *
+     * Returns null when the column has no zone maps (no basis to bound).
+     * Chain-aware: bounds fold across continuation members (all-or-nothing).
+     *
+     * @return array{upper: int, estimate: int|null}|null
+     */
+    public function estimatedRows(int|string $column, string $op, int|float $value, int|float|null $value2 = null): ?array
+    {
+        if (\is_string($column)) {
+            $column = $this->resolveColumnName($column) + 1;
+        }
+
+        $upper = $this->survivingRowCount($column, $op, $value, $value2);
+        if ($upper === null) {
+            return null;
+        }
+
+        return ['upper' => $upper, 'estimate' => $this->estimateSelectivity($column, $op, $value, $value2)];
+    }
+
+    /**
+     * Describe the query plan rowsWhereAll() would run for a predicate
+     * set — WITHOUT executing it. Zero I/O; every number comes from the
+     * sidecar. Shape:
+     *   - strategy: 'zone-map-prune' (some predicate pruned blocks) or
+     *     'full-scan' (no statful predicate / no index);
+     *   - candidateBlocks: blocks surviving the intersection;
+     *   - runs: contiguous block runs to scan (each = one seek);
+     *   - estimatedRows: {upper: int|null, estimate: int|null} — upper is
+     *     the row-count bound of the candidate blocks; estimate assumes
+     *     predicate independence;
+     *   - estimatedBytes: compressed bytes the scan would fetch (the S3
+     *     range budget — exactly what bounded streamFrom will request).
+     *
+     * @param  list<array{0: int|string, 1: string, 2: int|float, 3?: int|float|null}>  $predicates
+     * @return array{strategy: string, candidateBlocks: int, runs: int, estimatedRows: array{upper: int|null, estimate: int|null}, estimatedBytes: int}
+     */
+    public function explain(array $predicates): array
+    {
+        if ($predicates === []) {
+            throw new \InvalidArgumentException('explain() requires at least one predicate');
+        }
+
+        $preds = [];
+        foreach ($predicates as $p) {
+            $col = $p[0];
+            if (\is_string($col)) {
+                $col = $this->resolveColumnName($col) + 1;
+            }
+            $preds[] = ['col' => $col, 'op' => $p[1], 'value' => $p[2], 'value2' => $p[3] ?? null];
+        }
+
+        $index = $this->loadRandomAccessIndex();
+        $chain = $this->chain();
+        $entries = $chain !== null ? array_map(fn ($m) => $m['entry'], $chain) : [$this->currentEntry];
+
+        $pruned = false;
+        $candidateBlocks = 0;
+        $runs = 0;
+        $bytes = 0;
+        $upper = 0;
+        $upperKnown = false;
+        foreach ($entries as $entry) {
+            $plan = $this->planAllIn($index, $entry, $preds);
+            if (! $plan['full']) {
+                $pruned = true;
+            }
+            $candidateBlocks += $plan['candidateBlocks'];
+            $runs += $plan['runs'];
+            $bytes += $plan['bytes'];
+            if ($plan['upper'] !== null) {
+                $upper += $plan['upper'];
+                $upperKnown = true;
+            }
+        }
+
+        return [
+            'strategy' => $pruned ? 'zone-map-prune' : 'full-scan',
+            'candidateBlocks' => $candidateBlocks,
+            'runs' => $runs,
+            'estimatedRows' => [
+                'upper' => $upperKnown ? $upper : null,
+                'estimate' => $this->estimateAnd($preds),
+            ],
+            'estimatedBytes' => $bytes,
+        ];
+    }
+
+    /**
      * Single-sheet predicate matcher behind rowsWhere(): zone-map
      * pruning + run-merged scans over one entry, yielding LOCAL 1-based
      * row number => raw matched row (casts belong to the caller). This
@@ -949,26 +1099,14 @@ class StreamingXlsxReader
 
         // Prune, then merge surviving adjacent blocks into runs so each
         // run costs one seek + one linear scan instead of per-block seeks.
-        $runs = [];
-        $run = null;
-        foreach ($stats['blocks'] as $i => $block) {
-            $survives = $block['count'] > 0 && $block['max'] >= $lo && $block['min'] <= $hi;
-            if ($survives) {
-                $run === null ? $run = [$i, $i] : $run[1] = $i;
-            } elseif ($run !== null) {
-                $runs[] = $run;
-                $run = null;
-            }
-        }
-        if ($run !== null) {
-            $runs[] = $run;
-        }
+        $runs = $this->mergeRuns($this->survivingBlocks($stats['blocks'], $lo, $hi));
 
         foreach ($runs as [$firstBlock, $lastBlock]) {
             $start = $ranges[$firstBlock];
             $stopRow = $ranges[$lastBlock]['last_row'];
+            $compLength = $this->runCompLength($ranges, $firstBlock, $lastBlock);
 
-            foreach ($this->openSheetReader([$column - 1], $entry)->rowsFromOffset($start['comp_offset'], $start['start_row_at_offset'] ?? 1, $start['first_row']) as $rn => $row) {
+            foreach ($this->openSheetReader([$column - 1], $entry)->rowsFromOffset($start['comp_offset'], $start['start_row_at_offset'] ?? 1, $start['first_row'], $compLength) as $rn => $row) {
                 if ($rn < $start['first_row']) {
                     continue;
                 }
@@ -980,6 +1118,372 @@ class StreamingXlsxReader
                 }
             }
         }
+    }
+
+    /**
+     * Single-sheet AND matcher behind rowsWhereAll(): intersect each
+     * statful predicate's surviving blocks, scan the (run-merged)
+     * intersection once, and yield rows satisfying every predicate.
+     * Yields LOCAL 1-based row => raw row (casts belong to the caller),
+     * mirroring matchRowsIn's contract.
+     *
+     * @param  list<array{col: int, op: string, value: int|float, value2: int|float|null}>  $preds
+     * @return \Generator<int, array<int, mixed>>
+     */
+    private function matchRowsAllIn(string $entry, array $preds): \Generator
+    {
+        $index = $this->loadRandomAccessIndex();
+
+        // Candidate blocks = intersection of the surviving-block sets of
+        // every predicate that HAS zone maps. A predicate on an untracked
+        // column can't prune (it is filtered per row below), so it simply
+        // doesn't constrain the candidate set. null = still unconstrained.
+        $candidate = null;
+        $readColumns = [];
+        foreach ($preds as $p) {
+            $readColumns[$p['col'] - 1] = true;
+            $stats = $index?->columnStats($entry, $p['col']);
+            if ($stats === null) {
+                // Validate the op even when it can't prune, so a bad op or
+                // a between without an upper bound fails fast like rowsWhere.
+                $this->pruneBounds($p['op'], $p['value'], $p['value2']);
+
+                continue;
+            }
+            [$lo, $hi] = $this->pruneBounds($p['op'], $p['value'], $p['value2']);
+            $survivors = $this->survivingBlocks($stats['blocks'], $lo, $hi);
+            $candidate = $candidate === null
+                ? $survivors
+                : array_values(array_intersect($candidate, $survivors));
+        }
+
+        $columns = array_keys($readColumns);
+
+        if ($candidate === null) {
+            // No statful predicate — full scan, filter per row.
+            foreach ($this->openSheetReader($columns, $entry)->rowsFromOffset(null, 1) as $rn => $row) {
+                if ($this->rowMatchesAll($row, $preds)) {
+                    yield $rn => $row;
+                }
+            }
+
+            return;
+        }
+
+        if ($candidate === []) {
+            return; // every block pruned
+        }
+
+        $ranges = $this->blockRanges($index, $entry);
+        foreach ($this->mergeRuns($candidate) as [$firstBlock, $lastBlock]) {
+            $start = $ranges[$firstBlock];
+            $stopRow = $ranges[$lastBlock]['last_row'];
+            $compLength = $this->runCompLength($ranges, $firstBlock, $lastBlock);
+
+            foreach ($this->openSheetReader($columns, $entry)->rowsFromOffset($start['comp_offset'], $start['start_row_at_offset'] ?? 1, $start['first_row'], $compLength) as $rn => $row) {
+                if ($rn < $start['first_row']) {
+                    continue;
+                }
+                if ($rn > $stopRow) {
+                    break;
+                }
+                if ($this->rowMatchesAll($row, $preds)) {
+                    yield $rn => $row;
+                }
+            }
+        }
+    }
+
+    /**
+     * True when a raw row satisfies every predicate (numeric cells only,
+     * pre-cast values — same per-cell semantics as rowsWhere).
+     *
+     * @param  array<int, mixed>  $row
+     * @param  list<array{col: int, op: string, value: int|float, value2: int|float|null}>  $preds
+     */
+    private function rowMatchesAll(array $row, array $preds): bool
+    {
+        foreach ($preds as $p) {
+            if (! $this->cellMatches($row[$p['col'] - 1] ?? null, $p['op'], $p['value'], $p['value2'])) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Hard upper bound on the rows a single predicate can select: the
+     * summed value-count of its zone-map surviving blocks, folded across
+     * chain members. null when any member lacks stats for the column
+     * (all-or-nothing — a bound with a hole is not a bound).
+     */
+    private function survivingRowCount(int $column, string $op, int|float $value, int|float|null $value2): ?int
+    {
+        $index = $this->loadRandomAccessIndex();
+        if ($index === null) {
+            return null;
+        }
+
+        [$lo, $hi] = $this->pruneBounds($op, $value, $value2);
+        $chain = $this->chain();
+        $entries = $chain !== null ? array_map(fn ($m) => $m['entry'], $chain) : [$this->currentEntry];
+
+        $total = 0;
+        foreach ($entries as $entry) {
+            $stats = $index->columnStats($entry, $column);
+            if ($stats === null) {
+                return null;
+            }
+            foreach ($this->survivingBlocks($stats['blocks'], $lo, $hi) as $b) {
+                $total += $stats['blocks'][$b]['count'];
+            }
+        }
+
+        return $total;
+    }
+
+    /**
+     * Approximate row count for a single predicate from the sketches:
+     * HLL count/distinct for '=', t-digest ΔCDF × count for ranges. null
+     * when the column carries no digest/HLL.
+     */
+    private function estimateSelectivity(int $column, string $op, int|float $value, int|float|null $value2): ?int
+    {
+        if ($op === '=') {
+            $distinct = $this->countDistinct($column);
+            $stats = $this->columnStats($column);
+            if ($distinct === null || $distinct <= 0 || $stats === null) {
+                return null;
+            }
+
+            return (int) max(1, round($stats['count'] / $distinct));
+        }
+
+        $stats = $this->columnStats($column);
+        if ($stats === null) {
+            return null;
+        }
+        $count = $stats['count'];
+
+        if ($op === 'between') {
+            $lo = min((float) $value, (float) $value2);
+            $hi = max((float) $value, (float) $value2);
+            $cLo = $this->estimateCdf($column, $lo);
+            $cHi = $this->estimateCdf($column, $hi);
+            if ($cLo === null || $cHi === null) {
+                return null;
+            }
+
+            return (int) round($count * max(0.0, $cHi - $cLo));
+        }
+
+        $cdf = $this->estimateCdf($column, (float) $value);
+        if ($cdf === null) {
+            return null;
+        }
+        $frac = ($op === '>=' || $op === '>') ? 1.0 - $cdf : $cdf;
+
+        return (int) round($count * max(0.0, $frac));
+    }
+
+    /**
+     * CDF(x) = fraction of the column's values ≤ x, recovered by inverting
+     * the in-memory t-digest's quantile() with 40 bisection steps (the
+     * digest exposes quantile, not rank). Zero I/O. null when the column
+     * has no digest. Values below min converge to 0, above max to 1.
+     */
+    private function estimateCdf(int $column, float $x): ?float
+    {
+        if ($this->quantile($column, 0.5) === null) {
+            return null;
+        }
+
+        $lo = 0.0;
+        $hi = 1.0;
+        for ($i = 0; $i < 40; $i++) {
+            $mid = ($lo + $hi) / 2.0;
+            $v = $this->quantile($column, $mid);
+            if ($v === null) {
+                return null;
+            }
+            if ($v < $x) {
+                $lo = $mid;
+            } else {
+                $hi = $mid;
+            }
+        }
+
+        return ($lo + $hi) / 2.0;
+    }
+
+    /**
+     * Plan a predicate set over ONE entry without scanning: intersect the
+     * statful predicates' surviving blocks, then count candidate blocks,
+     * merged runs, the compressed byte budget of those runs and the
+     * row-count upper bound.
+     *
+     * @param  list<array{col: int, op: string, value: int|float, value2: int|float|null}>  $preds
+     * @return array{full: bool, candidateBlocks: int, runs: int, bytes: int, upper: int|null}
+     */
+    private function planAllIn(?RandomAccessIndex $index, string $entry, array $preds): array
+    {
+        $candidate = null;
+        if ($index !== null) {
+            foreach ($preds as $p) {
+                $stats = $index->columnStats($entry, $p['col']);
+                if ($stats === null) {
+                    continue;
+                }
+                [$lo, $hi] = $this->pruneBounds($p['op'], $p['value'], $p['value2']);
+                $survivors = $this->survivingBlocks($stats['blocks'], $lo, $hi);
+                $candidate = $candidate === null
+                    ? $survivors
+                    : array_values(array_intersect($candidate, $survivors));
+            }
+        }
+
+        $entrySize = $this->cd->entry($entry)['compressed_size'] ?? 0;
+
+        if ($candidate === null) {
+            // Full scan: read the whole entry, row count only if indexed.
+            return [
+                'full' => true,
+                'candidateBlocks' => 0,
+                'runs' => 1,
+                'bytes' => $entrySize,
+                'upper' => $index?->totalRows($entry),
+            ];
+        }
+
+        if ($candidate === []) {
+            return ['full' => false, 'candidateBlocks' => 0, 'runs' => 0, 'bytes' => 0, 'upper' => 0];
+        }
+
+        $ranges = $this->blockRanges($index, $entry);
+        $runs = $this->mergeRuns($candidate);
+        $bytes = 0;
+        $upper = 0;
+        foreach ($runs as [$firstBlock, $lastBlock]) {
+            $startComp = $ranges[$firstBlock]['comp_offset'] ?? 0;
+            $end = $ranges[$lastBlock + 1]['comp_offset'] ?? $entrySize;
+            $bytes += max(0, $end - $startComp);
+            for ($b = $firstBlock; $b <= $lastBlock; $b++) {
+                $upper += $ranges[$b]['last_row'] - $ranges[$b]['first_row'] + 1;
+            }
+        }
+
+        return [
+            'full' => false,
+            'candidateBlocks' => count($candidate),
+            'runs' => count($runs),
+            'bytes' => $bytes,
+            'upper' => $upper,
+        ];
+    }
+
+    /**
+     * Independence-assumption estimate for a conjunction: total rows ×
+     * Π(per-predicate selectivity). null when any predicate has no sketch
+     * to estimate from or the population is unknown.
+     *
+     * @param  list<array{col: int, op: string, value: int|float, value2: int|float|null}>  $preds
+     */
+    private function estimateAnd(array $preds): ?int
+    {
+        $population = $this->rowCount();
+        if ($population <= 0) {
+            return null;
+        }
+
+        $product = 1.0;
+        foreach ($preds as $p) {
+            $est = $this->estimatedRows($p['col'], $p['op'], $p['value'], $p['value2']);
+            if ($est === null || $est['estimate'] === null) {
+                return null;
+            }
+            $product *= min(1.0, $est['estimate'] / $population);
+        }
+
+        return (int) round($population * $product);
+    }
+
+    /**
+     * Zone-map survivor test for one predicate: the ascending list of
+     * block indices whose [min, max] range can hold a value in [lo, hi]
+     * (empty blocks and blocks entirely outside the band are pruned).
+     * Sound by construction — a matching row's block always survives, so
+     * pruning never drops a match. Reused by rowsWhere (single predicate),
+     * rowsWhereAll (intersection) and estimatedRows (bound).
+     *
+     * @param  list<array{min: float, max: float, sum: float, count: int, other: int}>  $statBlocks
+     * @return list<int>
+     */
+    private function survivingBlocks(array $statBlocks, float|int $lo, float|int $hi): array
+    {
+        $survivors = [];
+        foreach ($statBlocks as $i => $block) {
+            if ($block['count'] > 0 && $block['max'] >= $lo && $block['min'] <= $hi) {
+                $survivors[] = $i;
+            }
+        }
+
+        return $survivors;
+    }
+
+    /**
+     * Collapse an ascending list of surviving block indices into
+     * contiguous [firstBlock, lastBlock] runs, so each run costs one seek
+     * plus one linear scan instead of a seek per block. A gap in the
+     * indices (a pruned block between survivors) starts a new run.
+     *
+     * @param  list<int>  $blocks  ascending, no duplicates
+     * @return list<array{0: int, 1: int}>
+     */
+    private function mergeRuns(array $blocks): array
+    {
+        $runs = [];
+        $run = null;
+        $prev = null;
+        foreach ($blocks as $i) {
+            if ($run === null) {
+                $run = [$i, $i];
+            } elseif ($i === $prev + 1) {
+                $run[1] = $i;
+            } else {
+                $runs[] = $run;
+                $run = [$i, $i];
+            }
+            $prev = $i;
+        }
+        if ($run !== null) {
+            $runs[] = $run;
+        }
+
+        return $runs;
+    }
+
+    /**
+     * Compressed byte length of a surviving block run [firstBlock,
+     * lastBlock], from its starting sync point to the sync point that
+     * begins the block AFTER it (a ZLIB_FULL_FLUSH boundary). Passed to
+     * rowsFromOffset so a pruned scan fetches only the run's bytes
+     * instead of ranging to the entry end.
+     *
+     * Returns null when the run reaches the entry's final block (read to
+     * EOF, historical FINISH path) or when the trailing block sits before
+     * the first sync point (no recorded offset to bound at).
+     *
+     * @param  list<array{first_row: int, last_row: int, comp_offset: int|null, uncomp_offset: int|null, start_row_at_offset: int|null}>  $ranges
+     */
+    private function runCompLength(array $ranges, int $firstBlock, int $lastBlock): ?int
+    {
+        $next = $ranges[$lastBlock + 1]['comp_offset'] ?? null;
+        if ($next === null) {
+            return null;
+        }
+
+        return $next - ($ranges[$firstBlock]['comp_offset'] ?? 0);
     }
 
     /**

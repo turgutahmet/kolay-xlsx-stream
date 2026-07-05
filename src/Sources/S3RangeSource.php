@@ -122,15 +122,22 @@ class S3RangeSource implements Source, SupportsSuffixRange
         return ['data' => $data, 'size' => $size];
     }
 
-    public function streamFrom(int $offset)
+    public function streamFrom(int $offset, ?int $length = null)
     {
         $size = $this->size();
+
+        // Bounded scans stop at a sync boundary: fetch exactly
+        // [offset, offset+length-1] instead of streaming to EOF, so a
+        // pruned query over an early block reads only that block's bytes
+        // off the wire. Clamp to the last byte so a length past EOF (or
+        // null) degrades to the historical open-ended range.
+        $end = $length !== null ? min($offset + $length - 1, $size - 1) : $size - 1;
 
         try {
             $r = $this->s3->getObject([
                 'Bucket' => $this->bucket,
                 'Key' => $this->key,
-                'Range' => sprintf('bytes=%d-%d', $offset, $size - 1),
+                'Range' => sprintf('bytes=%d-%d', $offset, $end),
                 '@http' => ['stream' => true],
             ]);
         } catch (\Throwable $e) {

@@ -109,7 +109,7 @@ class StreamingSheetReader
      *
      * @return \Generator<int, array<int, mixed>>
      */
-    public function rowsFromOffset(?int $compOffset, int $startingRowNumber, ?int $fastForwardTo = null): \Generator
+    public function rowsFromOffset(?int $compOffset, int $startingRowNumber, ?int $fastForwardTo = null, ?int $compLength = null): \Generator
     {
         $rowNumber = $startingRowNumber;
         $buffer = '';
@@ -122,7 +122,7 @@ class StreamingSheetReader
         $skipRemaining = $fastForwardTo !== null ? max(0, $fastForwardTo - $startingRowNumber) : 0;
         $carry = '';
 
-        foreach ($this->inflatedChunks($compOffset) as $inflated) {
+        foreach ($this->inflatedChunks($compOffset, $compLength) as $inflated) {
             if ($skipRemaining > 0) {
                 $scan = $carry.$inflated;
                 $found = substr_count($scan, '</row>');
@@ -244,7 +244,7 @@ class StreamingSheetReader
      *
      * @return \Generator<int, string>
      */
-    private function inflatedChunks(?int $compOffset): \Generator
+    private function inflatedChunks(?int $compOffset, ?int $compLength = null): \Generator
     {
         $entry = $this->cd->entry($this->sheetEntry);
         if ($entry === null) {
@@ -261,9 +261,20 @@ class StreamingSheetReader
 
         $dataOffset = $this->cd->dataOffset($this->source, $this->sheetEntry);
         $startOffset = $dataOffset + ($compOffset ?? 0);
-        $compRemaining = $entry['compressed_size'] - ($compOffset ?? 0);
+        $entryRemaining = $entry['compressed_size'] - ($compOffset ?? 0);
 
-        $stream = $this->source->streamFrom($startOffset);
+        // A caller-supplied $compLength stops the read at a ZLIB_FULL_FLUSH
+        // sync boundary (the run's trailing block). Because a full flush
+        // already emits every byte before it, the bounded bytes are fed to
+        // inflate with NO_FLUSH and the loop stops WITHOUT a ZLIB_FINISH
+        // step — the exact inverse of seeking INTO a sync point, which the
+        // random-access index already does. $bounded === false is the
+        // historical path (read to entry end, then FINISH), preserved
+        // byte-for-byte when $compLength is null or reaches the entry end.
+        $compRemaining = $compLength !== null ? min($compLength, $entryRemaining) : $entryRemaining;
+        $bounded = $compRemaining < $entryRemaining;
+
+        $stream = $this->source->streamFrom($startOffset, $bounded ? $compRemaining : null);
 
         $inflate = null;
         if ($method === self::METHOD_DEFLATE) {
@@ -305,7 +316,12 @@ class StreamingSheetReader
                         $compRemaining -= $n;
 
                         if ($method === self::METHOD_DEFLATE) {
-                            $flag = $compRemaining === 0 ? ZLIB_FINISH : ZLIB_NO_FLUSH;
+                            // Bounded reads end at a full-flush boundary, so
+                            // the last chunk is still NO_FLUSH — never FINISH
+                            // (the flush already emitted its output; a FINISH
+                            // on a stream truncated before its BFINAL block
+                            // would error).
+                            $flag = ($compRemaining === 0 && ! $bounded) ? ZLIB_FINISH : ZLIB_NO_FLUSH;
                             if ($flag === ZLIB_FINISH) {
                                 $finishedFlush = true;
                             }
@@ -318,7 +334,7 @@ class StreamingSheetReader
                             $inflated = $compressed;
                         }
                     }
-                } elseif (! $finishedFlush) {
+                } elseif (! $finishedFlush && ! $bounded) {
                     $inflated = inflate_add($inflate, '', ZLIB_FINISH);
                     if ($inflated === false) {
                         throw XlsxReadException::inflateFailed('final inflate_add returned false');
@@ -330,7 +346,9 @@ class StreamingSheetReader
                     yield $inflated;
                 }
 
-                if ($compRemaining === 0 && $finishedFlush) {
+                // Bounded runs stop as soon as their bytes are consumed
+                // (no FINISH to wait for); unbounded runs wait for FINISH.
+                if ($compRemaining === 0 && ($finishedFlush || $bounded)) {
                     break;
                 }
             }
