@@ -1116,6 +1116,72 @@ class StreamingXlsxReader
     }
 
     /**
+     * A uniform random sample of $k rows, fetched via the index — so a
+     * sample of a multi-GB sheet costs ≈$k block reads, not a full scan.
+     * $k distinct row numbers are drawn uniformly (without replacement)
+     * from the data range with a seeded Mt19937 Randomizer, then exactly
+     * those rows are read; each data row has an equal $k/N chance
+     * (unbiasedness proven in poc/d3_sample.php via chi-square). The
+     * Randomizer is local — the global mt_rand() state is untouched.
+     *
+     * Pass $seed for a reproducible sample (same file + seed => same
+     * rows); omit it for a fresh secure-random draw. Returns an ascending
+     * map of 1-based row number => row (casts applied). Empty for
+     * $k <= 0; the whole table (in order) when $k >= the row count.
+     * Best for $k far below the total — at large $k a full rows() scan is
+     * cheaper than that many seeks.
+     *
+     * @return array<int, array<int, mixed>>
+     */
+    public function sampleRows(int $k, ?int $seed = null): array
+    {
+        if ($k <= 0) {
+            return [];
+        }
+
+        $total = $this->rowCount();
+        if ($total <= 1) {
+            return []; // header only, no data rows
+        }
+
+        $lo = 2;            // row 1 is the header
+        $hi = $total;
+        $n = $hi - $lo + 1;
+        $k = min($k, $n);
+
+        $rows = [];
+        if ($k === $n) {
+            foreach ($this->rowRange($lo, $hi) as $rn => $row) {
+                $rows[$rn] = $row;
+            }
+
+            return $rows;
+        }
+
+        $rng = new \Random\Randomizer(
+            $seed !== null ? new \Random\Engine\Mt19937($seed) : null
+        );
+
+        // Rejection sampling for k DISTINCT rows — getInt() is itself
+        // rejection-based, so no modulo bias; the set keys dedup draws.
+        // Efficient while k ≪ n, which is the intended use.
+        $picked = [];
+        while (count($picked) < $k) {
+            $picked[$rng->getInt($lo, $hi)] = true;
+        }
+        ksort($picked);
+
+        foreach (array_keys($picked) as $rn) {
+            $row = $this->rowAt($rn);
+            if ($row !== null) {
+                $rows[$rn] = $row;
+            }
+        }
+
+        return $rows;
+    }
+
+    /**
      * Sorted-column fast path: the k extremes are a contiguous block of
      * rows at one end of the sheet. Read just that row range (via the
      * seeking rowRange) and order it by value — no per-row comparison
