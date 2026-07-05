@@ -49,6 +49,11 @@ class SinkableXlsxWriter extends BaseXlsxWriter
      * Pass `$putObjectParams` (e.g. `['ACL' => 'public-read']`) for S3-only
      * options. They are ignored for local disks.
      *
+     * $partSize resolution: an explicit argument wins; otherwise the
+     * published config's `xlsx-stream.s3.part_size` (version-2+ config
+     * only — see BaseXlsxWriter::applyConfigDefaults() for the gate's
+     * rationale); otherwise the sink default (8 MB).
+     *
      * @throws XlsxStreamException when the disk is not configured or the
      *                             driver is not supported.
      */
@@ -56,7 +61,7 @@ class SinkableXlsxWriter extends BaseXlsxWriter
         string $disk,
         string $path,
         array $putObjectParams = [],
-        int $partSize = S3MultipartSink::DEFAULT_PART_SIZE
+        ?int $partSize = null
     ): self {
         if (! function_exists('config')) {
             throw new XlsxStreamException(
@@ -86,12 +91,15 @@ class SinkableXlsxWriter extends BaseXlsxWriter
                 'use_path_style_endpoint' => $config['use_path_style_endpoint'] ?? false,
             ]);
 
+            $packageConfig = self::packageConfig();
+
             $sink = new S3MultipartSink(
                 $client,
                 $config['bucket'] ?? '',
                 $path,
-                $partSize,
-                $putObjectParams
+                self::resolvePartSize($partSize, $packageConfig),
+                $putObjectParams,
+                self::resolveConcurrency($packageConfig)
             );
 
             return new self($sink);
@@ -108,6 +116,67 @@ class SinkableXlsxWriter extends BaseXlsxWriter
             "Disk [{$disk}] driver [{$driver}] is not supported. ".
             'Supported drivers: s3, local.'
         );
+    }
+
+    /**
+     * The package's published config, or null outside Laravel / when
+     * the container can't serve it — the same guard the base writer's
+     * constructor uses for its own defaults.
+     */
+    private static function packageConfig(): ?array
+    {
+        if (! function_exists('config')) {
+            return null;
+        }
+        try {
+            $cfg = config('xlsx-stream');
+        } catch (\Throwable) {
+            return null;
+        }
+
+        return is_array($cfg) ? $cfg : null;
+    }
+
+    /**
+     * Part-size precedence for forDisk(): explicit argument > version-2+
+     * config's s3.part_size > sink default. Invalid config values fall
+     * through to the default — config is environment data, not code
+     * (see BaseXlsxWriter::applyConfigDefaults()); the sink additionally
+     * raises anything below S3's 5 MB minimum on its own.
+     */
+    protected static function resolvePartSize(?int $explicit, ?array $config): int
+    {
+        if ($explicit !== null) {
+            return $explicit;
+        }
+
+        if ((int) ($config['version'] ?? 0) >= 2) {
+            $size = $config['s3']['part_size'] ?? null;
+            if (is_numeric($size) && (int) $size >= 1) {
+                return (int) $size;
+            }
+        }
+
+        return S3MultipartSink::DEFAULT_PART_SIZE;
+    }
+
+    /**
+     * Upload-window concurrency for forDisk(): version-2+ config's
+     * s3.concurrency > sink default. No explicit-argument tier —
+     * forDisk()'s signature stays put; callers needing per-call control
+     * construct S3MultipartSink directly (its constructor takes
+     * concurrency). Same invalid-value policy as resolvePartSize().
+     */
+    protected static function resolveConcurrency(?array $config): int
+    {
+        if ((int) ($config['version'] ?? 0) >= 2) {
+            $value = $config['s3']['concurrency'] ?? null;
+            if (is_numeric($value) && (int) $value >= 1) {
+                return (int) $value;
+            }
+        }
+
+        return S3MultipartSink::DEFAULT_CONCURRENCY;
     }
 
     protected function writeToDest(string $data): void

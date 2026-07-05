@@ -20,7 +20,7 @@ OPTIONAL in this document are to be interpreted as described in
 
 | | |
 |---|---|
-| Document version | **1.1.0** |
+| Document version | **1.2.0** |
 | Format version described | KXSI binary version **2** (the `version` header byte) |
 | Reference implementation | `kolay/xlsx-stream` ≥ 3.2.0 (PHP) — writer + reader |
 | Conformance suite | `tests/SpecVectors/` in the reference repository (§8) |
@@ -559,6 +559,52 @@ Failing checks 15–16 SHOULD degrade silently to non-indexed reading
 (the file itself is fine — only the sidecar is unusable); failing
 checks 1–14 indicates a corrupt or crafted sidecar and MAY additionally
 be surfaced as an error.
+
+### 6.1 Continuation chains (informative)
+
+This subsection is **non-normative**: it describes reader behavior the
+reference implementation ships (since v3.2.2), not a property of the
+binary format. It is recorded here so independent implementations can
+reproduce the same query semantics from one description instead of
+reverse-engineering the reference reader.
+
+Writers that split one logical table across multiple worksheets purely
+because of Excel's 1,048,576-row sheet ceiling (the reference writer
+rolls to a new sheet at 1,048,575 rows including the header, and
+re-emits the header row on each continuation sheet) produce what the
+reference reader calls a **continuation chain**. A chain is a maximal
+run of consecutive sheets, in workbook order, where:
+
+1. every non-final member's `total_rows` (from the sidecar) equals
+   exactly **1,048,575** — the reference writer's split point; a
+   hand-authored sheet virtually never lands on this count, which is
+   what makes fullness a reliable continuation signal;
+2. every member's first row (its header) tokenizes to an identical
+   cell sequence; and
+3. the sidecar is present and passes every §6 invariant (the detection
+   consumes `total_rows`, so unindexed files are never chained).
+
+Readers that implement chains treat one chain as ONE logical table:
+
+- **Global row numbering**: the first member contributes rows
+  `1..total_rows`; each continuation member contributes rows
+  `2..total_rows` (its repeated header row does not exist logically),
+  numbered consecutively after the previous member. Data row *i* of
+  the logical table therefore lives at global row *i + 1*.
+- **Aggregates compose**: per-sheet `STAT` blocks fold (min/max/sum/
+  count/other are all associative), and `TDIG`/`CHLL` sketches merge —
+  the merge-associativity documented in §4.3/§4.4 is exactly what
+  makes per-sheet sections chain-composable. Implementations SHOULD be
+  all-or-nothing: if any member lacks a column's section, answer "no
+  data" rather than a silent partial aggregate.
+- Sheets outside the chain (different headers, non-full predecessors)
+  keep per-sheet semantics.
+
+Known false-positive: a hand-built workbook whose sheets are exactly
+1,048,575 rows with identical headers on a born-indexed file is
+indistinguishable from an auto-split chain — and is treated as one.
+Semantically such a file *is* a continuation chain, so the reference
+implementation accepts this deliberately.
 
 ## 7. Security considerations
 

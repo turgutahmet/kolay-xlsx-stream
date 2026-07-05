@@ -8,6 +8,7 @@ listed below `Backlog` is "considered, not committed".
 
 | Version | Date | Highlights |
 |---|---|---|
+| [3.2.2](CHANGELOG.md#322--2026-07-05) | 2026-07-05 | Correctness patch: on auto-split workbooks (>1,048,575 rows) the entire query surface — `rowCount`/`rows`/`rowAt`/`rowRange`/`rowsWhere`/`findRow`/`columnStats`/`groupStats`/`quantile`/`countDistinct`/`shards` — now spans the continuation chain as one logical table instead of silently answering from the active sheet alone; misleading never-read config keys removed |
 | [3.2.0](CHANGELOG.md#320--2026-07-04) | 2026-07-04 | KXSI becomes an **open specification** ([SPEC.md](SPEC.md)) with a byte-pinned conformance suite; `SCRC` per-sync-point integrity CRCs; approximate analytics — `withColumnSketches()` embeds t-digest + HyperLogLog, `quantile()`/`median()`/`countDistinct()` answer with zero row reads; `groupStats()` sorted-group pushdown; +30 % read throughput (tokenizer micro-pass); `rows(skip)` fast path (~1,580× indexed) + within-block fast-forward (~19×); parallel S3 multipart upload (flat memory, steady wall times); packed shared strings (ceiling 20 → 64 MB compressed at 3.5× less peak); `autoDetectDates()` for external files |
 | [3.1.0](CHANGELOG.md#310--2026-07-04) | 2026-07-04 | Queryable XLSX: KXSI TLV sidecar extension with per-block column stats (zone maps) — `withColumnStats()` on the writer; `columnStats()`/`rowsWhere()`/`findRow()` on the reader (Parquet-style block pruning, sidecar-only aggregates, single-block point lookups); `shards()`/`rowsForShard()` for zero-coordination queue fan-out; writer +55 % throughput (PCRE-JIT escape gate, flattened row builder, level-5 default); S3 reader open 7 → 3 round trips; `rowCount()` boundary-count fast path |
 | [3.0.0](CHANGELOG.md#300--2026-05-06) | 2026-05-06 | Streaming reader (`StreamingXlsxReader`) with bounded ~24 MB RAM; born-indexed XLSX via opt-in `withRandomAccessIndex()` enabling O(1) `rowAt`/`rowRange`/`rowCount`; external XLSX support via shared-strings; new read + random-access benchmark scripts; tests reorganized under `Writers/` + `Readers/`; no breaking changes |
@@ -37,9 +38,15 @@ concatenation) are already PoC-proven.
   blocks {17, 19, 20}, decide between three requests or one padded
   request from measured RTT/bandwidth (S3 `GetObject` accepts only a
   single range per request).
-- **`explain()`** — return the query plan without executing: strategy,
-  candidate blocks, estimated requests/bytes/latency. Doubles as a CI
+- **`explain()` / `estimatedRows()`** — return the query plan without
+  executing: strategy, candidate blocks, estimated requests/bytes, and
+  a zero-I/O result-size estimate (zone-map counts give a hard upper
+  bound; the t-digest CDF gives a point estimate). Doubles as a CI
   oracle (plan vs. actual request count).
+- **`rowsWhereAll()`** — multi-predicate queries whose per-column
+  zone-map survivor sets are intersected before any block is read
+  (`WHERE date BETWEEN … AND amount > …` scans the intersection, never
+  more blocks than the most selective predicate alone).
 - **Hedged range requests** — re-issue a slow critical-path range on a
   second connection, first response wins; insurance against S3 tail
   latency on point lookups.
