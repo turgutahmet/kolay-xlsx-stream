@@ -5,6 +5,91 @@ All notable changes to `kolay/xlsx-stream` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.2.2] — 2026-07-05
+
+Correctness patch. No new public API. The writer's output path is
+untouched — the only writer change is constructor-time config-defaults
+wiring (below); the bytes it produces are the 3.2.1 bytes, and the
+single-sheet read path measures within ±1 % of 3.2.1 (A/B, five-run
+medians) — the auto-split fix costs nothing unless a file actually has
+a continuation chain.
+
+### Fixed — auto-split workbooks now answer queries for the WHOLE table
+
+When an export exceeds Excel's 1,048,576-row sheet ceiling the writer
+auto-splits it across continuation sheets. Every query API silently
+answered from the active sheet alone: on a 2.1M-row file `rowCount()`
+reported 1,048,575, `findRow()` returned null for anything past the
+first sheet, and `columnStats()` summed less than half the data —
+silently. This release makes the whole query surface span the
+continuation chain:
+
+- **Spanned APIs:** `rowCount()`, `rows()`/`chunked()` (including the
+  `skip` fast path), `rowAt()`, `rowRange()`, `rowsWhere()`,
+  `findRow()`, `columnStats()`, `groupStats()`, `quantile()`/
+  `median()`, `countDistinct()`, `shards()`.
+- **Chain detection is deliberately conservative:** consecutive sheets
+  chain only when every non-final member is exactly full (1,048,575
+  rows — the writer's split point, a count no hand-built sheet hits by
+  accident) AND every member carries an identical header row, AND the
+  file is born-indexed (the sidecar provides the O(1) totals the
+  detection needs). Intentional multi-sheet workbooks — different
+  headers, or same-schema sheets that aren't full — keep their
+  per-sheet semantics exactly as before. Single-sheet files take a
+  `count($sheets) < 2` early-out; nothing changes for them.
+- **Global row numbering:** a chain is ONE logical table. Continuation
+  members' repeated header rows do not exist logically; data row *i*
+  lives at global row *i + 1*. `rowsWhere()`/`findRow()`/`rowRange()`
+  keys, `rowAt()` addressing and `rows(skip:)` all use this numbering.
+- **Aggregates compose exactly:** `columnStats()` folds each member's
+  block stats; `quantile()`/`countDistinct()` merge the members'
+  t-digest/HLL sketches (that merge-associativity is why the sidecar
+  stores them per sheet). All-or-nothing rule: if any chain member
+  lacks the column's stats or sketch, the answer is `null` rather than
+  a silent partial — the exact failure mode this release removes.
+- **`shards()`** now fans out over every chain sheet (previously a
+  4M-row file dispatched workers for only its first sheet).
+  `rowsForShard()` keys remain LOCAL to the shard's sheet, as
+  documented — the "skip `$rn === 1`" guidance now applies per member,
+  since each member's first shard carries its (repeated) header.
+- Behaviour note: selecting a chain member explicitly via
+  `onSheet()`/`onSheetIndex()` still answers for the whole chain — a
+  physical continuation sheet is not a meaningful query target. Sheets
+  outside the chain are unaffected.
+
+### Fixed — the published config now actually applies (versioned)
+
+`config/xlsx-stream.php` shipped `writer` / `s3` / `memory` / `logging`
+keys (e.g. `XLSX_STREAM_COMPRESSION_LEVEL`) that no code ever read —
+settings silently did nothing. As of 3.2.2 the config is wired in, with
+two safety properties:
+
+- **Version gate:** the package applies the config only when it carries
+  `'version' => 2` (present in the new published file). Copies
+  published before 3.2.2 lack the key and stay inert — exactly their
+  previous behaviour — because their stale defaults contradict the code
+  (old file said compression level 1; the writer's real default has
+  been 5 since v3.1) and honouring them would have silently changed
+  output for existing installs. Re-publish with
+  `php artisan vendor:publish --tag=xlsx-stream-config --force` to opt
+  in.
+- **Precedence:** code-level setters always override config values,
+  which override package defaults. Invalid config values are ignored
+  (environment data must not turn every `new Writer` into a 500);
+  setters keep throwing on invalid input as before.
+
+Applied keys map 1:1 to real knobs: `writer.compression_level`,
+`writer.buffer_flush_interval`, `s3.part_size` and `s3.concurrency`
+(the `forDisk()` defaults). The old `memory` / `logging` /
+`max_rows_per_sheet` keys had no implementation behind them and are
+gone — a config key that silently does nothing is the exact bug this
+release fixes. Two of the old keys have real homes elsewhere,
+documented in the config file: transient S3 retries belong to the AWS
+SDK's retry middleware (`'retries' => N` on your `S3Client`; the sink
+adds one last-resort re-dispatch), and "logging" is the `onProgress()`
+callback. Outside Laravel nothing changes (`config()` absence is
+guarded).
+
 ## [3.2.1] — 2026-07-04
 
 Documentation-only patch. The v3.2.0 tag was published with this

@@ -451,6 +451,16 @@ foreach ($reader->rowRange(100_000, 100_500) as $rowNumber => $row) {
 fall back to a sequential O(N) scan from the first row. Only the cost
 differs; the API contract is identical.
 
+> **The physics of deflate streaming** — seekability requires
+> `Z_FULL_FLUSH` markers, and each marker resets the compressor's
+> dictionary, which in principle costs compression ratio. In practice
+> the cost is negligible at our default cadence: a sync point every
+> 10K rows resets a 32 KB window once per ~1 MB of XML, measured at
+> **+0.04 %** file size on the 500K-row benchmark workload (predicted
+> ceiling ≤0.5 %). You would only notice dictionary-reset overhead at
+> extreme settings like `every: 100` — if you shrink the period for
+> query granularity, re-measure your file sizes.
+
 > **Performance tip:** When you need many adjacent rows, prefer
 > `rowRange($from, $to)` over a loop of `rowAt()` calls. `rowRange()`
 > seeks once and reuses a single inflate stream; repeated `rowAt()`
@@ -850,6 +860,23 @@ $stats = $writer->finishFile();
 // $stats['sheets'] = 2
 ```
 
+**Reading auto-split files back** *(v3.2.2+)*: on born-indexed files the
+reader detects the continuation chain (consecutive exactly-full sheets
+with identical headers) and treats it as ONE logical table — `rowCount()`,
+`rowsWhere()`, `findRow()`, `columnStats()`, `quantile()`, `shards()` and
+friends span every continuation sheet with continuous global row numbers.
+Intentional multi-sheet workbooks (different headers, or sheets that
+aren't exactly full) keep per-sheet semantics. Before v3.2.2 queries
+silently answered from the active sheet alone — treat that as a reason
+to upgrade if you export past one sheet.
+
+Measured on a 2.1M-row, 3-sheet chain (local disk, 6 MB peak RAM):
+chain detection + `rowCount()` 1.5 ms on first call (~1 µs warmed),
+`findRow()` into the second sheet 9.5 ms, `rowAt()` 2.2 ms,
+`columnStats()` 1.5 ms, `quantile()` 1.7 ms. Single-sheet files take an
+early-out before any chain logic — the A/B benchmark against v3.2.1
+shows every single-sheet read path within ±1 % (measurement noise).
+
 ### Performance Tuning
 
 ```php
@@ -858,7 +885,7 @@ $writer->setCompressionLevel(1)        // Minimal compression
        ->setBufferFlushInterval(50000); // Large buffer
 
 // Balanced mode (default)
-$writer->setCompressionLevel(6)        // Balanced compression
+$writer->setCompressionLevel(5)        // Balanced compression (the default)
        ->setBufferFlushInterval(10000); // Medium buffer
 
 // Maximum compression (slower, smaller files)
@@ -908,34 +935,45 @@ try {
 
 ## Configuration
 
-Published configuration file (`config/xlsx-stream.php`):
+Defaults come from the published config file; code-level setters always
+override them at call time. *(Fixed in v3.2.2 — earlier releases
+shipped these keys without reading them; re-publish the config to opt
+in: `php artisan vendor:publish --tag=xlsx-stream-config --force`. The
+new file carries a `'version' => 2` marker; pre-3.2.2 copies stay
+inert so their stale defaults can't silently change your output.)*
 
 ```php
+// config/xlsx-stream.php — applied when 'version' => 2 is present
 return [
-    's3' => [
-        'part_size' => 32 * 1024 * 1024,  // S3 multipart chunk size
-        'retry_attempts' => 3,             // Retry failed uploads
-        'retry_delay_ms' => 100,           // Delay between retries
-    ],
-    
+    'version' => 2,
     'writer' => [
-        'compression_level' => 1,          // 1-9 (1=fastest, 9=smallest)
-        'buffer_flush_interval' => 10000,  // Rows to buffer
-        'max_rows_per_sheet' => 1048575,   // Excel limit - 1
+        'compression_level' => env('XLSX_STREAM_COMPRESSION_LEVEL', 5),
+        'buffer_flush_interval' => env('XLSX_STREAM_BUFFER_FLUSH_INTERVAL', 10000),
     ],
-    
-    'memory' => [
-        'file_buffer_size' => 1024 * 1024, // 1MB file write buffer
-    ],
-    
-    'logging' => [
-        'enabled' => true,
-        'channel' => null,                  // null = default channel
-        'log_progress' => false,            // Log progress updates
-        'progress_interval' => 10000,       // Log every N rows
+    's3' => [
+        'part_size' => env('XLSX_STREAM_S3_PART_SIZE', 8 * 1024 * 1024),
+        'concurrency' => env('XLSX_STREAM_S3_CONCURRENCY', 4),
     ],
 ];
 ```
+
+```php
+// Setters override config per writer instance:
+$writer->setCompressionLevel(9)           // wins over the config value
+       ->setBufferFlushInterval(50000);
+$writer->withRandomAccessIndex(every: 10000)
+       ->withColumnStats([1, 4])
+       ->withColumnSketches([1, 4]);
+$writer->onProgress(fn ($rows, $bytes) => ...)->setProgressInterval(10000);
+
+// Full control: construct the sink directly.
+new S3MultipartSink($s3, $bucket, $key, partSize: 8 * 1024 * 1024, concurrency: 8);
+```
+
+Transient S3 retries belong to the AWS SDK — configure them on your
+`S3Client` (`'retries' => N`); the sink adds one last-resort re-dispatch
+after the SDK gives up. Progress/"logging" is the `onProgress()`
+callback: wire it to your logger of choice.
 
 ## How It Works
 
