@@ -194,6 +194,13 @@ abstract class BaseXlsxWriter
     protected int $indexSyncPeriod = 10000;
     protected int $rowsSinceSync = 0;
 
+    // Group-boundary sync (opt-in via syncAtGroupBoundaries). When set,
+    // a ZLIB_FULL_FLUSH is forced whenever the 1-based $groupSyncColumn's
+    // value changes, so each index block holds exactly one group and
+    // groupStats() folds it straight from the sidecar with zero row reads.
+    protected ?int $groupSyncColumn = null;
+    protected ?string $lastGroupKey = null;
+
     /**
      * Per-sheet sync points keyed by sheet entry path.
      *
@@ -430,6 +437,41 @@ abstract class BaseXlsxWriter
 
         $this->randomAccessIndexEnabled = true;
         $this->indexSyncPeriod = $every;
+
+        return $this;
+    }
+
+    /**
+     * Align index block boundaries to GROUP changes: force a sync point
+     * (ZLIB_FULL_FLUSH) whenever the 1-based $column's value differs from
+     * the previous row's, so each block holds exactly one group.
+     *
+     * Why it pays: groupStats() folds a group-pure block straight from the
+     * sidecar's per-block aggregates without reading a row. Aligning
+     * blocks to groups makes EVERY block pure, so "GROUP BY on a grouped
+     * export" answers from the sidecar alone — zero row reads, even on S3.
+     * Pair it with withColumnStats() on the group and aggregate columns.
+     *
+     * Rows must be written grouped (all of a group's rows consecutive),
+     * as grouped exports already are; an interleaved column just produces
+     * more, smaller blocks (still correct). Enables the random-access
+     * index if it is not already on. Must be called before startFile().
+     * The row-count sync period still applies as an upper bound, so a
+     * single huge group is capped into several (same-group) blocks.
+     */
+    public function syncAtGroupBoundaries(int $column): self
+    {
+        if ($this->started) {
+            throw XlsxStreamException::alreadyStarted();
+        }
+        if ($column < 1) {
+            throw new XlsxStreamException(
+                "Group-sync column is 1-based; got {$column}."
+            );
+        }
+
+        $this->groupSyncColumn = $column;
+        $this->randomAccessIndexEnabled = true;
 
         return $this;
     }
@@ -932,6 +974,21 @@ abstract class BaseXlsxWriter
             $this->startNewSheet();
         }
 
+        // Group-boundary sync: when this row starts a new group, flush the
+        // buffered previous group WITH a sync point so its block ends here.
+        // Runs before currentSheetRow++ so the sync point (recorded as
+        // currentSheetRow + 1) lands on this row — the first of the new
+        // group's block. The empty-buffer guard skips the first row and
+        // fresh-sheet starts.
+        if ($this->groupSyncColumn !== null) {
+            $value = $row[$this->groupSyncColumn - 1] ?? null;
+            $key = is_scalar($value) ? (string) $value : '';
+            if ($this->lastGroupKey !== null && $key !== $this->lastGroupKey && $this->rowBuffer !== '') {
+                $this->flushRowBuffer(true);
+            }
+            $this->lastGroupKey = $key;
+        }
+
         $this->currentSheetRow++;
         $this->totalRows++;
 
@@ -1195,7 +1252,7 @@ abstract class BaseXlsxWriter
      * elements, the alignment invariant the reader's row tokenizer
      * depends on.
      */
-    protected function flushRowBuffer(): void
+    protected function flushRowBuffer(bool $forceSync = false): void
     {
         if ($this->rowBuffer === '') {
             return;
@@ -1203,7 +1260,7 @@ abstract class BaseXlsxWriter
 
         $rowsInBuffer = $this->rowBufferCount;
         $shouldSync = $this->randomAccessIndexEnabled
-            && ($this->rowsSinceSync + $rowsInBuffer) >= $this->indexSyncPeriod;
+            && ($forceSync || ($this->rowsSinceSync + $rowsInBuffer) >= $this->indexSyncPeriod);
 
         if (! $shouldSync) {
             $this->writeSheetData($this->rowBuffer);

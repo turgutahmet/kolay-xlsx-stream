@@ -1932,7 +1932,8 @@ class StreamingXlsxReader
             [$first, $last] = $step['scan'];
             $start = $ranges[$first];
             $stopRow = $ranges[$last]['last_row'];
-            foreach ($this->openSheetReader([$groupBy - 1, $aggregate - 1], $entry)->rowsFromOffset($start['comp_offset'], $start['start_row_at_offset'] ?? 1, $start['first_row']) as $rn => $row) {
+            $compLength = $this->runCompLength($ranges, $first, $last);
+            foreach ($this->openSheetReader([$groupBy - 1, $aggregate - 1], $entry)->rowsFromOffset($start['comp_offset'], $start['start_row_at_offset'] ?? 1, $start['first_row'], $compLength) as $rn => $row) {
                 if ($rn > $stopRow) {
                     break;
                 }
