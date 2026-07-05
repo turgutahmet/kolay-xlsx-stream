@@ -4,6 +4,7 @@ namespace Kolay\XlsxStream\Sources;
 
 use Aws\S3\S3Client;
 use GuzzleHttp\Psr7\StreamWrapper;
+use Kolay\XlsxStream\Contracts\ProvidesCostHints;
 use Kolay\XlsxStream\Contracts\Source;
 use Kolay\XlsxStream\Contracts\SupportsSuffixRange;
 use Kolay\XlsxStream\Exceptions\XlsxReadException;
@@ -19,18 +20,39 @@ use Kolay\XlsxStream\Exceptions\XlsxReadException;
  * getObject call — without it the SDK spills bodies >2 MB to php://temp,
  * which would defeat the bounded-memory goal of the reader.
  */
-class S3RangeSource implements Source, SupportsSuffixRange
+class S3RangeSource implements ProvidesCostHints, Source, SupportsSuffixRange
 {
     private S3Client $s3;
     private string $bucket;
     private string $key;
     private ?int $size = null;
+    private int $rttUs;
+    private int $bandwidthBps;
 
-    public function __construct(S3Client $s3, string $bucket, string $key)
-    {
+    /**
+     * $rttUs / $bandwidthBps are gap-bridging planning hints (see
+     * ProvidesCostHints), not benchmark claims — override them for your
+     * deployment. Defaults are conservative intra-region estimates
+     * (~30 ms round-trip, ~50 MB/s per connection); they only affect how
+     * aggressively pruned scans coalesce runs, never correctness.
+     */
+    public function __construct(
+        S3Client $s3,
+        string $bucket,
+        string $key,
+        int $rttUs = 30_000,
+        int $bandwidthBps = 52_428_800
+    ) {
         $this->s3 = $s3;
         $this->bucket = $bucket;
         $this->key = $key;
+        $this->rttUs = $rttUs;
+        $this->bandwidthBps = $bandwidthBps;
+    }
+
+    public function costHints(): array
+    {
+        return ['rtt_us' => $this->rttUs, 'bandwidth_bps' => $this->bandwidthBps];
     }
 
     public function size(): int

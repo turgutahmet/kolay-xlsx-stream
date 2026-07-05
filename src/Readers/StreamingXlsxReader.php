@@ -3,6 +3,7 @@
 namespace Kolay\XlsxStream\Readers;
 
 use Aws\S3\S3Client;
+use Kolay\XlsxStream\Contracts\ProvidesCostHints;
 use Kolay\XlsxStream\Contracts\Source;
 use Kolay\XlsxStream\Exceptions\XlsxReadException;
 use Kolay\XlsxStream\Sketches\HyperLogLog;
@@ -83,6 +84,9 @@ class StreamingXlsxReader
 
     private Source $source;
     private ZipDirectory $cd;
+
+    /** Memoized gap-bridge byte budget (rtt × bandwidth); see maxBridgeBytes(). */
+    private ?int $bridgeBytesCache = null;
 
     /** @var list<array{name: string, sheetId: int, entry: string}> */
     private array $sheets;
@@ -1067,6 +1071,200 @@ class StreamingXlsxReader
     }
 
     /**
+     * "ORDER BY $column [DESC] LIMIT $k" answered from the sidecar:
+     * return the $k rows with the smallest ($desc = false) or largest
+     * ($desc = true) values in $column, ranked by that value.
+     *
+     * On a column the writer flagged sorted, the extremes are the rows at
+     * one end of the sheet, so only the blocks at that end are read (one
+     * seek, early exit) — an indexed top-N. On an unsorted column it is a
+     * single full scan holding an O($k) heap (no pruning is possible, but
+     * memory stays bounded). Ranking uses the raw stored numeric value —
+     * the same value columnStats/rowsWhere see — while the returned rows
+     * carry any registered casts. Non-numeric cells never rank.
+     *
+     * Returns an ordered map of 1-based row number => row (rank order:
+     * position 0 is the top). Empty for $k <= 0 or a header-only sheet;
+     * $k is clamped to the available data rows.
+     *
+     * @return array<int, array<int, mixed>>
+     */
+    public function topRows(int|string $column, int $k, bool $desc = false): array
+    {
+        if (\is_string($column)) {
+            $column = $this->resolveColumnName($column) + 1;
+        }
+        if ($k <= 0) {
+            return [];
+        }
+
+        $total = $this->rowCount();
+        $dataRows = $total - 1; // row 1 is the header
+        if ($dataRows <= 0) {
+            return [];
+        }
+        $k = min($k, $dataRows);
+
+        $stats = $this->columnStats($column);
+        $sorted = $stats['sorted'] ?? null;
+
+        if ($sorted === 'asc' || $sorted === 'desc') {
+            return $this->topRowsSorted($k, $desc, $sorted, $total);
+        }
+
+        return $this->topRowsScan($column, $k, $desc);
+    }
+
+    /**
+     * Sorted-column fast path: the k extremes are a contiguous block of
+     * rows at one end of the sheet. Read just that row range (via the
+     * seeking rowRange) and order it by value — no per-row comparison
+     * needed, the sorted flag guarantees value order equals row order.
+     *
+     * @return array<int, array<int, mixed>>
+     */
+    private function topRowsSorted(int $k, bool $desc, string $sorted, int $total): array
+    {
+        // Which end holds the wanted extreme? On an asc column high values
+        // sit at the tail; on desc, at the head. We want the high end when
+        // $desc (largest) is requested.
+        $wantHigh = $desc;
+        $highAtTail = $sorted === 'asc';
+        $readTail = $wantHigh === $highAtTail;
+
+        [$from, $to] = $readTail ? [$total - $k + 1, $total] : [2, $k + 1];
+
+        $rows = [];
+        foreach ($this->rowRange($from, $to) as $rn => $row) {
+            $rows[$rn] = $row;
+        }
+
+        // $rows is keyed by ascending row number. Value ascends with row
+        // number iff the column is asc-sorted. Reorder so position 0 is
+        // the requested top (high first when $desc).
+        $ascendingByValue = $sorted === 'asc';
+        if ($ascendingByValue === $desc) {
+            $rows = array_reverse($rows, true);
+        }
+
+        return $rows;
+    }
+
+    /**
+     * Unsorted-column path: a single full scan keeping the running top-k
+     * by raw value in an O(k) heap-like array. Casts are applied only to
+     * the surviving rows.
+     *
+     * @return array<int, array<int, mixed>>
+     */
+    private function topRowsScan(int $column, int $k, bool $desc): array
+    {
+        $idx = $column - 1;
+        $top = [];          // rn => ['v' => float, 'row' => raw row]
+        $threshold = null;  // worst value currently kept (evict candidate)
+
+        foreach ($this->scanAllRaw() as $rn => $row) {
+            $cell = $row[$idx] ?? null;
+            if (! is_numeric($cell)) {
+                continue;
+            }
+            $v = (float) $cell;
+
+            if (count($top) < $k) {
+                $top[$rn] = ['v' => $v, 'row' => $row];
+                if (count($top) === $k) {
+                    $threshold = $this->worstValue($top, $desc);
+                }
+
+                continue;
+            }
+
+            // Only touch the heap when the new value beats the weakest one.
+            if ($desc ? $v > $threshold : $v < $threshold) {
+                unset($top[$this->worstRow($top, $desc)]);
+                $top[$rn] = ['v' => $v, 'row' => $row];
+                $threshold = $this->worstValue($top, $desc);
+            }
+        }
+
+        uasort($top, fn ($a, $b) => $desc ? ($b['v'] <=> $a['v']) : ($a['v'] <=> $b['v']));
+
+        $out = [];
+        foreach ($top as $rn => $e) {
+            $out[$rn] = $this->applyCasts($e['row']);
+        }
+
+        return $out;
+    }
+
+    /**
+     * Weakest value in the current top-k (the min when ranking largest,
+     * the max when ranking smallest) — the eviction threshold.
+     *
+     * @param  array<int, array{v: float, row: array<int, mixed>}>  $top
+     */
+    private function worstValue(array $top, bool $desc): float
+    {
+        $worst = null;
+        foreach ($top as $e) {
+            if ($worst === null || ($desc ? $e['v'] < $worst : $e['v'] > $worst)) {
+                $worst = $e['v'];
+            }
+        }
+
+        return $worst ?? 0.0;
+    }
+
+    /**
+     * Row number of the weakest entry in the current top-k.
+     *
+     * @param  array<int, array{v: float, row: array<int, mixed>}>  $top
+     */
+    private function worstRow(array $top, bool $desc): int
+    {
+        $worstRn = array_key_first($top);
+        $worstV = null;
+        foreach ($top as $rn => $e) {
+            if ($worstV === null || ($desc ? $e['v'] < $worstV : $e['v'] > $worstV)) {
+                $worstV = $e['v'];
+                $worstRn = $rn;
+            }
+        }
+
+        return $worstRn;
+    }
+
+    /**
+     * Chain-aware full scan yielding global 1-based row number => raw row
+     * (no casts), header rows skipped. Backs the unsorted topRows path.
+     *
+     * @return \Generator<int, array<int, mixed>>
+     */
+    private function scanAllRaw(): \Generator
+    {
+        $chain = $this->chain();
+        if ($chain !== null) {
+            foreach ($chain as $m) {
+                foreach ($this->openSheetReader([], $m['entry'])->rowsFromOffset(null, 1) as $rn => $row) {
+                    if ($rn === 1) {
+                        continue; // header (real on member 0, repeated on continuations)
+                    }
+                    yield $m['globalStart'] + ($rn - $m['dataStartLocal']) => $row;
+                }
+            }
+
+            return;
+        }
+
+        foreach ($this->openSheetReader()->rowsFromOffset(null, 1) as $rn => $row) {
+            if ($rn === 1) {
+                continue;
+            }
+            yield $rn => $row;
+        }
+    }
+
+    /**
      * Single-sheet predicate matcher behind rowsWhere(): zone-map
      * pruning + run-merged scans over one entry, yielding LOCAL 1-based
      * row number => raw matched row (casts belong to the caller). This
@@ -1099,7 +1297,7 @@ class StreamingXlsxReader
 
         // Prune, then merge surviving adjacent blocks into runs so each
         // run costs one seek + one linear scan instead of per-block seeks.
-        $runs = $this->mergeRuns($this->survivingBlocks($stats['blocks'], $lo, $hi));
+        $runs = $this->planRuns($this->survivingBlocks($stats['blocks'], $lo, $hi), $ranges, $this->maxBridgeBytes());
 
         foreach ($runs as [$firstBlock, $lastBlock]) {
             $start = $ranges[$firstBlock];
@@ -1175,7 +1373,7 @@ class StreamingXlsxReader
         }
 
         $ranges = $this->blockRanges($index, $entry);
-        foreach ($this->mergeRuns($candidate) as [$firstBlock, $lastBlock]) {
+        foreach ($this->planRuns($candidate, $ranges, $this->maxBridgeBytes()) as [$firstBlock, $lastBlock]) {
             $start = $ranges[$firstBlock];
             $stopRow = $ranges[$lastBlock]['last_row'];
             $compLength = $this->runCompLength($ranges, $firstBlock, $lastBlock);
@@ -1361,7 +1559,7 @@ class StreamingXlsxReader
         }
 
         $ranges = $this->blockRanges($index, $entry);
-        $runs = $this->mergeRuns($candidate);
+        $runs = $this->planRuns($candidate, $ranges, $this->maxBridgeBytes());
         $bytes = 0;
         $upper = 0;
         foreach ($runs as [$firstBlock, $lastBlock]) {
@@ -1433,34 +1631,78 @@ class StreamingXlsxReader
 
     /**
      * Collapse an ascending list of surviving block indices into
-     * contiguous [firstBlock, lastBlock] runs, so each run costs one seek
-     * plus one linear scan instead of a seek per block. A gap in the
-     * indices (a pruned block between survivors) starts a new run.
+     * [firstBlock, lastBlock] runs, so each run costs one seek plus one
+     * linear scan instead of a seek per block. Adjacent survivors always
+     * merge; a gap of pruned blocks merges too (G5 gap-bridging) when its
+     * compressed byte span fits $maxBridgeBytes — the reader keeps one
+     * ranged read alive through the gap because transferring those bytes
+     * beats a fresh round-trip. The gap's non-matching rows are read and
+     * filtered out, never mismatched.
+     *
+     * $maxBridgeBytes = 0 (a zero-latency / no-hints Source) disables
+     * bridging entirely, so run merging is byte-for-byte the contiguous
+     * behaviour it always had.
      *
      * @param  list<int>  $blocks  ascending, no duplicates
+     * @param  list<array{first_row: int, last_row: int, comp_offset: int|null, uncomp_offset: int|null, start_row_at_offset: int|null}>  $ranges
      * @return list<array{0: int, 1: int}>
      */
-    private function mergeRuns(array $blocks): array
+    private function planRuns(array $blocks, array $ranges, int $maxBridgeBytes): array
     {
-        $runs = [];
-        $run = null;
-        $prev = null;
-        foreach ($blocks as $i) {
-            if ($run === null) {
-                $run = [$i, $i];
-            } elseif ($i === $prev + 1) {
-                $run[1] = $i;
-            } else {
-                $runs[] = $run;
-                $run = [$i, $i];
-            }
-            $prev = $i;
-        }
-        if ($run !== null) {
-            $runs[] = $run;
+        if ($blocks === []) {
+            return [];
         }
 
+        $runs = [];
+        $runStart = $blocks[0];
+        $runEnd = $blocks[0];
+        for ($i = 1, $n = count($blocks); $i < $n; $i++) {
+            $b = $blocks[$i];
+            if ($b === $runEnd + 1) {
+                $runEnd = $b;
+
+                continue;
+            }
+
+            // Gap = blocks [runEnd+1 .. b-1]; its compressed span is the
+            // distance between the sync point after runEnd and the one
+            // starting b. Bridge only when both offsets are known and the
+            // span fits the round-trip byte budget.
+            $gapFrom = $ranges[$runEnd + 1]['comp_offset'] ?? null;
+            $gapTo = $ranges[$b]['comp_offset'] ?? null;
+            $gapBytes = ($gapFrom !== null && $gapTo !== null) ? $gapTo - $gapFrom : PHP_INT_MAX;
+
+            if ($maxBridgeBytes > 0 && $gapBytes <= $maxBridgeBytes) {
+                $runEnd = $b; // bridge the gap into the current run
+            } else {
+                $runs[] = [$runStart, $runEnd];
+                $runStart = $b;
+                $runEnd = $b;
+            }
+        }
+        $runs[] = [$runStart, $runEnd];
+
         return $runs;
+    }
+
+    /**
+     * Byte budget for gap-bridging: how many compressed bytes transfer in
+     * one round-trip on this Source (rtt × bandwidth). A Source without
+     * ProvidesCostHints (local disk) is treated as zero-latency → 0 →
+     * bridging off. Memoized; the hints don't change within a read.
+     */
+    private function maxBridgeBytes(): int
+    {
+        if ($this->bridgeBytesCache === null) {
+            if ($this->source instanceof ProvidesCostHints) {
+                $h = $this->source->costHints();
+                $this->bridgeBytesCache = (int) (($h['rtt_us'] / 1_000_000) * $h['bandwidth_bps']);
+            } else {
+                $this->bridgeBytesCache = 0;
+            }
+        }
+
+        return $this->bridgeBytesCache;
     }
 
     /**
