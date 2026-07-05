@@ -144,6 +144,18 @@ class StreamingXlsxReader
      */
     private array $headerByEntry = [];
 
+    /**
+     * Header-name resolution cache per sheet entry: 'map' (name =>
+     * 0-based index, unique names only), 'dupes' (name => every 0-based
+     * position, for the ambiguity error), 'headers' (addressable names
+     * in sheet order, for the unknown-name error). Built lazily by
+     * resolveColumnName(); entry-keyed, so sheet switches need no
+     * invalidation.
+     *
+     * @var array<string, array{map: array<string, int>, dupes: array<string, list<int>>, headers: list<string>}>
+     */
+    private array $columnNamesByEntry = [];
+
     /** @var array<string, TDigest|null> merged chain digests, keyed chain-head|column */
     private array $chainDigestCache = [];
 
@@ -581,7 +593,12 @@ class StreamingXlsxReader
      *
      * $column is 1-based, matching the writer's withColumnStats() —
      * this API pairs with that opt-in (unlike castColumn(), whose
-     * 0-based indexing addresses the yielded row arrays).
+     * 0-based indexing addresses the yielded row arrays). A header
+     * NAME works everywhere a column number does — 'Amount' instead
+     * of 4 — and makes that base split invisible; naming semantics
+     * live on resolveColumnName(). Every query API below (quantile,
+     * median, countDistinct, rowsWhere, findRow, groupStats) accepts
+     * the same int|string form.
      *
      * Returns null when the file carries no stats for the column (not
      * born-indexed, stale sidecar, or column not tracked) — callers
@@ -593,8 +610,11 @@ class StreamingXlsxReader
      *
      * @return array{min: float|null, max: float|null, sum: float, avg: float|null, count: int, other: int, sorted: string|null}|null
      */
-    public function columnStats(int $column): ?array
+    public function columnStats(int|string $column): ?array
     {
+        if (\is_string($column)) {
+            $column = $this->resolveColumnName($column) + 1;
+        }
         $index = $this->loadRandomAccessIndex();
 
         // Chain: fold every member's blocks — the sidecar carries each
@@ -718,8 +738,11 @@ class StreamingXlsxReader
      * decide whether an exact scan is worth it. Also null for a sketch
      * that saw no numeric values (e.g. a text column).
      */
-    public function quantile(int $column, float $q): ?float
+    public function quantile(int|string $column, float $q): ?float
     {
+        if (\is_string($column)) {
+            $column = $this->resolveColumnName($column) + 1;
+        }
         if ($q < 0.0 || $q > 1.0) {
             throw new \InvalidArgumentException("quantile must be within [0, 1]; got {$q}");
         }
@@ -772,7 +795,7 @@ class StreamingXlsxReader
     /**
      * Approximate median — sugar for quantile($column, 0.5).
      */
-    public function median(int $column): ?float
+    public function median(int|string $column): ?float
     {
         return $this->quantile($column, 0.5);
     }
@@ -792,8 +815,11 @@ class StreamingXlsxReader
      * Returns null when the file carries no sketch for the column;
      * 0 for a tracked column whose data rows were all empty.
      */
-    public function countDistinct(int $column): ?int
+    public function countDistinct(int|string $column): ?int
     {
+        if (\is_string($column)) {
+            $column = $this->resolveColumnName($column) + 1;
+        }
         $chain = $this->chain();
         if ($chain !== null) {
             return $this->chainHll($chain, $column)?->count();
@@ -859,8 +885,12 @@ class StreamingXlsxReader
      *
      * @return \Generator<int, array<int, mixed>>
      */
-    public function rowsWhere(int $column, string $op, int|float $value, int|float|null $value2 = null): \Generator
+    public function rowsWhere(int|string $column, string $op, int|float $value, int|float|null $value2 = null): \Generator
     {
+        if (\is_string($column)) {
+            $column = $this->resolveColumnName($column) + 1;
+        }
+
         // Chain: run the per-sheet matcher over every member in order,
         // remapping local row numbers to the chain's global numbering.
         // Continuation members' repeated header row (local 1) is
@@ -967,7 +997,7 @@ class StreamingXlsxReader
      *
      * @return array{row: int, values: array<int, mixed>}|null
      */
-    public function findRow(int $column, int|float $value): ?array
+    public function findRow(int|string $column, int|float $value): ?array
     {
         foreach ($this->rowsWhere($column, '=', $value) as $rn => $row) {
             return ['row' => $rn, 'values' => $row];
@@ -1034,8 +1064,14 @@ class StreamingXlsxReader
      * @param  callable(float): (int|float)  $bucket
      * @return list<array{group: int|float, sum: float, count: int, min: float|null, max: float|null}>
      */
-    public function groupStats(int $groupBy, int $aggregate, ?callable $bucket = null): array
+    public function groupStats(int|string $groupBy, int|string $aggregate, ?callable $bucket = null): array
     {
+        if (\is_string($groupBy)) {
+            $groupBy = $this->resolveColumnName($groupBy) + 1;
+        }
+        if (\is_string($aggregate)) {
+            $aggregate = $this->resolveColumnName($aggregate) + 1;
+        }
         if ($groupBy < 1 || $aggregate < 1) {
             throw new \InvalidArgumentException(
                 "groupStats() columns are 1-based; got groupBy={$groupBy}, aggregate={$aggregate}"
@@ -1586,7 +1622,9 @@ class StreamingXlsxReader
     }
 
     /**
-     * Register a cell-value cast for a 0-indexed column. Built-in cast
+     * Register a cell-value cast for a column — 0-indexed number, or a
+     * header NAME (see resolveColumnName; addressing by name makes the
+     * 0-based-here vs 1-based-in-queries split invisible). Built-in cast
      * names: date, datetime, int, float, bool. Pass a callable for
      * custom transformations.
      *
@@ -1598,8 +1636,12 @@ class StreamingXlsxReader
      * column is exempted from detection, so the cast always receives
      * the raw tokenized value, never a DateTimeImmutable.
      */
-    public function castColumn(int $col, string|callable $cast): self
+    public function castColumn(int|string $col, string|callable $cast): self
     {
+        if (is_string($col)) {
+            $col = $this->resolveColumnName($col); // 0-based, castColumn's native base
+        }
+
         // String is always interpreted as a built-in cast name (date,
         // datetime, int, float, bool). is_callable() must NOT win the
         // dispatch here — "date" is a real PHP function, so a naive
@@ -1612,9 +1654,14 @@ class StreamingXlsxReader
     }
 
     /**
-     * Bulk variant of castColumn().
+     * Bulk variant of castColumn(). Keys may be 0-based numbers or
+     * header names. PHP coerces numeric-string ARRAY KEYS ('5') to
+     * ints before we ever see them, so a header literally named "5"
+     * cannot be addressed through this bulk form — use
+     * castColumn('5', ...) for that (the parameter form keeps the
+     * string intact).
      *
-     * @param  array<int, string|callable>  $casts
+     * @param  array<int|string, string|callable>  $casts
      */
     public function castColumns(array $casts): self
     {
@@ -1991,6 +2038,66 @@ class StreamingXlsxReader
         }
 
         return null;
+    }
+
+    /**
+     * Resolve a header NAME to its 0-based column index — the single
+     * naming authority behind every int|string API.
+     *
+     * Semantics (deliberate, uniform):
+     *   - A string is ALWAYS a name. '2024' looks up a header called
+     *     "2024"; it is never coerced to column 2024 — silent numeric
+     *     reinterpretation is exactly the ambiguity this API removes.
+     *   - Names match the RAW tokenized header row (before casts /
+     *     date detection), compared on the cells' string form. On a
+     *     continuation chain every member carries an identical header,
+     *     so the active entry's header speaks for the whole chain.
+     *   - Empty header cells are not addressable (skipped, not an error).
+     *   - A duplicated name throws ambiguousColumnName — silently
+     *     picking one column is the silent-wrong-answer failure class.
+     *   - An unknown name throws unknownColumnName listing the sheet's
+     *     headers, so a typo is a one-glance fix.
+     *
+     * The map builds once per sheet entry and is memoized; lookups are
+     * O(1) after that.
+     */
+    private function resolveColumnName(string $name): int
+    {
+        $entry = $this->currentEntry;
+        if (! isset($this->columnNamesByEntry[$entry])) {
+            $map = [];
+            $dupes = [];
+            $headers = [];
+            foreach ($this->rawHeaderOf($entry) as $idx => $cell) {
+                $label = (string) $cell;
+                if ($label === '') {
+                    continue;
+                }
+                $headers[] = $label;
+                if (isset($dupes[$label])) {
+                    $dupes[$label][] = $idx;
+                } elseif (isset($map[$label])) {
+                    $dupes[$label] = [$map[$label], $idx];
+                } else {
+                    $map[$label] = $idx;
+                }
+            }
+            $this->columnNamesByEntry[$entry] = ['map' => $map, 'dupes' => $dupes, 'headers' => $headers];
+        }
+
+        $names = $this->columnNamesByEntry[$entry];
+
+        if (isset($names['dupes'][$name])) {
+            throw XlsxReadException::ambiguousColumnName(
+                $name,
+                array_map(static fn (int $i): int => $i + 1, $names['dupes'][$name])
+            );
+        }
+        if (! array_key_exists($name, $names['map'])) {
+            throw XlsxReadException::unknownColumnName($name, $names['headers']);
+        }
+
+        return $names['map'][$name];
     }
 
     /**
