@@ -88,6 +88,9 @@ class StreamingXlsxReader
     /** Memoized gap-bridge byte budget (rtt × bandwidth); see maxBridgeBytes(). */
     private ?int $bridgeBytesCache = null;
 
+    /** Observability hook fired when a query degrades to a full scan; see onFullScan(). */
+    private ?\Closure $onFullScan = null;
+
     /** @var list<array{name: string, sheetId: int, entry: string}> */
     private array $sheets;
 
@@ -872,6 +875,36 @@ class StreamingXlsxReader
     }
 
     /**
+     * Register a hook fired whenever a query CANNOT push down and falls
+     * back to a full row scan — an unindexed column on rowsWhere /
+     * rowsWhereAll, or a groupBy column that is not sorted / not tracked
+     * on groupStats. The callback receives a context array
+     * `{query, column, reason, entry}` so callers can log or alert when a
+     * query silently reads the whole sheet instead of the sidecar. Pass
+     * null to clear. On an auto-split chain it may fire once per member.
+     *
+     * @param  (callable(array{query: string, column: int|null, reason: string, entry: string}): void)|null  $callback
+     */
+    public function onFullScan(?callable $callback): self
+    {
+        $this->onFullScan = $callback === null ? null : \Closure::fromCallable($callback);
+
+        return $this;
+    }
+
+    private function fireFullScan(string $query, ?int $column, string $reason, string $entry): void
+    {
+        if ($this->onFullScan !== null) {
+            ($this->onFullScan)([
+                'query' => $query,
+                'column' => $column,
+                'reason' => $reason,
+                'entry' => $entry,
+            ]);
+        }
+    }
+
+    /**
      * Yield rows whose $column (1-based, see columnStats) satisfies a
      * numeric predicate, using the sidecar's per-block zone maps to skip
      * every block whose [min, max] provably contains no match — the
@@ -1350,6 +1383,7 @@ class StreamingXlsxReader
             // rows(): that wrapper re-keys sequentially from 0, while
             // this generator's contract (and the pruned path below) is
             // 1-based sheet row numbers.
+            $this->fireFullScan('rowsWhere', $column, 'column-not-indexed', $entry);
             foreach ($this->openSheetReader([$column - 1], $entry)->rowsFromOffset(null, 1) as $rn => $row) {
                 if ($this->cellMatches($row[$column - 1] ?? null, $op, $value, $value2)) {
                     yield $rn => $row;
@@ -1425,6 +1459,7 @@ class StreamingXlsxReader
 
         if ($candidate === null) {
             // No statful predicate — full scan, filter per row.
+            $this->fireFullScan('rowsWhereAll', null, 'no-indexed-predicate', $entry);
             foreach ($this->openSheetReader($columns, $entry)->rowsFromOffset(null, 1) as $rn => $row) {
                 if ($this->rowMatchesAll($row, $preds)) {
                     yield $rn => $row;
@@ -1927,6 +1962,10 @@ class StreamingXlsxReader
             // No pushdown basis — honest full scan with the same
             // grouping. Not via rows(): the scan must see 1-based row
             // numbers to exclude exactly the header.
+            $reason = ($groupCol === null || $aggCol === null || $index === null)
+                ? 'column-not-indexed'
+                : 'groupby-not-sorted';
+            $this->fireFullScan('groupStats', $groupBy, $reason, $entry);
             foreach ($this->openSheetReader([$groupBy - 1, $aggregate - 1], $entry)->rowsFromOffset(null, 1) as $rn => $row) {
                 if ($rn === 1) {
                     continue;

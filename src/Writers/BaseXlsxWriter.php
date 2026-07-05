@@ -591,6 +591,27 @@ abstract class BaseXlsxWriter
         return $this;
     }
 
+    /**
+     * One-call preset for a fully queryable export: turn on the
+     * random-access index, per-block zone maps (columnStats) and, unless
+     * $withSketches is false, the t-digest/HLL sketches — all for the
+     * given 1-based $columns. Equivalent to chaining withRandomAccessIndex()
+     * + withColumnStats() + withColumnSketches(), and byte-identical to
+     * doing so with the same arguments.
+     *
+     * Must be called before startFile().
+     */
+    public function queryable(array $columns, int $every = 10000, bool $withSketches = true): self
+    {
+        $this->withRandomAccessIndex($every);
+        $this->withColumnStats($columns);
+        if ($withSketches) {
+            $this->withColumnSketches($columns);
+        }
+
+        return $this;
+    }
+
     public function setBufferFlushInterval(int $rows): self
     {
         if ($rows < 1) {
