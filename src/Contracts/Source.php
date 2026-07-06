@@ -28,22 +28,20 @@ interface Source
     public function range(int $offset, int $length): string;
 
     /**
-     * Open a forward-only stream resource starting at the given offset.
-     * Caller is responsible for fclose(). The stream MUST support fread()
-     * and feof(); seeking is not required.
+     * Open a forward-only stream resource starting at the given offset,
+     * reading to the end of the object. Caller is responsible for
+     * fclose(). The stream MUST support fread() and feof(); seeking is not
+     * required.
      *
-     * When $length is given the stream is bounded to at most that many
-     * bytes from $offset (a ranged [offset, offset+length-1] fetch on
-     * remote sources; a read cap on local ones). $length === null keeps
-     * the historical behaviour of reading to the end of the object. The
-     * bound is an I/O optimization for pruned scans that stop at a
-     * ZLIB_FULL_FLUSH sync boundary — never a correctness contract on
-     * exact byte counts, so implementations may over-read to EOF if
-     * bounding is not cheap.
+     * A source that can serve a BOUNDED range cheaply (stopping after a
+     * given byte length, e.g. an HTTP Range GET) additionally implements
+     * SupportsBoundedStream — the reader uses that for pruned scans that
+     * end at a sync boundary. Sources that only implement this method keep
+     * working; they just fetch to EOF and let the reader cap the read.
      *
      * @return resource
      */
-    public function streamFrom(int $offset, ?int $length = null);
+    public function streamFrom(int $offset);
 
     /**
      * Release any underlying handles. Idempotent — safe to call multiple times.

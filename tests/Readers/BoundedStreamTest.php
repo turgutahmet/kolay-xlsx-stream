@@ -3,6 +3,7 @@
 namespace Kolay\XlsxStream\Tests\Readers;
 
 use Kolay\XlsxStream\Contracts\Source;
+use Kolay\XlsxStream\Contracts\SupportsBoundedStream;
 use Kolay\XlsxStream\Readers\StreamingXlsxReader;
 use Kolay\XlsxStream\Sinks\FileSink;
 use Kolay\XlsxStream\Sources\LocalFileSource;
@@ -56,10 +57,10 @@ class BoundedStreamTest extends TestCase
         $writer->finishFile();
     }
 
-    /** Spy Source recording every (offset, length) passed to streamFrom. */
+    /** Spy Source recording each open: unbounded streamFrom (length null) vs bounded streamFromRange. */
     private function makeSpy(): object
     {
-        return new class (new LocalFileSource($this->testFile)) implements Source {
+        return new class (new LocalFileSource($this->testFile)) implements Source, SupportsBoundedStream {
             /** @var list<array{offset: int, length: int|null}> */
             public array $streamCalls = [];
 
@@ -75,11 +76,18 @@ class BoundedStreamTest extends TestCase
                 return $this->inner->range($offset, $length);
             }
 
-            public function streamFrom(int $offset, ?int $length = null)
+            public function streamFrom(int $offset)
+            {
+                $this->streamCalls[] = ['offset' => $offset, 'length' => null];
+
+                return $this->inner->streamFrom($offset);
+            }
+
+            public function streamFromRange(int $offset, int $length)
             {
                 $this->streamCalls[] = ['offset' => $offset, 'length' => $length];
 
-                return $this->inner->streamFrom($offset, $length);
+                return $this->inner->streamFromRange($offset, $length);
             }
 
             public function close(): void

@@ -3,6 +3,7 @@
 namespace Kolay\XlsxStream\Readers;
 
 use Kolay\XlsxStream\Contracts\Source;
+use Kolay\XlsxStream\Contracts\SupportsBoundedStream;
 use Kolay\XlsxStream\Exceptions\XlsxReadException;
 
 /**
@@ -333,7 +334,13 @@ class StreamingSheetReader
         $compRemaining = $compLength !== null ? min($compLength, $entryRemaining) : $entryRemaining;
         $bounded = $compRemaining < $entryRemaining;
 
-        $stream = $this->source->streamFrom($startOffset, $bounded ? $compRemaining : null);
+        // A source that can serve a bounded range (S3 range GET) fetches
+        // only the run's bytes off the wire; others fall back to a plain
+        // stream-to-EOF and the loop caps the read via $compRemaining. The
+        // NO_FLUSH / skip-FINISH handling below is identical either way.
+        $stream = ($bounded && $this->source instanceof SupportsBoundedStream)
+            ? $this->source->streamFromRange($startOffset, $compRemaining)
+            : $this->source->streamFrom($startOffset);
 
         $inflate = null;
         if ($method === self::METHOD_DEFLATE) {

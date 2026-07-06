@@ -6,6 +6,7 @@ use Aws\S3\S3Client;
 use GuzzleHttp\Psr7\StreamWrapper;
 use Kolay\XlsxStream\Contracts\ProvidesCostHints;
 use Kolay\XlsxStream\Contracts\Source;
+use Kolay\XlsxStream\Contracts\SupportsBoundedStream;
 use Kolay\XlsxStream\Contracts\SupportsSuffixRange;
 use Kolay\XlsxStream\Exceptions\XlsxReadException;
 
@@ -20,7 +21,7 @@ use Kolay\XlsxStream\Exceptions\XlsxReadException;
  * getObject call — without it the SDK spills bodies >2 MB to php://temp,
  * which would defeat the bounded-memory goal of the reader.
  */
-class S3RangeSource implements ProvidesCostHints, Source, SupportsSuffixRange
+class S3RangeSource implements ProvidesCostHints, Source, SupportsBoundedStream, SupportsSuffixRange
 {
     private S3Client $s3;
     private string $bucket;
@@ -144,17 +145,27 @@ class S3RangeSource implements ProvidesCostHints, Source, SupportsSuffixRange
         return ['data' => $data, 'size' => $size];
     }
 
-    public function streamFrom(int $offset, ?int $length = null)
+    public function streamFrom(int $offset)
     {
-        $size = $this->size();
+        return $this->rangedStream($offset, $this->size() - 1);
+    }
 
+    public function streamFromRange(int $offset, int $length)
+    {
         // Bounded scans stop at a sync boundary: fetch exactly
         // [offset, offset+length-1] instead of streaming to EOF, so a
         // pruned query over an early block reads only that block's bytes
-        // off the wire. Clamp to the last byte so a length past EOF (or
-        // null) degrades to the historical open-ended range.
-        $end = $length !== null ? min($offset + $length - 1, $size - 1) : $size - 1;
+        // off the wire. Clamp to the last byte in case length runs past EOF.
+        return $this->rangedStream($offset, min($offset + $length - 1, $this->size() - 1));
+    }
 
+    /**
+     * Open a streaming ranged GET for [offset, end] (inclusive).
+     *
+     * @return resource
+     */
+    private function rangedStream(int $offset, int $end)
+    {
         try {
             $r = $this->s3->getObject([
                 'Bucket' => $this->bucket,
