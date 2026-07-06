@@ -250,6 +250,70 @@ class TDigest
         return $prevValue + ($this->max - $prevValue) * ($index - $prevMid) / ($this->count - $prevMid);
     }
 
+    /**
+     * Approximate CDF: fraction of the stream's values <= $x — the inverse
+     * of quantile(). null for an empty digest; 0.0 below min, 1.0 above
+     * max. A single O(centroids) pass through the same piecewise-linear
+     * model quantile() uses, so rank() and quantile() are numerical
+     * inverses within the digest's resolution:
+     *
+     *     rank(quantile(q)) ≈ q    and    quantile(rank(x)) ≈ x
+     *
+     * This is the direct CDF the reader's selectivity estimator needs;
+     * previously it recovered the CDF by bisecting quantile() 40 times
+     * (40 × O(centroids) → one O(centroids) pass here, ~80× fewer calls
+     * into the centroid walk for a 'between' estimate).
+     */
+    public function rank(float $x): ?float
+    {
+        $this->flushBuffer();
+
+        if ($this->count === 0) {
+            return null;
+        }
+        // Boundary conventions mirror quantile()'s early returns: x at/below
+        // min → 0.0 (the rank of the first value), x at/above max → 1.0.
+        if ($x <= $this->min) {
+            return 0.0;
+        }
+        if ($x >= $this->max) {
+            return 1.0;
+        }
+
+        // Walk centroid midpoints exactly as quantile() does, but solve for
+        // the rank whose quantile would land at x. Centroid i sits at the
+        // cumulative-weight midpoint m_i; the value segment between the
+        // previous anchor and mean_i maps linearly onto the rank segment
+        // [prevMid, m_i]. Head anchor (min, 0), tail (max, count).
+        //
+        // Whenever $x < $mean triggers we have prevValue <= x < mean, so
+        // $mean > $prevValue strictly — the interpolation denominator is
+        // always positive (no degenerate-segment guard needed).
+        $cumBefore = 0.0;
+        $prevMid = 0.0;
+        $prevValue = $this->min;
+
+        foreach ($this->means as $i => $mean) {
+            $mid = $cumBefore + $this->weights[$i] / 2;
+            if ($x < $mean) {
+                $index = $prevMid + ($mid - $prevMid) * ($x - $prevValue) / ($mean - $prevValue);
+
+                return $index / $this->count;
+            }
+            $cumBefore += $this->weights[$i];
+            $prevMid = $mid;
+            $prevValue = $mean;
+        }
+
+        // Tail segment [prevValue, max] → rank [prevMid, count]. We reach
+        // here only when x >= every centroid mean; x < max (guarded above),
+        // and max > prevValue (the last centroid does not saturate at max
+        // unless min === max, which the early return handled).
+        $index = $prevMid + ($this->count - $prevMid) * ($x - $prevValue) / ($this->max - $prevValue);
+
+        return $index / $this->count;
+    }
+
     public function count(): int
     {
         return $this->count;

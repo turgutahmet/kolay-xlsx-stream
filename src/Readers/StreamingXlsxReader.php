@@ -1646,33 +1646,24 @@ class StreamingXlsxReader
     }
 
     /**
-     * CDF(x) = fraction of the column's values ≤ x, recovered by inverting
-     * the in-memory t-digest's quantile() with 40 bisection steps (the
-     * digest exposes quantile, not rank). Zero I/O. null when the column
-     * has no digest. Values below min converge to 0, above max to 1.
+     * CDF(x) = fraction of the column's values ≤ x, answered directly by
+     * the t-digest's rank() — a single O(centroids) pass through the same
+     * piecewise-linear model quantile() uses (rank and quantile are
+     * numerical inverses within the digest's resolution). Zero I/O. null
+     * when the column has no digest. Values below min → 0, above max → 1.
+     *
+     * Previously this inverted quantile() by bisecting it 40 times
+     * (40 × O(centroids)); rank() collapses that to one O(centroids) pass,
+     * ~80× fewer centroid walks for a 'between' estimate (two CDF lookups).
      */
     private function estimateCdf(int $column, float $x): ?float
     {
-        if ($this->quantile($column, 0.5) === null) {
-            return null;
+        $chain = $this->chain();
+        if ($chain !== null) {
+            return $this->chainDigest($chain, $column)?->rank($x);
         }
 
-        $lo = 0.0;
-        $hi = 1.0;
-        for ($i = 0; $i < 40; $i++) {
-            $mid = ($lo + $hi) / 2.0;
-            $v = $this->quantile($column, $mid);
-            if ($v === null) {
-                return null;
-            }
-            if ($v < $x) {
-                $lo = $mid;
-            } else {
-                $hi = $mid;
-            }
-        }
-
-        return ($lo + $hi) / 2.0;
+        return $this->loadRandomAccessIndex()?->columnDigest($this->currentEntry, $column)?->rank($x);
     }
 
     /**
