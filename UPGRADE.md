@@ -1,5 +1,62 @@
 # Upgrade Guide
 
+## Upgrading from v3.2.2 to v3.3.0
+
+No breaking API changes — every call site works unchanged, the base
+`Source` contract is unchanged, and classic writer output stays
+byte-identical (the new `compact()` and `syncAtGroupBoundaries()` modes
+are opt-in). There is **one behavioral change** to know about, plus a lot
+of new opt-in capability.
+
+### 1. S3 multipart uploads are now synchronous by default (memory fix)
+
+`S3MultipartSink`'s default `concurrency` changed from **4 to 1**. This
+fixes a real memory leak: the parallel (async) upload path let the AWS
+SDK's promise graph retain every part's body, so S3 write memory grew
+with the file (~130 MB at 3M rows, unbounded beyond) — the advertised
+"stream millions of rows to S3 with bounded memory" was silently
+O(file size). The synchronous default keeps memory flat at ~part size
+regardless of file size.
+
+- **You almost certainly want the new default.** On bandwidth-bound links
+  it is no slower than the old parallel default (both are network-bound)
+  and it is steadier.
+- **To restore parallel uploads** (only worth it on a high-latency link
+  where you have measured a throughput win), opt back in explicitly:
+
+  ```php
+  // Per sink:
+  new S3MultipartSink($s3, $bucket, $key, concurrency: 4);
+  // Or via config/env for forDisk() writers:
+  // XLSX_STREAM_S3_CONCURRENCY=4
+  ```
+
+  The parallel path now runs a per-part `gc_collect_cycles()` to bound its
+  footprint, but it is still a higher, sawtooth memory profile than the
+  synchronous default.
+
+### 2. New opt-in capabilities (nothing to change)
+
+All additive — adopt as you like:
+
+- **Query engine:** `rowsWhereAll()`, `estimatedRows()`/`explain()`,
+  `topRows()`, `sampleRows()`, column addressing by header name
+  (`columnStats('amount')`), `Readers\Bucket::month()` for `groupStats()`.
+- **Integrity:** `$reader->verify()` (block-granularity CRC check);
+  `new S3MultipartSink(..., verifyParts: true)` so S3 rejects a corrupted
+  part.
+- **Writer ergonomics:** `queryable([1,2,3])` (index + zone maps +
+  sketches in one call); `compact()` (r-less cells, ~52–62 % smaller
+  compressed sheets — opt-in while it accrues field mileage);
+  `syncAtGroupBoundaries(col)` (zero-scan `groupStats` on grouped exports).
+- **Observability:** `$reader->onFullScan(fn ($ctx) => …)` to detect when
+  a query isn't using the index.
+
+If you implement your own `Source`, note that bounded ranged reads are a
+new optional capability interface (`SupportsBoundedStream`) — you do NOT
+need to implement it; sources without it simply fetch to EOF and the
+reader caps the read.
+
 ## Upgrading from v3.2.0 / v3.2.1 to v3.2.2
 
 No breaking API changes — every call site works unchanged. One
@@ -38,8 +95,9 @@ carries `'version' => 2`, so existing published copies stay inert and
 nothing changes until you opt in.
 
 **The safe way to opt in** is re-publishing the file, which ships the
-new defaults (they match the code: compression level 5, flush interval
-10,000, part size 8 MB, concurrency 4):
+current defaults (they match the code: compression level 5, flush
+interval 10,000, part size 8 MB, and — as of v3.3 — concurrency 1;
+see the v3.3.0 note above):
 
 ```bash
 php artisan vendor:publish --tag=xlsx-stream-config --force

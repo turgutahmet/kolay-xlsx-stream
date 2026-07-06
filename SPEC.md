@@ -178,6 +178,17 @@ A sync point is a **resume marker inside the sheet's deflate stream**.
   Together these guarantee a reader can seek to `comp_offset`,
   initialize a fresh raw-inflate context with no history and no
   priming, and immediately tokenize whole rows.
+
+  > *Informative.* The window-reset property (2) is the single primitive
+  > several features share: because no compressed byte after a sync point
+  > references data before it, a sync point is simultaneously a **random-
+  > access seek target** (readers), a **block boundary** for per-block
+  > zone maps / running CRCs / group-aligned blocks (`STAT`/`SCRC` and a
+  > writer's group-boundary flushing), and a **crash-resume checkpoint**:
+  > the deflate dictionary is empty there, so a writer that snapshots its
+  > state at a sync point can resume and produce output **byte-identical**
+  > to an uninterrupted run. Anything claiming byte-identical resume MUST
+  > checkpoint only at sync points for this reason.
 - Sync points MUST be **strictly increasing** in `row`, in
   `comp_offset`, and in `uncomp_offset`.
 - `row` MUST NOT exceed `total_rows + 1`. The value `total_rows + 1` is

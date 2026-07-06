@@ -330,6 +330,98 @@ class TDigestTest extends TestCase
     }
 
     // ------------------------------------------------------------------
+    // rank() — the CDF (inverse of quantile)
+    // ------------------------------------------------------------------
+
+    public function test_rank_is_null_for_empty_digest(): void
+    {
+        $this->assertNull((new TDigest())->rank(1.0));
+    }
+
+    public function test_rank_boundary_conventions(): void
+    {
+        $d = new TDigest();
+        foreach (range(1.0, 100.0) as $v) {
+            $d->add($v);
+        }
+
+        $this->assertSame(0.0, $d->rank(1.0));      // at min
+        $this->assertSame(0.0, $d->rank(0.0));      // below min
+        $this->assertSame(1.0, $d->rank(100.0));    // at max
+        $this->assertSame(1.0, $d->rank(1000.0));   // above max
+    }
+
+    /**
+     * rank() and quantile() are numerical inverses within the digest's
+     * resolution: round-tripping through both lands back near the input
+     * rank. The round-trip error is bounded by the digest's own rank
+     * resolution (it cannot be tighter than the clustering allows).
+     */
+    public function test_rank_inverse_of_quantile_on_uniform(): void
+    {
+        mt_srand(42);
+        [$digest] = $this->build(fn () => mt_rand() / mt_getrandmax() * 1000.0);
+
+        // quantile→rank: feeding q's output back through rank recovers q
+        // within ~0.5% (the digest's mid-range resolution at δ=100).
+        foreach ([0.01, 0.1, 0.25, 0.5, 0.75, 0.9, 0.99] as $q) {
+            $v = $digest->quantile($q);
+            $this->assertNotNull($v);
+            $recovered = $digest->rank($v);
+            $this->assertNotNull($recovered);
+            $this->assertLessThanOrEqual(
+                0.005,
+                abs($recovered - $q),
+                "rank(quantile({$q})) = {$recovered}, off by " . abs($recovered - $q)
+            );
+        }
+    }
+
+    /**
+     * rank() estimates the true CDF of the sample within the same rank
+     * error tolerance the quantile tests pin — rank error is symmetric:
+     * |rank(x) - trueCDF(x)| is the same quantity quantile tests measure
+     * as |q - trueRank(quantile(q))|.
+     */
+    public function test_rank_error_against_exact_cdf(): void
+    {
+        mt_srand(1234);
+        [$digest, $sorted] = $this->build(fn () => mt_rand() / mt_getrandmax() * 1000.0);
+        $n = count($sorted);
+
+        // Pick values at known true CDF positions: the k-th smallest has
+        // true CDF ≈ k/n. rank() of that value should be within the
+        // digest's resolution.
+        foreach ([0.01, 0.25, 0.5, 0.75, 0.99] as $qFrac) {
+            $k = (int) round($qFrac * $n);
+            $x = $sorted[$k];
+            $trueCdf = $k / $n;
+            $estimated = $digest->rank($x);
+            $this->assertNotNull($estimated);
+            $err = abs($estimated - $trueCdf);
+            $this->assertLessThanOrEqual(
+                0.005,
+                $err,
+                sprintf('rank() error %.4f%% at trueCDF=%.3f exceeds 0.5%%', $err * 100, $trueCdf)
+            );
+        }
+    }
+
+    public function test_rank_constant_stream(): void
+    {
+        $d = new TDigest();
+        for ($i = 0; $i < 1000; $i++) {
+            $d->add(5.0);
+        }
+
+        // All values equal → min === max; rank of anything below is 0,
+        // at/above is 1. The 5.0 boundary hits the min early-return (0.0).
+        $this->assertSame(0.0, $d->rank(5.0));
+        $this->assertSame(1.0, $d->rank(5.0001));
+        $this->assertSame(0.0, $d->rank(4.9999));
+    }
+
+    // ------------------------------------------------------------------
     // Helpers
     // ------------------------------------------------------------------
 

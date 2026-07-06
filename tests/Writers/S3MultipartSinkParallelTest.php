@@ -191,11 +191,9 @@ class S3MultipartSinkParallelTest extends TestCase
     {
         $s3 = $this->mockS3();
 
-        $s3->shouldReceive('uploadPartAsync')
-            ->once()
-            ->andReturn(new RejectedPromise(new \RuntimeException('boom')));
-
-        // Re-dispatch also fails -> first-error-wins failure.
+        // Synchronous default (concurrency 1): uploadPart is called directly
+        // and its throw is recorded as the failure (the SDK's own retry
+        // middleware already handled transience — no manual re-dispatch here).
         $s3->shouldReceive('uploadPart')
             ->once()
             ->andThrow(new \RuntimeException('still failing'));
@@ -206,11 +204,10 @@ class S3MultipartSinkParallelTest extends TestCase
             ->andReturn([]);
 
         $sink = new S3MultipartSink($s3, 'bucket', 'key.xlsx', self::PART, [], 1);
-        $sink->write(str_repeat('d', self::PART)); // dispatches part 1
+        $sink->write(str_repeat('d', self::PART)); // uploads part 1 -> throws -> failure recorded
 
         try {
-            // Window (size 1) is full: this waits on part 1, discovers the
-            // failure, aborts and throws.
+            // The next write() sees the recorded failure, aborts and throws.
             $sink->write(str_repeat('d', self::PART));
             $this->fail('Expected S3Exception was not thrown');
         } catch (S3Exception $e) {
@@ -300,19 +297,15 @@ class S3MultipartSinkParallelTest extends TestCase
         $s3 = $this->mockS3();
 
         $events = [];
-        $s3->shouldReceive('uploadPartAsync')
+        // concurrency 1 = synchronous uploadPart: each part fully uploads
+        // (call returns) before the next is sent — inherently sequential.
+        $s3->shouldReceive('uploadPart')
             ->times(3)
             ->andReturnUsing(function (array $args) use (&$events) {
                 $n = $args['PartNumber'];
-                $events[] = "dispatch-{$n}";
+                $events[] = "part-{$n}";
 
-                $promise = null;
-                $promise = new Promise(function () use (&$promise, &$events, $n) {
-                    $events[] = "complete-{$n}";
-                    $promise->resolve(['ETag' => 'etag-' . $n]);
-                });
-
-                return $promise;
+                return ['ETag' => 'etag-' . $n];
             });
 
         $s3->shouldReceive('completeMultipartUpload')
@@ -327,15 +320,11 @@ class S3MultipartSinkParallelTest extends TestCase
         $sink->write(str_repeat('g', self::PART * 3));
         $sink->close();
 
-        // Same S3 request sequence as the pre-3.2 blocking implementation:
-        // each part fully completes before the next one is dispatched.
+        // Parts upload in strict order, each finishing before the next.
         $this->assertSame([
-            'dispatch-1',
-            'complete-1',
-            'dispatch-2',
-            'complete-2',
-            'dispatch-3',
-            'complete-3',
+            'part-1',
+            'part-2',
+            'part-3',
             'complete-upload',
         ], $events);
     }

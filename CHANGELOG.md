@@ -5,6 +5,96 @@ All notable changes to `kolay/xlsx-stream` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.3.0] — 2026-07-06
+
+A backward-compatible minor: a real query engine on top of the born-indexed
+sidecar, writer & DX ergonomics, integrity verification, and a critical S3
+write-memory fix. No breaking API changes — the base `Source` contract is
+unchanged and classic writer output stays byte-identical (compact mode and
+group-aligned blocks are opt-in). Full suite 604 tests / 7541 assertions;
+local write/read and the whole query surface measured at parity with 3.2.x
+(no hot-path regression).
+
+### Added — query engine
+
+- **`rowsWhereAll(array $predicates)`** — multi-predicate AND with zone-map
+  INTERSECTION. A row matching every predicate lives in a block surviving
+  every predicate, so querying two differently-clustered columns reads far
+  fewer blocks than either alone. Untracked columns filter per row.
+- **`estimatedRows(col, op, value, value2?)` + `explain(array $predicates)`**
+  — zero-I/O selectivity and query plans from the sidecar alone.
+  `estimatedRows` returns a hard zone-map `upper` bound plus a t-digest/HLL
+  `estimate`; `explain` returns `{strategy, candidateBlocks, runs,
+  estimatedRows, estimatedBytes}` — the byte budget a pruned scan would fetch.
+- **`topRows(col, k, desc)`** — "ORDER BY column [DESC] LIMIT k" from the
+  sidecar. On a sorted column the k extremes are read from one end (one seek,
+  early exit — an indexed top-N); on an unsorted column a single scan holds
+  an O(k) heap.
+- **`sampleRows(k, seed?)`** — a uniform random sample of k rows fetched via
+  the index (≈k block reads, not a full scan). Seeded for reproducibility;
+  unbiasedness proven by a chi-square goodness-of-fit gate.
+- **Column addressing by header name** across the whole query surface —
+  `columnStats('amount')`, `rowsWhere('date', …)`, `groupStats('region',
+  'total')`, etc. Index addressing keeps its exact fast path.
+- **`Readers\Bucket::year()/month()/day()`** — ready-made monotone bucket
+  callables for `groupStats()` over a date column ("GROUP BY month" in one
+  call), so the group-pure block pushdown still applies.
+- **`verify()`** — read-side integrity check against the writer's per-block
+  running-CRC (SCRC) pins and whole-sheet CRC. A single inflate pass at O(1)
+  memory reports which block (if any) went bad — the "verified read" for
+  audit/payroll/HR data. Falls back to the whole-entry ZIP CRC without a
+  sidecar.
+- **`onFullScan(callable)`** — observability hook fired when a query cannot
+  push down and degrades to a full scan (unindexed column, unsorted groupBy),
+  with `{query, column, reason, entry}` context.
+
+### Added — writer & S3
+
+- **`queryable(array $columns, every?, withSketches?)`** — one call that
+  turns on the random-access index + zone maps + sketches for a set of
+  columns; byte-identical to chaining the three explicit calls.
+- **`compact()`** — opt-in r-less cell output (ECMA-376 makes `c/@r` and
+  `row/@r` optional). Compressed sheets shrink ~52–62 %, and both writing and
+  reading get faster (smaller XML to build and tokenize). The compact row
+  builders are the exact r-less projection of the classic ones (byte-oracle
+  test); classic output is byte-identical when off. Opens in Excel/
+  LibreOffice/Numbers; read by PhpSpreadsheet 5.8 & OpenSpout 4.28.
+- **`syncAtGroupBoundaries(column)`** — align index block boundaries to a
+  column's group changes so every block holds one group; `groupStats()` then
+  folds each block straight from the sidecar and reads only the header block.
+  Enables the index if not already on; default off → output byte-identical.
+- **Opt-in per-part integrity: `new S3MultipartSink(..., verifyParts: true)`**
+  — attaches a `Content-MD5` to every part so S3 verifies it and rejects a
+  corrupted part; a bad byte never enters the object ("verified export").
+- **Bounded ranged reads (`Contracts\SupportsBoundedStream`)** — a pruned
+  scan that stops at a sync boundary fetches only that block run's bytes; on
+  S3 an open-ended `[offset, EOF]` GET becomes an exact ranged read. Optional
+  gap-bridging keeps one ranged read alive across a short gap of non-matching
+  blocks when transferring those bytes beats a round-trip (via an optional
+  `Contracts\ProvidesCostHints` on the Source).
+
+### Fixed
+
+- **S3 multipart writes now use O(1) memory (was O(file size)).** The
+  parallel (async) upload path leaked: the AWS SDK's promise/command graph
+  held each dispatched part's body in a reference cycle refcounting cannot
+  free, so write memory climbed with row count (~130 MB at 3M rows, ≈ the
+  whole file — unbounded beyond), silently breaking the streaming-to-S3
+  memory promise. Uploads are now **synchronous by default** and release
+  each part as it lands, keeping memory flat at ~part size regardless of
+  file size (verified ~30 MB peak on a 3M-row write). Local writes were
+  always flat.
+
+### Changed
+
+- **`S3MultipartSink` default `concurrency` is now 1 (was 4).** This is the
+  memory fix above: the default is strictly synchronous uploads (O(1) memory,
+  steady throughput — no faster on bandwidth-bound links, and free of the
+  leak). Parallel part uploads remain available as an opt-in (`concurrency >
+  1` / `XLSX_STREAM_S3_CONCURRENCY`), now with per-part GC to bound their
+  footprint — prefer them only where you have measured a win on a high-latency
+  link. See UPGRADE.md.
+
 ## [3.2.2] — 2026-07-05
 
 Correctness patch. No new public API. Row/cell bytes are unchanged

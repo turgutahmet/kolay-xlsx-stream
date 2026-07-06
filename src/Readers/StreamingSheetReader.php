@@ -3,6 +3,7 @@
 namespace Kolay\XlsxStream\Readers;
 
 use Kolay\XlsxStream\Contracts\Source;
+use Kolay\XlsxStream\Contracts\SupportsBoundedStream;
 use Kolay\XlsxStream\Exceptions\XlsxReadException;
 
 /**
@@ -109,7 +110,7 @@ class StreamingSheetReader
      *
      * @return \Generator<int, array<int, mixed>>
      */
-    public function rowsFromOffset(?int $compOffset, int $startingRowNumber, ?int $fastForwardTo = null): \Generator
+    public function rowsFromOffset(?int $compOffset, int $startingRowNumber, ?int $fastForwardTo = null, ?int $compLength = null): \Generator
     {
         $rowNumber = $startingRowNumber;
         $buffer = '';
@@ -122,7 +123,7 @@ class StreamingSheetReader
         $skipRemaining = $fastForwardTo !== null ? max(0, $fastForwardTo - $startingRowNumber) : 0;
         $carry = '';
 
-        foreach ($this->inflatedChunks($compOffset) as $inflated) {
+        foreach ($this->inflatedChunks($compOffset, $compLength) as $inflated) {
             if ($skipRemaining > 0) {
                 $scan = $carry.$inflated;
                 $found = substr_count($scan, '</row>');
@@ -236,6 +237,65 @@ class StreamingSheetReader
     }
 
     /**
+     * Integrity check: inflate the whole sheet once, running a CRC32 over
+     * the uncompressed bytes, and compare it against the sidecar's
+     * per-sync-point running-CRC pins (SCRC) and the whole-sheet CRC. This
+     * is the read-side counterpart of the CRC the writer pinned at each
+     * ZLIB_FULL_FLUSH boundary, so a corrupt block is localized to the two
+     * sync points that bracket it. O(1) memory (streaming inflate).
+     *
+     * A checkpoint is `[uncompOffset, expectedCrc]` — expectedCrc must equal
+     * the CRC32 of the first uncompOffset uncompressed bytes. $checkpoints
+     * must be ascending by offset. `inflate_ok=false` means the compressed
+     * data itself was too corrupt to inflate (a hard failure, reported not
+     * thrown so callers get a full report).
+     *
+     * @param  list<array{0: int, 1: int}>  $checkpoints
+     * @return array{sheet_crc_ok: bool, corrupt_blocks: list<int>, inflate_ok: bool}
+     */
+    public function verifyCrc(array $checkpoints, int $sheetCrc): array
+    {
+        $ctx = hash_init('crc32b');
+        $consumed = 0;
+        $ci = 0;
+        $n = count($checkpoints);
+        $corrupt = [];
+
+        try {
+            foreach ($this->inflatedChunks(null) as $chunk) {
+                $len = strlen($chunk);
+                $pos = 0;
+
+                // Close out every checkpoint whose boundary falls in this chunk.
+                while ($ci < $n && $checkpoints[$ci][0] <= $consumed + $len) {
+                    $upto = $checkpoints[$ci][0] - $consumed;
+                    if ($upto > $pos) {
+                        hash_update($ctx, substr($chunk, $pos, $upto - $pos));
+                        $pos = $upto;
+                    }
+                    if (hexdec(hash_final(hash_copy($ctx))) !== $checkpoints[$ci][1]) {
+                        $corrupt[] = $ci;
+                    }
+                    $ci++;
+                }
+
+                if ($pos < $len) {
+                    hash_update($ctx, substr($chunk, $pos));
+                }
+                $consumed += $len;
+            }
+        } catch (\Throwable) {
+            return ['sheet_crc_ok' => false, 'corrupt_blocks' => $corrupt, 'inflate_ok' => false];
+        }
+
+        return [
+            'sheet_crc_ok' => hexdec(hash_final($ctx)) === $sheetCrc,
+            'corrupt_blocks' => $corrupt,
+            'inflate_ok' => true,
+        ];
+    }
+
+    /**
      * Stream the sheet entry's inflated bytes as string chunks. Shared
      * engine behind rowsFromOffset() (row assembly) and countRows()
      * (boundary counting): entry validation, the ranged read loop, the
@@ -244,7 +304,7 @@ class StreamingSheetReader
      *
      * @return \Generator<int, string>
      */
-    private function inflatedChunks(?int $compOffset): \Generator
+    private function inflatedChunks(?int $compOffset, ?int $compLength = null): \Generator
     {
         $entry = $this->cd->entry($this->sheetEntry);
         if ($entry === null) {
@@ -261,9 +321,26 @@ class StreamingSheetReader
 
         $dataOffset = $this->cd->dataOffset($this->source, $this->sheetEntry);
         $startOffset = $dataOffset + ($compOffset ?? 0);
-        $compRemaining = $entry['compressed_size'] - ($compOffset ?? 0);
+        $entryRemaining = $entry['compressed_size'] - ($compOffset ?? 0);
 
-        $stream = $this->source->streamFrom($startOffset);
+        // A caller-supplied $compLength stops the read at a ZLIB_FULL_FLUSH
+        // sync boundary (the run's trailing block). Because a full flush
+        // already emits every byte before it, the bounded bytes are fed to
+        // inflate with NO_FLUSH and the loop stops WITHOUT a ZLIB_FINISH
+        // step — the exact inverse of seeking INTO a sync point, which the
+        // random-access index already does. $bounded === false is the
+        // historical path (read to entry end, then FINISH), preserved
+        // byte-for-byte when $compLength is null or reaches the entry end.
+        $compRemaining = $compLength !== null ? min($compLength, $entryRemaining) : $entryRemaining;
+        $bounded = $compRemaining < $entryRemaining;
+
+        // A source that can serve a bounded range (S3 range GET) fetches
+        // only the run's bytes off the wire; others fall back to a plain
+        // stream-to-EOF and the loop caps the read via $compRemaining. The
+        // NO_FLUSH / skip-FINISH handling below is identical either way.
+        $stream = ($bounded && $this->source instanceof SupportsBoundedStream)
+            ? $this->source->streamFromRange($startOffset, $compRemaining)
+            : $this->source->streamFrom($startOffset);
 
         $inflate = null;
         if ($method === self::METHOD_DEFLATE) {
@@ -305,7 +382,12 @@ class StreamingSheetReader
                         $compRemaining -= $n;
 
                         if ($method === self::METHOD_DEFLATE) {
-                            $flag = $compRemaining === 0 ? ZLIB_FINISH : ZLIB_NO_FLUSH;
+                            // Bounded reads end at a full-flush boundary, so
+                            // the last chunk is still NO_FLUSH — never FINISH
+                            // (the flush already emitted its output; a FINISH
+                            // on a stream truncated before its BFINAL block
+                            // would error).
+                            $flag = ($compRemaining === 0 && ! $bounded) ? ZLIB_FINISH : ZLIB_NO_FLUSH;
                             if ($flag === ZLIB_FINISH) {
                                 $finishedFlush = true;
                             }
@@ -318,7 +400,7 @@ class StreamingSheetReader
                             $inflated = $compressed;
                         }
                     }
-                } elseif (! $finishedFlush) {
+                } elseif (! $finishedFlush && ! $bounded) {
                     $inflated = inflate_add($inflate, '', ZLIB_FINISH);
                     if ($inflated === false) {
                         throw XlsxReadException::inflateFailed('final inflate_add returned false');
@@ -330,7 +412,9 @@ class StreamingSheetReader
                     yield $inflated;
                 }
 
-                if ($compRemaining === 0 && $finishedFlush) {
+                // Bounded runs stop as soon as their bytes are consumed
+                // (no FINISH to wait for); unbounded runs wait for FINISH.
+                if ($compRemaining === 0 && ($finishedFlush || $bounded)) {
                     break;
                 }
             }

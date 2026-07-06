@@ -3,6 +3,7 @@
 namespace Kolay\XlsxStream\Sources;
 
 use Kolay\XlsxStream\Contracts\Source;
+use Kolay\XlsxStream\Contracts\SupportsBoundedStream;
 use Kolay\XlsxStream\Contracts\SupportsSuffixRange;
 use Kolay\XlsxStream\Exceptions\XlsxReadException;
 
@@ -13,7 +14,7 @@ use Kolay\XlsxStream\Exceptions\XlsxReadException;
  * a fresh handle per streamFrom() call so the parser's long-running
  * sequential read does not interfere with central-directory lookups.
  */
-class LocalFileSource implements Source, SupportsSuffixRange
+class LocalFileSource implements Source, SupportsBoundedStream, SupportsSuffixRange
 {
     /** @var resource */
     private $handle;
@@ -95,6 +96,16 @@ class LocalFileSource implements Source, SupportsSuffixRange
         }
 
         return $h;
+    }
+
+    public function streamFromRange(int $offset, int $length)
+    {
+        // Local reads are lazy and the sheet reader already caps how many
+        // compressed bytes it pulls (a bounded scan stops at a sync
+        // boundary), so a plain seeked handle over-reads nothing on disk —
+        // $length needs no special handling here. Bounding only pays on
+        // remote sources where the range is an actual HTTP fetch size.
+        return $this->streamFrom($offset);
     }
 
     public function close(): void

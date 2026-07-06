@@ -14,7 +14,9 @@ median, p99 or distinct count **without reading a single row** — over
 HTTP range requests, from a file Excel opens like any other.
 
 - **Write**: ~289K rows/s locally at 6 MB peak RAM; direct S3 multipart
-  (parallel upload window, no temp files)
+  streaming at bounded memory — synchronous by default (flat ~part-size
+  working set, true O(1) regardless of file size), optional parallel
+  upload window, no temp files
 - **Read**: ~127K rows/s full scans with bounded memory, any file size
 - **Seek**: `rowAt(1_000_000)` in milliseconds via the born-indexed sidecar
 - **Query**: `columnStats` / `rowsWhere` / `findRow` / `groupStats` with
@@ -39,20 +41,26 @@ Numbers, PhpSpreadsheet and OpenSpout all open the files normally.
 
 ### The trajectory — same canonical workloads, every release
 
-| | v1.x (Sep 2025) | v2.2 (May 2026) | v3.0 (May 2026) | v3.1 (Jul 2026) | v3.2 (Jul 2026) |
-|---|---|---|---|---|---|
-| Write, local | ~182K rows/s | ~210K | ~215K | **~289K** | ~289K |
-| Write, S3 (1M rows) | ~9K rows/s | ~107K | ~107K | +36% same-link A/B | + parallel window |
-| Read, local | — | — | ~70K rows/s | ~106K | **~127K** |
-| Random access | — | — | O(1) `rowAt` | + block-pruned queries | + within-block skip (~19×) |
-| Analytics | — | — | — | `columnStats` 0-request | **median/p99/distinct 0-request** |
-| Peak RAM (write/read) | 0-2 MB / — | ~6 MB / — | 6 / 24 MB | 6 / 24 MB | 6 / **6 MB** |
+| | v1.x (Sep 2025) | v2.2 (May 2026) | v3.0 (May 2026) | v3.1 (Jul 2026) | v3.2 (Jul 2026) | v3.3 (Jul 2026) |
+|---|---|---|---|---|---|---|
+| Write, local | ~182K rows/s | ~210K | ~215K | **~289K** | ~289K | ~289K |
+| Write, S3 | ~9K rows/s | ~107K | ~107K | +36% same-link A/B | + parallel window | **O(1) memory (was O(file))** |
+| Read, local | — | — | ~70K rows/s | ~106K | **~127K** | ~127K |
+| Random access | — | — | O(1) `rowAt` | + block-pruned queries | + within-block skip (~19×) | + bounded ranged fetch |
+| Query engine | — | — | — | `columnStats`/`rowsWhere` | + `groupStats` | **AND / `topRows` / `explain` / by-name** |
+| Analytics | — | — | — | 0-request sums | median/p99/distinct 0-request | + `Bucket::month` GROUP BY |
+| Integrity | — | — | — | — | — | **`verify()` + S3 per-part checks** |
+| Peak RAM (write/read) | 0-2 MB / — | ~6 MB / — | 6 / 24 MB | 6 / 24 MB | 6 / **6 MB** | 6 / 6 MB |
 
 Absolute S3 throughput tracks the network path far more than the
 library (the same 1M-row export measured 59K–153K rows/s across
 sessions) — the honest S3 claim is the same-day A/B: **v3.2's writer is
-+36% over v3.0.2 on an identical link**, and the parallel upload window
-turns 3× wall-time swings into steady runs. Benchmark on your own link.
++36% over v3.0.2 on an identical link**. Uploads are **synchronous by
+default** — part memory stays flat at ~part-size no matter how large the
+file, and throughput is steady; a **parallel upload window is opt-in**
+(`concurrency`) for high-latency links where hiding per-request
+round-trips outweighs its higher (sawtooth) memory. Benchmark on your
+own link.
 
 ### Cross-package, 100K rows (May 2026, latest stables)
 
@@ -276,13 +284,19 @@ $s3Client = new S3Client([
     ],
 ]);
 
-// Create S3 sink with 32MB parts
+// Create S3 sink (default 8 MB parts, synchronous uploads = O(1) memory)
 $sink = new S3MultipartSink(
     $s3Client,
     'my-bucket',
-    'exports/report.xlsx',
-    32 * 1024 * 1024 // 32MB parts for optimal performance
+    'exports/report.xlsx'
 );
+
+// On a HIGH-LATENCY link (cross-region, slow uplink) you can opt into a
+// parallel upload window — it overlaps per-part round-trips at the cost of
+// a higher (sawtooth) memory profile. On bandwidth-bound links it's no
+// faster, so measure before flipping it on:
+//   new S3MultipartSink($s3Client, 'my-bucket', 'key.xlsx', concurrency: 4);
+// (or set XLSX_STREAM_S3_CONCURRENCY=4 for forDisk() writers.)
 
 $writer = new SinkableXlsxWriter($sink);
 
@@ -292,7 +306,7 @@ $writer->setCompressionLevel(1)      // Fastest compression
 
 $writer->startFile(['ID', 'Name', 'Email', 'Status']);
 
-// Stream millions of rows with constant 32MB memory
+// Stream millions of rows with flat ~part-size memory (default ~8 MB)
 User::query()
     ->select(['id', 'name', 'email', 'status'])
     ->chunkById(1000, function ($users) use ($writer) {
@@ -532,6 +546,77 @@ merge associatively, which is what future segment/partition stitching
 builds on. The full binary layout is public: **KXSI is an open spec**
 (see [SPEC.md](SPEC.md)) with committed conformance vectors under
 `tests/SpecVectors/`, so other implementations can verify byte-for-byte.
+
+### The query engine grows up *(v3.3+)*
+
+The sidecar turns into a small SQL-shaped engine — all answered by
+reading only the blocks that can match, and all addressable by header
+name (not just 1-based index):
+
+```php
+// One call makes an export fully queryable (index + zone maps + sketches):
+$writer->queryable([1, 3, 4]);                 // writer side, before startFile()
+
+// Multi-predicate AND — intersects each predicate's surviving blocks, so
+// two differently-clustered columns read far fewer blocks than either alone:
+$reader->rowsWhereAll([
+    ['region', '=', 3],
+    ['amount', 'between', 500, 5000],
+]);
+
+// ORDER BY amount DESC LIMIT 10 — on a sorted column, one seek + early exit:
+$reader->topRows('amount', 10, desc: true);
+
+// Plan a query WITHOUT running it — zero I/O, straight from the sidecar:
+$reader->estimatedRows('amount', '>=', 1000);  // ['upper' => .., 'estimate' => ..]
+$reader->explain([['region', '=', 3], ['amount', '>=', 500]]);
+//   ['strategy' => 'zone-map-prune', 'candidateBlocks' => .., 'runs' => ..,
+//    'estimatedRows' => [...], 'estimatedBytes' => ..]   // the S3 range budget
+
+// GROUP BY month over a date column — Bucket:: helpers keep the pushdown:
+use Kolay\XlsxStream\Readers\Bucket;
+$reader->groupStats('order_date', 'total', Bucket::month());   // one row per YYYYMM
+
+// A uniform, reproducible random sample without a full scan (≈k block reads):
+$reader->sampleRows(1000, seed: 42);
+
+// Know when a query silently falls back to a full scan (no index for it):
+$reader->onFullScan(fn (array $ctx) => logger()->warning('full scan', $ctx));
+```
+
+### Integrity — verified reads & writes *(v3.3+)*
+
+For data that matters (payroll, HR, audit exports):
+
+```php
+// Read side: check every block against the CRC the writer pinned at each
+// sync point. One inflate pass, O(1) memory; names the block that went bad.
+$report = $reader->verify();
+// ['ok' => true, 'sheets' => [['ok' => true, 'corrupt_blocks' => [], ...]]]
+
+// Write side: S3 verifies each part's Content-MD5 and rejects a corrupted
+// one — a bad byte never enters the object.
+$sink = new S3MultipartSink($s3, $bucket, $key, verifyParts: true);
+```
+
+### Bigger, cheaper writes *(v3.3+)*
+
+```php
+// Compact output: drop the optional r attributes on cells/rows (ECMA-376
+// allows it). ~52–62% smaller compressed sheets; opens in Excel/LibreOffice/
+// Numbers. Classic output is byte-identical when off.
+$writer->compact();
+
+// Group-aligned blocks: align index blocks to a sorted group column so
+// groupStats() folds each block from the sidecar — zero row reads.
+$writer->syncAtGroupBoundaries(2);
+```
+
+> **S3 writes are now O(1) memory.** Multipart uploads default to
+> synchronous (`concurrency: 1`): part memory stays flat at ~part-size no
+> matter the file size. (Earlier versions defaulted to a parallel window
+> that could grow memory toward the whole file.) Parallel is still an opt-in
+> for high-latency links — see [UPGRADE.md](UPGRADE.md).
 
 ### Parallel reads — shard a sheet across queue workers *(v3.1+)*
 
@@ -952,7 +1037,9 @@ return [
     ],
     's3' => [
         'part_size' => env('XLSX_STREAM_S3_PART_SIZE', 8 * 1024 * 1024),
-        'concurrency' => env('XLSX_STREAM_S3_CONCURRENCY', 4),
+        // 1 = synchronous uploads, O(1) memory (default). Raise to opt into
+        // parallel part uploads (higher, sawtooth memory) — see UPGRADE.md.
+        'concurrency' => env('XLSX_STREAM_S3_CONCURRENCY', 1),
     ],
 ];
 ```
@@ -966,8 +1053,10 @@ $writer->withRandomAccessIndex(every: 10000)
        ->withColumnSketches([1, 4]);
 $writer->onProgress(fn ($rows, $bytes) => ...)->setProgressInterval(10000);
 
-// Full control: construct the sink directly.
-new S3MultipartSink($s3, $bucket, $key, partSize: 8 * 1024 * 1024, concurrency: 8);
+// Full control: construct the sink directly. concurrency defaults to 1
+// (synchronous, O(1) memory); raise it only for high-latency links where
+// you've measured a win — parallel uploads hold more (sawtooth) memory.
+new S3MultipartSink($s3, $bucket, $key, partSize: 8 * 1024 * 1024, concurrency: 4);
 ```
 
 Transient S3 retries belong to the AWS SDK — configure them on your
@@ -1010,7 +1099,8 @@ callback: wire it to your logger of choice.
 
 4. **S3 Multipart Upload**
    - Direct streaming to S3 using multipart upload
-   - 32MB parts uploaded as they're ready
+   - Default 8 MB parts, uploaded synchronously and released as they land
+     (O(1) memory); parallel uploads are opt-in
    - No local file required at any point
 
 
@@ -1018,12 +1108,15 @@ callback: wire it to your logger of choice.
 
 - **Local writes are O(1)**: a row buffer (default 10K rows) plus the
   deflate context — ~6 MB peak regardless of row count.
-- **S3 writes are bounded by the upload window** *(v3.2)*: peak ≈
-  `part_size × (concurrency + 2)` — ~46 MB flat at the defaults, at 1M
-  rows and at 10M rows alike. (Before v3.2 the sink's buffer copies
-  ratcheted ~40 MB per million rows; the parallel window rework removed
-  that.) Memory saw-tooths as parts fill and upload — that's the buffer
-  cycle, not a leak.
+- **S3 writes are O(1)** *(v3.3)*: the default synchronous sink
+  (`concurrency: 1`) holds ~`part_size` (one part buffer + the part being
+  uploaded), flat at 1M rows and at 10M rows alike — measured ~30 MB peak
+  on a 3M-row write. The optional parallel upload window (`concurrency >
+  1`) trades that for latency-hiding on high-RTT links; it holds more
+  (a higher sawtooth) and runs a per-part GC to bound it. (Through v3.2
+  the parallel window was the default and its memory grew with the file —
+  the AWS SDK's async promise graph retained each part's body; v3.3's
+  synchronous default fixes that.)
 - **Reads are bounded by construction**: inflate chunks + one row in
   flight — ~6 MB for files this package wrote (24 MB ceiling with large
   external shared-strings tables, which now parse streaming — the full
@@ -1045,16 +1138,17 @@ File Size: 178 MB compressed XLSX
 Sheets: 5 (automatic splitting at Excel limit)
 Total Time: 96.85 seconds
 Average Speed: 46,462 rows/second
-Memory Usage: 178 MB average with ±178 MB fluctuation
-Peak Memory: 356 MB (during S3 part upload)
+Peak Memory: ~30 MB, flat (v3.3 synchronous S3 writes — O(1) regardless
+             of row count; the pre-v3.3 parallel-window default peaked at
+             ~356 MB here as the SDK retained each part's body)
 ```
 
 
-### Key Performance Metrics *(v3.2)*
+### Key Performance Metrics *(v3.3)*
 
 - **Write — Local**: ~289K rows/s sustained, 6 MB peak
-- **Write — S3**: network-bound; +36% over v3.0.2 same-link, steady
-  wall times under the parallel window, ~46 MB flat peak
+- **Write — S3**: network-bound; +36% over v3.0.2 same-link; O(1) memory
+  (synchronous default, ~30 MB flat peak regardless of file size)
 - **Read — Local**: ~127K rows/s full scan, bounded memory at any size
 - **Point reads**: `rowAt` ~1.1 ms within a block; `rows(skip: 1M)` 2.5 ms
 - **Analytics**: `median`/`quantile`/`countDistinct` answer with zero

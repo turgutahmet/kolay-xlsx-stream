@@ -28,9 +28,16 @@ interface Source
     public function range(int $offset, int $length): string;
 
     /**
-     * Open a forward-only stream resource starting at the given offset.
-     * Caller is responsible for fclose(). The stream MUST support fread()
-     * and feof(); seeking is not required.
+     * Open a forward-only stream resource starting at the given offset,
+     * reading to the end of the object. Caller is responsible for
+     * fclose(). The stream MUST support fread() and feof(); seeking is not
+     * required.
+     *
+     * A source that can serve a BOUNDED range cheaply (stopping after a
+     * given byte length, e.g. an HTTP Range GET) additionally implements
+     * SupportsBoundedStream — the reader uses that for pruned scans that
+     * end at a sync boundary. Sources that only implement this method keep
+     * working; they just fetch to EOF and let the reader cap the read.
      *
      * @return resource
      */

@@ -53,6 +53,9 @@ class S3MultipartSink implements Sink
 
     private int $concurrency;
 
+    /** When true, each part carries a Content-MD5 so S3 rejects a corrupted part. */
+    private bool $verifyParts = false;
+
     private int $partNumber = 1;
 
     private int $bytesWritten = 0;
@@ -66,7 +69,7 @@ class S3MultipartSink implements Sink
 
     public const DEFAULT_PART_SIZE = 8388608; // 8MB
 
-    public const DEFAULT_CONCURRENCY = 4;
+    public const DEFAULT_CONCURRENCY = 1;
 
     /**
      * @param S3Client $s3
@@ -74,13 +77,26 @@ class S3MultipartSink implements Sink
      * @param string $key S3 object key (path)
      * @param int $partSize Size of each part (min 5MB)
      * @param array $putObjectParams Additional S3 parameters (ContentType, ACL, etc)
-     * @param int|null $concurrency Max part uploads in flight at once (default 4).
-     *        Parts are dispatched asynchronously; when the window is full the
-     *        writer waits for the oldest part before dispatching the next one.
-     *        Memory ceiling is roughly partSize x (concurrency + 1): up to
-     *        `concurrency` part bodies held by in-flight requests plus the
-     *        accumulating buffer. Use 1 for strictly sequential uploads
-     *        (same S3 request sequence as pre-3.2 versions).
+     * @param int|null $concurrency Max part uploads in flight at once.
+     *        DEFAULT 1 = strictly synchronous uploads: each part is sent and
+     *        released before the next is buffered, so memory stays flat at
+     *        ~partSize regardless of file size (true O(1), the streaming-to-S3
+     *        promise). This is the safe default.
+     *
+     *        concurrency > 1 opts into PARALLEL part uploads (async window):
+     *        it hides per-request latency on high-RTT links, but the AWS SDK's
+     *        async promise/command graph holds each in-flight part's body in a
+     *        reference cycle that plain refcounting can't free, so the working
+     *        set grows with the number of dispatched parts until a periodic
+     *        gc_collect_cycles() (issued at each part boundary) reclaims it —
+     *        a higher, sawtooth memory profile than the synchronous default.
+     *        Prefer it only when you have measured a throughput win on your
+     *        link; on bandwidth-bound links it is no faster than the default.
+     * @param bool $verifyParts When true, every part carries a Content-MD5 so
+     *        S3 verifies each part's bytes and rejects a corrupted one — a
+     *        corrupt part never enters the object ("verified export", for
+     *        audit/payroll/HR data). Costs one MD5 per part (per ~part_size,
+     *        not per row). Default off.
      */
     public function __construct(
         S3Client $s3,
@@ -88,7 +104,8 @@ class S3MultipartSink implements Sink
         string $key,
         int $partSize = self::DEFAULT_PART_SIZE,
         array $putObjectParams = [],
-        ?int $concurrency = self::DEFAULT_CONCURRENCY
+        ?int $concurrency = self::DEFAULT_CONCURRENCY,
+        bool $verifyParts = false
     ) {
         $this->s3 = $s3;
         $this->bucket = $bucket;
@@ -97,6 +114,7 @@ class S3MultipartSink implements Sink
         // Silently adjust part size if too small
         $this->partSize = max(self::MIN_PART_SIZE, $partSize);
         $this->concurrency = max(1, $concurrency ?? self::DEFAULT_CONCURRENCY);
+        $this->verifyParts = $verifyParts;
 
         // Default parameters
         $this->putObjectParams = array_merge([
@@ -163,6 +181,16 @@ class S3MultipartSink implements Sink
      */
     private function dispatchPart(string $chunk): void
     {
+        // Synchronous default: send the part and let its body be released
+        // immediately (no async promise graph to leak). Flat ~partSize memory.
+        if ($this->concurrency === 1) {
+            $this->uploadPartSync($this->partNumber, $chunk);
+            $this->partNumber++;
+
+            return;
+        }
+
+        // Parallel window (opt-in): bounded to `concurrency` in-flight parts.
         while (count($this->inFlight) >= $this->concurrency) {
             $this->awaitOldest();
             $this->throwIfFailed();
@@ -172,6 +200,65 @@ class S3MultipartSink implements Sink
         $this->partNumber++;
 
         $this->inFlight[$partNumber] = $this->sendPartAsync($partNumber, $chunk);
+    }
+
+    /**
+     * Upload one part synchronously — no async promise, so nothing lingers
+     * to leak. The SDK's own retry middleware handles transient errors;
+     * a hard failure is recorded like the async path's.
+     */
+    /**
+     * Build uploadPart params, attaching a Content-MD5 when verifyParts is
+     * on so S3 recomputes the digest of the bytes it received and REJECTS
+     * the part on any mismatch — corrupt bytes never enter the object.
+     * (Content-MD5 is the header S3 has always enforced; the newer
+     * x-amz-checksum-* flexible checksums are not reliably verified by
+     * older SDKs, so MD5 is the portable per-part integrity guarantee.)
+     *
+     * @return array<string, mixed>
+     */
+    private function partParams(int $partNumber, string $chunk): array
+    {
+        $params = [
+            'Bucket' => $this->bucket,
+            'Key' => $this->key,
+            'UploadId' => $this->uploadId,
+            'PartNumber' => $partNumber,
+            'Body' => $chunk,
+        ];
+
+        if ($this->verifyParts) {
+            $params['ContentMD5'] = base64_encode(md5($chunk, true));
+        }
+
+        return $params;
+    }
+
+    private function uploadPartSync(int $partNumber, string $chunk): void
+    {
+        try {
+            $result = $this->s3->uploadPart($this->partParams($partNumber, $chunk));
+            $this->recordPart($partNumber, (string) $result['ETag']);
+        } catch (\Throwable $e) {
+            if ($this->failed === null) {
+                $this->failed = S3Exception::partUploadFailed($partNumber, $e->getMessage());
+            }
+        }
+
+        // The SDK's uploadPart is uploadPartAsync()->wait() under the hood, so
+        // even this synchronous call leaves the part's ~partSize body in a
+        // settled-promise reference cycle. Refcounting can't reclaim a cycle
+        // and PHP's automatic collector won't fire until ~10k roots accrue —
+        // thousands of parts later — so without this the bodies pile up and
+        // memory climbs toward the whole file (a 128 MB process OOMs at ~16
+        // parts). One collection per part keeps it flat at ~partSize (true
+        // O(1)). It is cheap: the collector scans only the root buffer (the
+        // handful of cycle objects a settled part leaves, not the live heap),
+        // measured a few ms of GC work across a multi-GB upload; the ~partSize
+        // free it triggers is work owed regardless. Once per 8 MB PUT, never
+        // on a hot inner loop.
+        unset($result);
+        gc_collect_cycles();
     }
 
     /**
@@ -185,13 +272,7 @@ class S3MultipartSink implements Sink
      */
     private function sendPartAsync(int $partNumber, string $chunk): PromiseInterface
     {
-        $params = [
-            'Bucket' => $this->bucket,
-            'Key' => $this->key,
-            'UploadId' => $this->uploadId,
-            'PartNumber' => $partNumber,
-            'Body' => $chunk,
-        ];
+        $params = $this->partParams($partNumber, $chunk);
 
         return $this->s3->uploadPartAsync($params)->then(
             function ($result) use ($partNumber) {
@@ -262,6 +343,15 @@ class S3MultipartSink implements Sink
         // The fulfillment handler normally removes the entry; make sure a
         // settled promise never lingers in the window.
         unset($this->inFlight[$oldest]);
+        unset($promise);
+
+        // Parallel path only. The AWS SDK's async promise/command graph links
+        // each settled request into a reference cycle that holds the part's
+        // body; refcounting can't free it, so without this the working set
+        // climbs toward the whole file. Collecting at each part boundary (a
+        // handful of times per GB) caps it. The synchronous default never
+        // reaches here and needs no GC.
+        gc_collect_cycles();
     }
 
     /**

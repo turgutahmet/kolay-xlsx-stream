@@ -6,13 +6,15 @@ The following versions of `kolay/xlsx-stream` receive security updates:
 
 | Version | Supported          |
 |---------|--------------------|
-| 2.2.x   | :white_check_mark: |
-| 2.1.x   | :white_check_mark: |
-| 2.0.x   | :white_check_mark: |
+| 3.3.x   | :white_check_mark: |
+| 3.2.x   | :white_check_mark: |
+| < 3.2   | :x:                |
+| 2.x     | :x:                |
 | 1.x     | :x:                |
 
-Users on v1.x are encouraged to upgrade to v2.x. See [UPGRADE.md](UPGRADE.md)
-for migration steps.
+Users on older releases are encouraged to upgrade to the latest 3.x.
+See [UPGRADE.md](UPGRADE.md) for migration steps (all 3.x upgrades are
+backward-compatible).
 
 ## Reporting a Vulnerability
 

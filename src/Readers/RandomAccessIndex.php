@@ -698,22 +698,34 @@ class RandomAccessIndex
      * the target precedes every recorded sync point (caller should
      * stream from the start of the sheet) or when no points exist.
      *
-     * Sync points are stored in row order by the writer, so a forward
-     * linear walk suffices — for typical sheets there are at most a
-     * few hundred points which is well under any benchmark threshold.
+     * Sync points are stored in strictly increasing row order (the writer
+     * appends them per flush; the decoder validates monotonicity), so a
+     * binary search finds the last point at or before $targetRow in
+     * O(log N). This matters when there are many points — e.g.
+     * syncAtGroupBoundaries() on a high-cardinality group column emits one
+     * per group, so a naive per-call linear walk would be O(groups).
      *
      * @return array{row: int, comp_offset: int, uncomp_offset: int}|null
      */
     public function findSyncPoint(string $sheetEntry, int $targetRow): ?array
     {
         $points = $this->syncPointsByEntry[$sheetEntry] ?? [];
-        $best = null;
+        $n = count($points);
+        if ($n === 0 || $points[0]['row'] > $targetRow) {
+            return null;
+        }
 
-        foreach ($points as $sp) {
-            if ($sp['row'] <= $targetRow) {
-                $best = $sp;
+        // Last index whose row <= $targetRow.
+        $lo = 0;
+        $hi = $n - 1;
+        $best = null;
+        while ($lo <= $hi) {
+            $mid = intdiv($lo + $hi, 2);
+            if ($points[$mid]['row'] <= $targetRow) {
+                $best = $points[$mid];
+                $lo = $mid + 1;
             } else {
-                break;
+                $hi = $mid - 1;
             }
         }
 

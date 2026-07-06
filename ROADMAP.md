@@ -8,6 +8,7 @@ listed below `Backlog` is "considered, not committed".
 
 | Version | Date | Highlights |
 |---|---|---|
+| [3.3.0](CHANGELOG.md#330--2026-07-06) | 2026-07-06 | The query engine grows up + integrity + O(1) S3 writes. **Query:** `rowsWhereAll()` (multi-predicate AND via zone-map intersection), `estimatedRows()`/`explain()` (zero-I/O plans), `topRows()` (indexed ORDER BY … LIMIT), `sampleRows()` (seeded uniform sample), column addressing by header name, `Bucket::month/day/year` for `groupStats`, bounded ranged reads + gap-bridging. **Writer/DX:** `queryable()` one-call preset, opt-in `compact()` (r-less cells, ~52–62% smaller sheets), `syncAtGroupBoundaries()` (zero-scan `groupStats`), `onFullScan()` hook. **Integrity:** `verify()` (block-granularity CRC report), opt-in per-part `Content-MD5` so S3 rejects a corrupted part. **Fixed:** S3 multipart writes are now O(1) memory (was O(file size)) — default `concurrency` 1, parallel opt-in. No breaking changes (base `Source` contract stable; classic output byte-identical) |
 | [3.2.2](CHANGELOG.md#322--2026-07-05) | 2026-07-05 | Correctness patch: on auto-split workbooks (>1,048,575 rows) the entire query surface — `rowCount`/`rows`/`rowAt`/`rowRange`/`rowsWhere`/`findRow`/`columnStats`/`groupStats`/`quantile`/`countDistinct`/`shards` — now spans the continuation chain as one logical table instead of silently answering from the active sheet alone; misleading never-read config keys removed |
 | [3.2.0](CHANGELOG.md#320--2026-07-04) | 2026-07-04 | KXSI becomes an **open specification** ([SPEC.md](SPEC.md)) with a byte-pinned conformance suite; `SCRC` per-sync-point integrity CRCs; approximate analytics — `withColumnSketches()` embeds t-digest + HyperLogLog, `quantile()`/`median()`/`countDistinct()` answer with zero row reads; `groupStats()` sorted-group pushdown; +30 % read throughput (tokenizer micro-pass); `rows(skip)` fast path (~1,580× indexed) + within-block fast-forward (~19×); parallel S3 multipart upload (flat memory, steady wall times); packed shared strings (ceiling 20 → 64 MB compressed at 3.5× less peak); `autoDetectDates()` for external files |
 | [3.1.0](CHANGELOG.md#310--2026-07-04) | 2026-07-04 | Queryable XLSX: KXSI TLV sidecar extension with per-block column stats (zone maps) — `withColumnStats()` on the writer; `columnStats()`/`rowsWhere()`/`findRow()` on the reader (Parquet-style block pruning, sidecar-only aggregates, single-block point lookups); `shards()`/`rowsForShard()` for zero-coordination queue fan-out; writer +55 % throughput (PCRE-JIT escape gate, flattened row builder, level-5 default); S3 reader open 7 → 3 round trips; `rowCount()` boundary-count fast path |
@@ -19,10 +20,14 @@ listed below `Backlog` is "considered, not committed".
 | [2.0.1](CHANGELOG.md#201--2026-05-03) | 2026-05-03 | CI / lint cleanup |
 | [2.0.0](CHANGELOG.md#200--2026-05-03) | 2026-05-03 | DateTime support, native boolean cells, big-int preservation, state machine guards, modernized dependency matrix |
 
-## Next: v3.3 — Durable exports & smarter S3 reads
+## Next: v3.4 — Resumable exports & tail-latency I/O
 
-Additive, no breaking changes planned. The through-line: exports that
-survive crashes, and reads that plan their own I/O.
+Additive, no breaking changes planned. v3.3 shipped the smarter-reads
+half of the original "durable + smart S3" theme (the query engine,
+`explain()`/`estimatedRows()`, `rowsWhereAll()`, range-coalescing via
+gap-bridging, and integrity `verify()`). v3.4 is the **durable** half:
+exports that survive a crash, plus the tail-latency I/O work deferred
+from v3.3.
 
 ### Resumable S3 exports (the headline)
 
@@ -34,26 +39,20 @@ concatenation) are already PoC-proven.
 
 ### Reader I/O planning
 
-- **Range coalescing with a cost model** — when a pruned query wants
-  blocks {17, 19, 20}, decide between three requests or one padded
-  request from measured RTT/bandwidth (S3 `GetObject` accepts only a
-  single range per request).
-- **`explain()` / `estimatedRows()`** — return the query plan without
-  executing: strategy, candidate blocks, estimated requests/bytes, and
-  a zero-I/O result-size estimate (zone-map counts give a hard upper
-  bound; the t-digest CDF gives a point estimate). Doubles as a CI
-  oracle (plan vs. actual request count).
-- **`rowsWhereAll()`** — multi-predicate queries whose per-column
-  zone-map survivor sets are intersected before any block is read
-  (`WHERE date BETWEEN … AND amount > …` scans the intersection, never
-  more blocks than the most selective predicate alone).
+Shipped in v3.3 ✅: **range coalescing** (gap-bridging with a cost model
+via `Contracts\ProvidesCostHints` — keep one ranged read alive across a
+short gap when it beats a round-trip), **`explain()`/`estimatedRows()`**
+(zero-I/O plans + hard upper bound + t-digest point estimate),
+**`rowsWhereAll()`** (multi-predicate zone-map intersection). Still ahead:
+
 - **Hedged range requests** — re-issue a slow critical-path range on a
   second connection, first response wins; insurance against S3 tail
   latency on point lookups.
 - **Prefetch pipeline** — keep 3-4 blocks in flight during sequential
   S3 scans so inflate/parse overlaps fetch.
 - **`onProgress` callback for the reader** — symmetric to the writer's,
-  for ingestion dashboards.
+  for ingestion dashboards. (The reader already has `onFullScan()` for
+  pushdown observability as of v3.3.)
 
 ### Tooling
 
@@ -74,7 +73,7 @@ concatenation) are already PoC-proven.
   the first `write()` so the sink is cheap to instantiate in DI
   contexts.
 
-### Queryable-XLSX follow-ups (PoC-verified, sequenced after v3.3)
+### Queryable-XLSX follow-ups (PoC-verified, sequenced after v3.4)
 
 - **Appendable XLSX** — end the last sheet at a full-flush boundary,
   reopen and continue with a fresh deflate context; on S3,
@@ -88,10 +87,10 @@ concatenation) are already PoC-proven.
 - **Verified partial reads (`MRKL`)** — a Merkle tree over per-block
   hashes (tag reserved in SPEC.md): prove a ranged read belongs to a
   signed file without fetching the rest of it.
-- **Compact cell refs** (`c/@r` omitted, spec-legal) — measured 2.1×
-  writer throughput and −44 % file size, but at least one popular
-  reader silently returns zero rows on such files; stays opt-in and
-  gated on the external-reader compat matrix.
+- ~~**Compact cell refs** (`c/@r` omitted, spec-legal)~~ — **shipped in
+  v3.3 as opt-in `compact()`** (~52–62 % smaller compressed sheets;
+  verified in Excel/LibreOffice/Numbers and read by PhpSpreadsheet 5.8 /
+  OpenSpout 4.28). Stays opt-in while it accrues field mileage.
 - **Retrofit index for foreign XLSX** — zran-style inflate-state
   snapshots make files *other* writers produced random-access after
   one pass. Pure PHP can't resume mid-stream (no `inflatePrime`);
