@@ -53,6 +53,9 @@ class S3MultipartSink implements Sink
 
     private int $concurrency;
 
+    /** When true, each part carries a Content-MD5 so S3 rejects a corrupted part. */
+    private bool $verifyParts = false;
+
     private int $partNumber = 1;
 
     private int $bytesWritten = 0;
@@ -89,6 +92,11 @@ class S3MultipartSink implements Sink
      *        a higher, sawtooth memory profile than the synchronous default.
      *        Prefer it only when you have measured a throughput win on your
      *        link; on bandwidth-bound links it is no faster than the default.
+     * @param bool $verifyParts When true, every part carries a Content-MD5 so
+     *        S3 verifies each part's bytes and rejects a corrupted one — a
+     *        corrupt part never enters the object ("verified export", for
+     *        audit/payroll/HR data). Costs one MD5 per part (per ~part_size,
+     *        not per row). Default off.
      */
     public function __construct(
         S3Client $s3,
@@ -96,7 +104,8 @@ class S3MultipartSink implements Sink
         string $key,
         int $partSize = self::DEFAULT_PART_SIZE,
         array $putObjectParams = [],
-        ?int $concurrency = self::DEFAULT_CONCURRENCY
+        ?int $concurrency = self::DEFAULT_CONCURRENCY,
+        bool $verifyParts = false
     ) {
         $this->s3 = $s3;
         $this->bucket = $bucket;
@@ -105,6 +114,7 @@ class S3MultipartSink implements Sink
         // Silently adjust part size if too small
         $this->partSize = max(self::MIN_PART_SIZE, $partSize);
         $this->concurrency = max(1, $concurrency ?? self::DEFAULT_CONCURRENCY);
+        $this->verifyParts = $verifyParts;
 
         // Default parameters
         $this->putObjectParams = array_merge([
@@ -197,16 +207,37 @@ class S3MultipartSink implements Sink
      * to leak. The SDK's own retry middleware handles transient errors;
      * a hard failure is recorded like the async path's.
      */
+    /**
+     * Build uploadPart params, attaching a Content-MD5 when verifyParts is
+     * on so S3 recomputes the digest of the bytes it received and REJECTS
+     * the part on any mismatch — corrupt bytes never enter the object.
+     * (Content-MD5 is the header S3 has always enforced; the newer
+     * x-amz-checksum-* flexible checksums are not reliably verified by
+     * older SDKs, so MD5 is the portable per-part integrity guarantee.)
+     *
+     * @return array<string, mixed>
+     */
+    private function partParams(int $partNumber, string $chunk): array
+    {
+        $params = [
+            'Bucket' => $this->bucket,
+            'Key' => $this->key,
+            'UploadId' => $this->uploadId,
+            'PartNumber' => $partNumber,
+            'Body' => $chunk,
+        ];
+
+        if ($this->verifyParts) {
+            $params['ContentMD5'] = base64_encode(md5($chunk, true));
+        }
+
+        return $params;
+    }
+
     private function uploadPartSync(int $partNumber, string $chunk): void
     {
         try {
-            $result = $this->s3->uploadPart([
-                'Bucket' => $this->bucket,
-                'Key' => $this->key,
-                'UploadId' => $this->uploadId,
-                'PartNumber' => $partNumber,
-                'Body' => $chunk,
-            ]);
+            $result = $this->s3->uploadPart($this->partParams($partNumber, $chunk));
             $this->recordPart($partNumber, (string) $result['ETag']);
         } catch (\Throwable $e) {
             if ($this->failed === null) {
@@ -235,13 +266,7 @@ class S3MultipartSink implements Sink
      */
     private function sendPartAsync(int $partNumber, string $chunk): PromiseInterface
     {
-        $params = [
-            'Bucket' => $this->bucket,
-            'Key' => $this->key,
-            'UploadId' => $this->uploadId,
-            'PartNumber' => $partNumber,
-            'Body' => $chunk,
-        ];
+        $params = $this->partParams($partNumber, $chunk);
 
         return $this->s3->uploadPartAsync($params)->then(
             function ($result) use ($partNumber) {

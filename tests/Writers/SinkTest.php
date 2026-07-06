@@ -149,6 +149,46 @@ class SinkTest extends TestCase
         $this->assertEquals(5 * 1024 * 1024, $sink->getBytesWritten());
     }
     
+    public function test_verify_parts_attaches_content_md5()
+    {
+        $chunk = str_repeat('a', 5 * 1024 * 1024);
+        $expectedMd5 = base64_encode(md5($chunk, true));
+
+        $s3Client = Mockery::mock(S3Client::class);
+        $s3Client->shouldReceive('createMultipartUpload')->once()
+            ->andReturn(['UploadId' => 'test-upload-id']);
+        $s3Client->shouldReceive('uploadPart')->once()
+            ->with(Mockery::on(fn ($args) => ($args['ContentMD5'] ?? null) === $expectedMd5))
+            ->andReturn(['ETag' => 'etag-1']);
+        $s3Client->shouldReceive('completeMultipartUpload')->once()->andReturn([]);
+
+        // verifyParts = true (7th arg)
+        $sink = new S3MultipartSink($s3Client, 'b', 'k.xlsx', 5 * 1024 * 1024, [], 1, true);
+        $sink->write($chunk);
+        $sink->close();
+
+        $this->assertSame(5 * 1024 * 1024, $sink->getBytesWritten());
+    }
+
+    public function test_parts_carry_no_content_md5_by_default()
+    {
+        $chunk = str_repeat('b', 5 * 1024 * 1024);
+
+        $s3Client = Mockery::mock(S3Client::class);
+        $s3Client->shouldReceive('createMultipartUpload')->once()
+            ->andReturn(['UploadId' => 'test-upload-id']);
+        $s3Client->shouldReceive('uploadPart')->once()
+            ->with(Mockery::on(fn ($args) => ! isset($args['ContentMD5'])))
+            ->andReturn(['ETag' => 'etag-1']);
+        $s3Client->shouldReceive('completeMultipartUpload')->once()->andReturn([]);
+
+        $sink = new S3MultipartSink($s3Client, 'b', 'k.xlsx', 5 * 1024 * 1024); // default: verifyParts off
+        $sink->write($chunk);
+        $sink->close();
+
+        $this->assertSame(5 * 1024 * 1024, $sink->getBytesWritten());
+    }
+
     public function test_s3_multipart_sink_aborts_on_error()
     {
         $s3Client = Mockery::mock(S3Client::class);
