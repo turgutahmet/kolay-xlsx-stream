@@ -120,13 +120,14 @@ class SinkTest extends TestCase
             ->once()
             ->andReturn(['UploadId' => 'test-upload-id']);
         
-        $s3Client->shouldReceive('uploadPartAsync')
+        // Default sink is synchronous (concurrency 1) -> uploadPart, not async.
+        $s3Client->shouldReceive('uploadPart')
             ->once()
             ->with(Mockery::on(function ($args) {
                 return $args['PartNumber'] === 1
                     && strlen($args['Body']) === 5 * 1024 * 1024;
             }))
-            ->andReturn(new \GuzzleHttp\Promise\FulfilledPromise(['ETag' => 'etag-1']));
+            ->andReturn(['ETag' => 'etag-1']);
         
         $s3Client->shouldReceive('completeMultipartUpload')
             ->once()

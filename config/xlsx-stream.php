@@ -48,11 +48,14 @@ return [
         'part_size' => env('XLSX_STREAM_S3_PART_SIZE', 8 * 1024 * 1024),
 
         // Max part uploads in flight at once for forDisk() writers.
-        // Memory ceiling is roughly part_size x (concurrency + 1);
-        // 1 = strictly sequential uploads. Writers that need per-call
-        // control construct S3MultipartSink directly — its constructor
-        // takes both part size and concurrency.
-        'concurrency' => env('XLSX_STREAM_S3_CONCURRENCY', 4),
+        // DEFAULT 1 = strictly synchronous uploads: memory stays flat at
+        // ~part_size regardless of file size (true O(1)). Raise it to opt
+        // into PARALLEL part uploads, which can hide per-request latency on
+        // high-RTT links but hold more memory (the async path keeps each
+        // in-flight part's body until a periodic GC reclaims it — a higher,
+        // sawtooth profile). Prefer > 1 only where you have measured a
+        // throughput win; on bandwidth-bound links it is no faster.
+        'concurrency' => env('XLSX_STREAM_S3_CONCURRENCY', 1),
 
         // Why there are no retry keys here: transient upload errors are
         // retried by the AWS SDK's own retry middleware — configure it

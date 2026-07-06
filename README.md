@@ -14,7 +14,9 @@ median, p99 or distinct count **without reading a single row** — over
 HTTP range requests, from a file Excel opens like any other.
 
 - **Write**: ~289K rows/s locally at 6 MB peak RAM; direct S3 multipart
-  (parallel upload window, no temp files)
+  streaming at bounded memory — synchronous by default (flat ~part-size
+  working set, true O(1) regardless of file size), optional parallel
+  upload window, no temp files
 - **Read**: ~127K rows/s full scans with bounded memory, any file size
 - **Seek**: `rowAt(1_000_000)` in milliseconds via the born-indexed sidecar
 - **Query**: `columnStats` / `rowsWhere` / `findRow` / `groupStats` with
@@ -51,8 +53,12 @@ Numbers, PhpSpreadsheet and OpenSpout all open the files normally.
 Absolute S3 throughput tracks the network path far more than the
 library (the same 1M-row export measured 59K–153K rows/s across
 sessions) — the honest S3 claim is the same-day A/B: **v3.2's writer is
-+36% over v3.0.2 on an identical link**, and the parallel upload window
-turns 3× wall-time swings into steady runs. Benchmark on your own link.
++36% over v3.0.2 on an identical link**. Uploads are **synchronous by
+default** — part memory stays flat at ~part-size no matter how large the
+file, and throughput is steady; a **parallel upload window is opt-in**
+(`concurrency`) for high-latency links where hiding per-request
+round-trips outweighs its higher (sawtooth) memory. Benchmark on your
+own link.
 
 ### Cross-package, 100K rows (May 2026, latest stables)
 

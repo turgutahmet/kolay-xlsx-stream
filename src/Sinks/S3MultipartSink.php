@@ -66,7 +66,7 @@ class S3MultipartSink implements Sink
 
     public const DEFAULT_PART_SIZE = 8388608; // 8MB
 
-    public const DEFAULT_CONCURRENCY = 4;
+    public const DEFAULT_CONCURRENCY = 1;
 
     /**
      * @param S3Client $s3
@@ -74,13 +74,21 @@ class S3MultipartSink implements Sink
      * @param string $key S3 object key (path)
      * @param int $partSize Size of each part (min 5MB)
      * @param array $putObjectParams Additional S3 parameters (ContentType, ACL, etc)
-     * @param int|null $concurrency Max part uploads in flight at once (default 4).
-     *        Parts are dispatched asynchronously; when the window is full the
-     *        writer waits for the oldest part before dispatching the next one.
-     *        Memory ceiling is roughly partSize x (concurrency + 1): up to
-     *        `concurrency` part bodies held by in-flight requests plus the
-     *        accumulating buffer. Use 1 for strictly sequential uploads
-     *        (same S3 request sequence as pre-3.2 versions).
+     * @param int|null $concurrency Max part uploads in flight at once.
+     *        DEFAULT 1 = strictly synchronous uploads: each part is sent and
+     *        released before the next is buffered, so memory stays flat at
+     *        ~partSize regardless of file size (true O(1), the streaming-to-S3
+     *        promise). This is the safe default.
+     *
+     *        concurrency > 1 opts into PARALLEL part uploads (async window):
+     *        it hides per-request latency on high-RTT links, but the AWS SDK's
+     *        async promise/command graph holds each in-flight part's body in a
+     *        reference cycle that plain refcounting can't free, so the working
+     *        set grows with the number of dispatched parts until a periodic
+     *        gc_collect_cycles() (issued at each part boundary) reclaims it —
+     *        a higher, sawtooth memory profile than the synchronous default.
+     *        Prefer it only when you have measured a throughput win on your
+     *        link; on bandwidth-bound links it is no faster than the default.
      */
     public function __construct(
         S3Client $s3,
@@ -163,6 +171,16 @@ class S3MultipartSink implements Sink
      */
     private function dispatchPart(string $chunk): void
     {
+        // Synchronous default: send the part and let its body be released
+        // immediately (no async promise graph to leak). Flat ~partSize memory.
+        if ($this->concurrency === 1) {
+            $this->uploadPartSync($this->partNumber, $chunk);
+            $this->partNumber++;
+
+            return;
+        }
+
+        // Parallel window (opt-in): bounded to `concurrency` in-flight parts.
         while (count($this->inFlight) >= $this->concurrency) {
             $this->awaitOldest();
             $this->throwIfFailed();
@@ -172,6 +190,38 @@ class S3MultipartSink implements Sink
         $this->partNumber++;
 
         $this->inFlight[$partNumber] = $this->sendPartAsync($partNumber, $chunk);
+    }
+
+    /**
+     * Upload one part synchronously — no async promise, so nothing lingers
+     * to leak. The SDK's own retry middleware handles transient errors;
+     * a hard failure is recorded like the async path's.
+     */
+    private function uploadPartSync(int $partNumber, string $chunk): void
+    {
+        try {
+            $result = $this->s3->uploadPart([
+                'Bucket' => $this->bucket,
+                'Key' => $this->key,
+                'UploadId' => $this->uploadId,
+                'PartNumber' => $partNumber,
+                'Body' => $chunk,
+            ]);
+            $this->recordPart($partNumber, (string) $result['ETag']);
+        } catch (\Throwable $e) {
+            if ($this->failed === null) {
+                $this->failed = S3Exception::partUploadFailed($partNumber, $e->getMessage());
+            }
+        }
+
+        // The SDK's uploadPart is uploadPartAsync()->wait() under the hood, so
+        // even this synchronous call leaves the part's ~partSize body in a
+        // settled-promise reference cycle. Collecting it here — once per part,
+        // a handful of times per GB — keeps memory flat at ~partSize (true
+        // O(1)) instead of climbing toward the whole file. Measured cost is a
+        // few ms across a multi-GB upload; negligible against the network.
+        unset($result);
+        gc_collect_cycles();
     }
 
     /**
@@ -262,6 +312,15 @@ class S3MultipartSink implements Sink
         // The fulfillment handler normally removes the entry; make sure a
         // settled promise never lingers in the window.
         unset($this->inFlight[$oldest]);
+        unset($promise);
+
+        // Parallel path only. The AWS SDK's async promise/command graph links
+        // each settled request into a reference cycle that holds the part's
+        // body; refcounting can't free it, so without this the working set
+        // climbs toward the whole file. Collecting at each part boundary (a
+        // handful of times per GB) caps it. The synchronous default never
+        // reaches here and needs no GC.
+        gc_collect_cycles();
     }
 
     /**
