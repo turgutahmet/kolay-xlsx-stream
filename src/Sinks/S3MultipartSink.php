@@ -247,10 +247,16 @@ class S3MultipartSink implements Sink
 
         // The SDK's uploadPart is uploadPartAsync()->wait() under the hood, so
         // even this synchronous call leaves the part's ~partSize body in a
-        // settled-promise reference cycle. Collecting it here — once per part,
-        // a handful of times per GB — keeps memory flat at ~partSize (true
-        // O(1)) instead of climbing toward the whole file. Measured cost is a
-        // few ms across a multi-GB upload; negligible against the network.
+        // settled-promise reference cycle. Refcounting can't reclaim a cycle
+        // and PHP's automatic collector won't fire until ~10k roots accrue —
+        // thousands of parts later — so without this the bodies pile up and
+        // memory climbs toward the whole file (a 128 MB process OOMs at ~16
+        // parts). One collection per part keeps it flat at ~partSize (true
+        // O(1)). It is cheap: the collector scans only the root buffer (the
+        // handful of cycle objects a settled part leaves, not the live heap),
+        // measured a few ms of GC work across a multi-GB upload; the ~partSize
+        // free it triggers is work owed regardless. Once per 8 MB PUT, never
+        // on a hot inner loop.
         unset($result);
         gc_collect_cycles();
     }
