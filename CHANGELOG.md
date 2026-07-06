@@ -11,7 +11,7 @@ A backward-compatible minor: a real query engine on top of the born-indexed
 sidecar, writer & DX ergonomics, integrity verification, and a critical S3
 write-memory fix. No breaking API changes — the base `Source` contract is
 unchanged and classic writer output stays byte-identical (compact mode and
-group-aligned blocks are opt-in). Full suite 599 tests / 7481 assertions;
+group-aligned blocks are opt-in). Full suite 604 tests / 7541 assertions;
 local write/read and the whole query surface measured at parity with 3.2.x
 (no hot-path regression).
 

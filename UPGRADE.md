@@ -95,8 +95,9 @@ carries `'version' => 2`, so existing published copies stay inert and
 nothing changes until you opt in.
 
 **The safe way to opt in** is re-publishing the file, which ships the
-new defaults (they match the code: compression level 5, flush interval
-10,000, part size 8 MB, concurrency 4):
+current defaults (they match the code: compression level 5, flush
+interval 10,000, part size 8 MB, and — as of v3.3 — concurrency 1;
+see the v3.3.0 note above):
 
 ```bash
 php artisan vendor:publish --tag=xlsx-stream-config --force
