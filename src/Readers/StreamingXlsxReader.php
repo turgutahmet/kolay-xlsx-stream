@@ -1211,10 +1211,11 @@ class StreamingXlsxReader
      * A uniform random sample of $k rows, fetched via the index — so a
      * sample of a multi-GB sheet costs ≈$k block reads, not a full scan.
      * $k distinct row numbers are drawn uniformly (without replacement)
-     * from the data range with a seeded Mt19937 Randomizer, then exactly
-     * those rows are read; each data row has an equal $k/N chance
-     * (unbiasedness proven in poc/d3_sample.php via chi-square). The
-     * Randomizer is local — the global mt_rand() state is untouched.
+     * from the data range with a seeded generator + rejection sampling,
+     * then exactly those rows are read; each data row has an equal $k/N
+     * chance (unbiasedness proven in poc/d3_sample.php via chi-square).
+     * The generator is self-contained — the global mt_rand() state is
+     * untouched, and it needs no PHP 8.2 ext-random.
      *
      * Pass $seed for a reproducible sample (same file + seed => same
      * rows); omit it for a fresh secure-random draw. Returns an ascending
@@ -1250,20 +1251,7 @@ class StreamingXlsxReader
             return $rows;
         }
 
-        $rng = new \Random\Randomizer(
-            $seed !== null ? new \Random\Engine\Mt19937($seed) : null
-        );
-
-        // Rejection sampling for k DISTINCT rows — getInt() is itself
-        // rejection-based, so no modulo bias; the set keys dedup draws.
-        // Efficient while k ≪ n, which is the intended use.
-        $picked = [];
-        while (count($picked) < $k) {
-            $picked[$rng->getInt($lo, $hi)] = true;
-        }
-        ksort($picked);
-
-        foreach (array_keys($picked) as $rn) {
+        foreach ($this->drawDistinctRowNumbers($lo, $hi, $k, $seed) as $rn) {
             $row = $this->rowAt($rn);
             if ($row !== null) {
                 $rows[$rn] = $row;
@@ -1271,6 +1259,53 @@ class StreamingXlsxReader
         }
 
         return $rows;
+    }
+
+    /**
+     * Draw $k DISTINCT row numbers uniformly from [$lo, $hi], ascending.
+     *
+     * ext-random's \Random\Randomizer is PHP 8.2+ and this package
+     * supports 8.1, so the draw uses a self-contained xorshift32 rather
+     * than the extension. Uniform without modulo bias (the top,
+     * range-incommensurate slice of the 32-bit output is rejected) and
+     * without replacement (the set keys dedup draws). Deterministic for a
+     * given $seed — same file + seed reproduces the sample — and seeded
+     * from the CSPRNG when $seed is null. The global mt_rand() state is
+     * never touched. Efficient while $k ≪ the range, the intended use.
+     *
+     * @return list<int>
+     */
+    private function drawDistinctRowNumbers(int $lo, int $hi, int $k, ?int $seed): array
+    {
+        $state = $seed !== null ? ($seed & 0xFFFFFFFF) : random_int(1, 0xFFFFFFFF);
+        // Scramble so adjacent small seeds (1, 2, …) start well separated.
+        $state = ($state ^ 0x9E3779B9) & 0xFFFFFFFF;
+        if ($state === 0) {
+            $state = 0x9E3779B9;   // xorshift32 must never sit at zero
+        }
+
+        $range = $hi - $lo + 1;
+        // Largest multiple of $range within the 32-bit output space; draws
+        // at or above it are rejected so every residue is equally likely.
+        $limit = intdiv(0x100000000, $range) * $range;
+
+        $picked = [];
+        while (count($picked) < $k) {
+            // xorshift32 — every op stays within a 64-bit int (masked to 32).
+            $state ^= ($state << 13) & 0xFFFFFFFF;
+            $state ^= $state >> 17;
+            $state ^= ($state << 5) & 0xFFFFFFFF;
+            $state &= 0xFFFFFFFF;
+
+            if ($state >= $limit) {
+                continue;   // reject the biased tail
+            }
+            $picked[$lo + ($state % $range)] = true;
+        }
+
+        ksort($picked);
+
+        return array_keys($picked);
     }
 
     /**
