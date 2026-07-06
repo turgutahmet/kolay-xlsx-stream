@@ -175,6 +175,95 @@ class TopRowsTest extends TestCase
         $reader->close();
     }
 
+    /**
+     * A sorted column may carry non-numeric cells (optional amount/discount
+     * columns) — the sorted flag orders only numeric cells. The extremes
+     * must be the true numeric extremes, never the null/text cells that
+     * happen to sit at the sheet end. Regression: the fast path used to
+     * read the fixed k rows at the end and return them verbatim, so a
+     * null-tailed asc column returned empties instead of the real maxima.
+     */
+    private function writeNullEndFixture(bool $nullsAtTail): void
+    {
+        $writer = new SinkableXlsxWriter(new FileSink($this->testFile));
+        $writer->withRandomAccessIndex(every: 100);
+        $writer->withColumnStats([2]);
+        $writer->setBufferFlushInterval(100);
+        $writer->startFile(['id', 'score']);
+        // Asc-sorted numeric core; a run of null-score rows at one end.
+        if ($nullsAtTail) {
+            for ($i = 1; $i <= 1000; $i++) {
+                $writer->writeRow([$i, $i * 1.5]);
+            }
+            for ($i = 1001; $i <= 1015; $i++) {
+                $writer->writeRow([$i, null]);
+            }
+        } else {
+            for ($i = 1; $i <= 15; $i++) {
+                $writer->writeRow([$i, null]);
+            }
+            for ($i = 16; $i <= 1015; $i++) {
+                $writer->writeRow([$i, ($i - 15) * 1.5]);
+            }
+        }
+        $writer->finishFile();
+    }
+
+    public function test_largest_ignores_null_tail_on_sorted_column(): void
+    {
+        $this->writeNullEndFixture(nullsAtTail: true);
+        $reader = StreamingXlsxReader::fromFile($this->testFile);
+
+        $top = $reader->topRows(2, 3, desc: true);
+        $this->assertSame(
+            [1500.0, 1498.5, 1497.0],
+            array_map(fn ($r) => (float) $r[1], array_values($top))
+        );
+        $this->assertSame($this->oracle($reader, 2, 3, true), array_map(fn ($r) => (float) $r[1], $top));
+        $reader->close();
+    }
+
+    public function test_smallest_ignores_null_head_on_sorted_column(): void
+    {
+        $this->writeNullEndFixture(nullsAtTail: false);
+        $reader = StreamingXlsxReader::fromFile($this->testFile);
+
+        $top = $reader->topRows(2, 3, desc: false);
+        $this->assertSame(
+            [1.5, 3.0, 4.5],
+            array_map(fn ($r) => (float) $r[1], array_values($top))
+        );
+        $this->assertSame($this->oracle($reader, 2, 3, false), array_map(fn ($r) => (float) $r[1], $top));
+        $reader->close();
+    }
+
+    public function test_null_scattered_including_extreme_window_matches_oracle(): void
+    {
+        // Nulls scattered through the column, some landing in the last k
+        // rows — the exact shape that slipped a null into the result.
+        $writer = new SinkableXlsxWriter(new FileSink($this->testFile));
+        $writer->withRandomAccessIndex(every: 100)->withColumnStats([2]);
+        $writer->setBufferFlushInterval(100);
+        $writer->startFile(['id', 'score']);
+        for ($i = 1; $i <= 1000; $i++) {
+            $writer->writeRow([$i, $i % 25 === 0 ? null : $i * 1.5]);
+        }
+        $writer->finishFile();
+
+        $reader = StreamingXlsxReader::fromFile($this->testFile);
+        foreach ([true, false] as $desc) {
+            $top = $reader->topRows(2, 8, desc: $desc);
+            $oracle = $this->oracle($reader, 2, 8, $desc);
+            $this->assertSame(array_keys($oracle), array_keys($top), 'desc='.var_export($desc, true));
+            $this->assertSame($oracle, array_map(fn ($r) => (float) $r[1], $top));
+            // No non-numeric cell may appear in the result.
+            foreach ($top as $row) {
+                $this->assertIsNumeric($row[1]);
+            }
+        }
+        $reader->close();
+    }
+
     public function test_addresses_column_by_name(): void
     {
         $this->writeFixture();

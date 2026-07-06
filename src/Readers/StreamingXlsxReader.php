@@ -1201,7 +1201,7 @@ class StreamingXlsxReader
         $sorted = $stats['sorted'] ?? null;
 
         if ($sorted === 'asc' || $sorted === 'desc') {
-            return $this->topRowsSorted($k, $desc, $sorted, $total);
+            return $this->topRowsSorted($column, $k, $desc, $sorted, $total);
         }
 
         return $this->topRowsScan($column, $k, $desc);
@@ -1309,38 +1309,82 @@ class StreamingXlsxReader
     }
 
     /**
-     * Sorted-column fast path: the k extremes are a contiguous block of
-     * rows at one end of the sheet. Read just that row range (via the
-     * seeking rowRange) and order it by value — no per-row comparison
-     * needed, the sorted flag guarantees value order equals row order.
+     * Sorted-column path: the k extremes are the k NUMERIC cells nearest
+     * one end of the sheet. On an asc column the largest sit at the tail
+     * and the smallest at the head ($desc flips which end); a desc column
+     * mirrors it. We read outward from the wanted end and keep numeric
+     * rows until k are gathered.
+     *
+     * The sorted flag orders only numeric cells — null/text may sit
+     * anywhere, including the ends — so the old "read exactly the k rows
+     * at the end" shortcut could return non-numeric cells instead of the
+     * true extremes when the end held any. A fully-numeric end still fills
+     * on the first k-row read (the O(k) fast path); non-numeric cells at
+     * that end just widen the window. This is exact: reading inward from
+     * the extreme end, no numeric row past those already gathered can
+     * outrank them, so interior nulls never force extra work. If the
+     * non-numeric run at the end is long enough that we would read a large
+     * slice of the sheet, a single ordered scan is cheaper — bail to it.
      *
      * @return array<int, array<int, mixed>>
      */
-    private function topRowsSorted(int $k, bool $desc, string $sorted, int $total): array
+    private function topRowsSorted(int $column, int $k, bool $desc, string $sorted, int $total): array
     {
-        // Which end holds the wanted extreme? On an asc column high values
-        // sit at the tail; on desc, at the head. We want the high end when
-        // $desc (largest) is requested.
-        $wantHigh = $desc;
-        $highAtTail = $sorted === 'asc';
-        $readTail = $wantHigh === $highAtTail;
+        $idx = $column - 1;
+        $readTail = $desc === ($sorted === 'asc');
+        $bailAfter = max($k * 4, 4096);
 
-        [$from, $to] = $readTail ? [$total - $k + 1, $total] : [2, $k + 1];
+        $collected = [];   // rn => cast row, gathered most-extreme first
+        $scanned = 0;
+        $chunk = max($k, 1);
+        $cursor = $readTail ? $total : 2;   // moving edge at the wanted end
 
-        $rows = [];
-        foreach ($this->rowRange($from, $to) as $rn => $row) {
-            $rows[$rn] = $row;
+        while (\count($collected) < $k) {
+            if ($readTail) {
+                $hi = $cursor;
+                if ($hi < 2) {
+                    break;
+                }
+                $lo = max(2, $hi - $chunk + 1);
+            } else {
+                $lo = $cursor;
+                if ($lo > $total) {
+                    break;
+                }
+                $hi = min($total, $lo + $chunk - 1);
+            }
+
+            $numeric = [];
+            foreach ($this->rowRange($lo, $hi) as $rn => $row) {
+                if (is_numeric($row[$idx] ?? null)) {
+                    $numeric[$rn] = $row;   // rowRange already applies casts
+                }
+            }
+            $scanned += $hi - $lo + 1;
+
+            // Most-extreme first: highest row for a tail read (largest
+            // value on an asc column), lowest row for a head read.
+            $readTail ? krsort($numeric) : ksort($numeric);
+            foreach ($numeric as $rn => $row) {
+                $collected[$rn] = $row;
+                if (\count($collected) >= $k) {
+                    break;
+                }
+            }
+
+            // Whole sheet consumed?
+            if (($readTail && $lo <= 2) || (! $readTail && $hi >= $total)) {
+                break;
+            }
+            if ($scanned >= $bailAfter && \count($collected) < $k) {
+                return $this->topRowsScan($column, $k, $desc);
+            }
+
+            $cursor = $readTail ? $lo - 1 : $hi + 1;
+            $chunk = min($chunk * 4, 65536);
         }
 
-        // $rows is keyed by ascending row number. Value ascends with row
-        // number iff the column is asc-sorted. Reorder so position 0 is
-        // the requested top (high first when $desc).
-        $ascendingByValue = $sorted === 'asc';
-        if ($ascendingByValue === $desc) {
-            $rows = array_reverse($rows, true);
-        }
-
-        return $rows;
+        return $collected;
     }
 
     /**
