@@ -451,6 +451,65 @@ class StreamingXlsxReader
     }
 
     /**
+     * Verify every sheet's data against the checksums the writer recorded,
+     * a single inflate pass per sheet at O(1) memory. On born-indexed files
+     * this checks the per-block running CRC (SCRC) pinned at each sync point
+     * AND the whole-sheet CRC, so corruption is localized: `corrupt_blocks`
+     * lists the 0-based sync-point index of each block whose bytes no longer
+     * match — the "which block went bad" report for audit/payroll/HR data.
+     * Without a sidecar it falls back to the whole-entry ZIP CRC only (no
+     * block granularity). `inflate_ok=false` marks a sheet whose compressed
+     * bytes were too damaged to inflate at all.
+     *
+     * @return array{ok: bool, sheets: list<array{sheet: int, entry: string, ok: bool, blocks_checked: int, corrupt_blocks: list<int>, sheet_crc_ok: bool, inflate_ok: bool}>}
+     */
+    public function verify(): array
+    {
+        $index = $this->loadRandomAccessIndex();
+        $sheets = [];
+        $allOk = true;
+
+        foreach ($this->sheets as $i => $sheet) {
+            $entry = $sheet['entry'];
+            $indexed = $index !== null && $index->sheetCrc32($entry) !== null;
+
+            if ($indexed) {
+                $sheetCrc = $index->sheetCrc32($entry);
+                $syncPoints = $index->syncPoints($entry);
+                $syncCrcs = $index->syncPointCrcs($entry);
+                $checkpoints = [];
+                foreach ($syncPoints as $k => $sp) {
+                    if (isset($syncCrcs[$k], $sp['uncomp_offset'])) {
+                        $checkpoints[] = [$sp['uncomp_offset'], $syncCrcs[$k]];
+                    }
+                }
+            } else {
+                // No SCRC pins — verify the whole entry against the ZIP's own CRC.
+                $sheetCrc = $this->cd->entry($entry)['crc32'] ?? -1;
+                $checkpoints = [];
+            }
+
+            $res = (new StreamingSheetReader($this->source, $this->cd, $entry))
+                ->verifyCrc($checkpoints, $sheetCrc);
+
+            $sheetOk = $res['inflate_ok'] && $res['sheet_crc_ok'] && $res['corrupt_blocks'] === [];
+            $allOk = $allOk && $sheetOk;
+
+            $sheets[] = [
+                'sheet' => $i,
+                'entry' => $entry,
+                'ok' => $sheetOk,
+                'blocks_checked' => count($checkpoints),
+                'corrupt_blocks' => $res['corrupt_blocks'],
+                'sheet_crc_ok' => $res['sheet_crc_ok'],
+                'inflate_ok' => $res['inflate_ok'],
+            ];
+        }
+
+        return ['ok' => $allOk, 'sheets' => $sheets];
+    }
+
+    /**
      * Return a single row by 1-based row number — row 1 is the header,
      * row 2 is the first data row. Returns null when $rowNumber is past
      * the end of the sheet.

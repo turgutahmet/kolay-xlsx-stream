@@ -236,6 +236,65 @@ class StreamingSheetReader
     }
 
     /**
+     * Integrity check: inflate the whole sheet once, running a CRC32 over
+     * the uncompressed bytes, and compare it against the sidecar's
+     * per-sync-point running-CRC pins (SCRC) and the whole-sheet CRC. This
+     * is the read-side counterpart of the CRC the writer pinned at each
+     * ZLIB_FULL_FLUSH boundary, so a corrupt block is localized to the two
+     * sync points that bracket it. O(1) memory (streaming inflate).
+     *
+     * A checkpoint is `[uncompOffset, expectedCrc]` — expectedCrc must equal
+     * the CRC32 of the first uncompOffset uncompressed bytes. $checkpoints
+     * must be ascending by offset. `inflate_ok=false` means the compressed
+     * data itself was too corrupt to inflate (a hard failure, reported not
+     * thrown so callers get a full report).
+     *
+     * @param  list<array{0: int, 1: int}>  $checkpoints
+     * @return array{sheet_crc_ok: bool, corrupt_blocks: list<int>, inflate_ok: bool}
+     */
+    public function verifyCrc(array $checkpoints, int $sheetCrc): array
+    {
+        $ctx = hash_init('crc32b');
+        $consumed = 0;
+        $ci = 0;
+        $n = count($checkpoints);
+        $corrupt = [];
+
+        try {
+            foreach ($this->inflatedChunks(null) as $chunk) {
+                $len = strlen($chunk);
+                $pos = 0;
+
+                // Close out every checkpoint whose boundary falls in this chunk.
+                while ($ci < $n && $checkpoints[$ci][0] <= $consumed + $len) {
+                    $upto = $checkpoints[$ci][0] - $consumed;
+                    if ($upto > $pos) {
+                        hash_update($ctx, substr($chunk, $pos, $upto - $pos));
+                        $pos = $upto;
+                    }
+                    if (hexdec(hash_final(hash_copy($ctx))) !== $checkpoints[$ci][1]) {
+                        $corrupt[] = $ci;
+                    }
+                    $ci++;
+                }
+
+                if ($pos < $len) {
+                    hash_update($ctx, substr($chunk, $pos));
+                }
+                $consumed += $len;
+            }
+        } catch (\Throwable) {
+            return ['sheet_crc_ok' => false, 'corrupt_blocks' => $corrupt, 'inflate_ok' => false];
+        }
+
+        return [
+            'sheet_crc_ok' => hexdec(hash_final($ctx)) === $sheetCrc,
+            'corrupt_blocks' => $corrupt,
+            'inflate_ok' => true,
+        ];
+    }
+
+    /**
      * Stream the sheet entry's inflated bytes as string chunks. Shared
      * engine behind rowsFromOffset() (row assembly) and countRows()
      * (boundary counting): entry validation, the ranged read loop, the
