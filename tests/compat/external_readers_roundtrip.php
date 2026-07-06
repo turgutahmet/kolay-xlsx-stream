@@ -7,11 +7,14 @@
  * libs are not present in the regular CI matrix, so loading them
  * inside a phpunit class would fail the suite.
  *
- * Two assertions:
- *   1. PhpSpreadsheet can open a file produced by SinkableXlsxWriter
- *      (with and without random-access index).
+ * Assertions:
+ *   1. PhpSpreadsheet + OpenSpout can open a file produced by
+ *      SinkableXlsxWriter (with and without random-access index).
  *   2. StreamingXlsxReader can read a file produced by PhpSpreadsheet
  *      (which uses xl/sharedStrings.xml — the external-XLSX path).
+ *   3. Both external readers open a COMPACT (r-less) file and assign
+ *      cell positions sequentially — a mid-row null does not shift
+ *      later columns (the compact-mode invariant).
  *
  * Exits non-zero on any failure; intended to be run from the workflow.
  */
@@ -156,6 +159,65 @@ try {
     }
 } catch (Throwable $e) {
     fail($failures, 'kxs→OpenSpout', $e->getMessage());
+}
+
+// ---------------------------------------------------------------
+// Test 5 & 6: kolay/xlsx-stream COMPACT (r-less cells) → external readers
+// Compact mode omits the optional c/@r and row/@r attributes; external
+// readers MUST assign cell positions sequentially, with the empty <c/>
+// placeholder carrying the position. The load-bearing risk: a mid-row
+// null must NOT shift later columns left. Row 100 is [100, <null>, 300,
+// false] — its col C (300) and col D (false) must stay put.
+// ---------------------------------------------------------------
+$kxsCompact = $tmp.'/kxs-compact.xlsx';
+$writer = new SinkableXlsxWriter(new FileSink($kxsCompact));
+$writer->compact();
+$writer->startFile(['a', 'b', 'c', 'd']);
+for ($i = 1; $i <= 200; $i++) {
+    $row = $i === 100 ? [100, null, 300, false] : [$i, "name-{$i}", $i * 2.5, $i % 2 === 0];
+    $writer->writeRow($row);
+}
+$writer->finishFile();
+
+try {
+    $book = IOFactory::load($kxsCompact);
+    $sheet = $book->getActiveSheet();
+    $rowCount = $sheet->getHighestDataRow();
+    $cAfterNull = (string) $sheet->getCell('C101')->getValue();   // data row 100 -> sheet row 101
+    if ($rowCount !== 201) {
+        fail($failures, 'kxs-compact→PhpSpreadsheet rowcount', "expected 201, got {$rowCount}");
+    } elseif ($cAfterNull !== '300') {
+        fail($failures, 'kxs-compact→PhpSpreadsheet position', "null shifted columns: C101='{$cAfterNull}' (expected 300)");
+    } else {
+        pass('kxs-compact→PhpSpreadsheet (r-less cells, mid-null keeps column position)');
+    }
+} catch (Throwable $e) {
+    fail($failures, 'kxs-compact→PhpSpreadsheet', $e->getMessage());
+}
+
+try {
+    $reader = new OpenSpoutReader();
+    $reader->open($kxsCompact);
+    $count = 0;
+    $row100 = null;
+    foreach ($reader->getSheetIterator() as $sheet) {
+        foreach ($sheet->getRowIterator() as $row) {
+            $count++;
+            if ($count === 101) {                 // header + 100 data rows
+                $row100 = $row->toArray();
+            }
+        }
+    }
+    $reader->close();
+    if ($count !== 201) {
+        fail($failures, 'kxs-compact→OpenSpout rowcount', "expected 201, got {$count}");
+    } elseif ($row100 === null || (int) ($row100[2] ?? 0) !== 300) {
+        fail($failures, 'kxs-compact→OpenSpout position', 'null shifted columns: row100='.json_encode($row100));
+    } else {
+        pass('kxs-compact→OpenSpout (r-less cells, mid-null keeps column position)');
+    }
+} catch (Throwable $e) {
+    fail($failures, 'kxs-compact→OpenSpout', $e->getMessage());
 }
 
 // ---------------------------------------------------------------
