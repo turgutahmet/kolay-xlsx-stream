@@ -6,6 +6,7 @@ use Kolay\XlsxStream\Readers\StreamingXlsxReader;
 use Kolay\XlsxStream\Sinks\FileSink;
 use Kolay\XlsxStream\Tests\TestCase;
 use Kolay\XlsxStream\Writers\SinkableXlsxWriter;
+use ZipArchive;
 
 /**
  * E3 — queryable(): one call that turns on the whole query stack
@@ -75,12 +76,29 @@ class QueryablePresetTest extends TestCase
             $write($preset, true);
             $write($manual, false);
 
-            // Same configuration => byte-identical file.
-            $this->assertSame(
-                hash_file('sha256', $manual),
-                hash_file('sha256', $preset),
-                'queryable() preset must equal the three explicit calls'
-            );
+            // Compare ZIP ENTRY CONTENTS, not the whole-file bytes: the ZIP
+            // local/central headers carry a DOS timestamp from time(), so two
+            // separate writes straddling a second boundary differ in metadata
+            // even for identical content. What "queryable() == the three
+            // calls" actually claims is that every produced entry — the sheet,
+            // styles, workbook, AND the xl/_kxs/index.bin sidecar (index +
+            // zone maps + sketches) — is byte-identical.
+            $za = new ZipArchive();
+            $zb = new ZipArchive();
+            $this->assertTrue($za->open($preset));
+            $this->assertTrue($zb->open($manual));
+
+            $this->assertSame($za->numFiles, $zb->numFiles, 'entry count differs');
+            for ($i = 0; $i < $za->numFiles; $i++) {
+                $name = $za->getNameIndex($i);
+                $this->assertSame(
+                    hash('sha256', (string) $za->getFromName($name)),
+                    hash('sha256', (string) $zb->getFromName($name)),
+                    "entry {$name} differs between queryable() and the three explicit calls"
+                );
+            }
+            $za->close();
+            $zb->close();
         } finally {
             @unlink($manual);
         }
