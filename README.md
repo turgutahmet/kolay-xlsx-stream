@@ -41,14 +41,16 @@ Numbers, PhpSpreadsheet and OpenSpout all open the files normally.
 
 ### The trajectory — same canonical workloads, every release
 
-| | v1.x (Sep 2025) | v2.2 (May 2026) | v3.0 (May 2026) | v3.1 (Jul 2026) | v3.2 (Jul 2026) |
-|---|---|---|---|---|---|
-| Write, local | ~182K rows/s | ~210K | ~215K | **~289K** | ~289K |
-| Write, S3 (1M rows) | ~9K rows/s | ~107K | ~107K | +36% same-link A/B | + parallel window |
-| Read, local | — | — | ~70K rows/s | ~106K | **~127K** |
-| Random access | — | — | O(1) `rowAt` | + block-pruned queries | + within-block skip (~19×) |
-| Analytics | — | — | — | `columnStats` 0-request | **median/p99/distinct 0-request** |
-| Peak RAM (write/read) | 0-2 MB / — | ~6 MB / — | 6 / 24 MB | 6 / 24 MB | 6 / **6 MB** |
+| | v1.x (Sep 2025) | v2.2 (May 2026) | v3.0 (May 2026) | v3.1 (Jul 2026) | v3.2 (Jul 2026) | v3.3 (Jul 2026) |
+|---|---|---|---|---|---|---|
+| Write, local | ~182K rows/s | ~210K | ~215K | **~289K** | ~289K | ~289K |
+| Write, S3 | ~9K rows/s | ~107K | ~107K | +36% same-link A/B | + parallel window | **O(1) memory (was O(file))** |
+| Read, local | — | — | ~70K rows/s | ~106K | **~127K** | ~127K |
+| Random access | — | — | O(1) `rowAt` | + block-pruned queries | + within-block skip (~19×) | + bounded ranged fetch |
+| Query engine | — | — | — | `columnStats`/`rowsWhere` | + `groupStats` | **AND / `topRows` / `explain` / by-name** |
+| Analytics | — | — | — | 0-request sums | median/p99/distinct 0-request | + `Bucket::month` GROUP BY |
+| Integrity | — | — | — | — | — | **`verify()` + S3 per-part checks** |
+| Peak RAM (write/read) | 0-2 MB / — | ~6 MB / — | 6 / 24 MB | 6 / 24 MB | 6 / **6 MB** | 6 / 6 MB |
 
 Absolute S3 throughput tracks the network path far more than the
 library (the same 1M-row export measured 59K–153K rows/s across
@@ -538,6 +540,77 @@ merge associatively, which is what future segment/partition stitching
 builds on. The full binary layout is public: **KXSI is an open spec**
 (see [SPEC.md](SPEC.md)) with committed conformance vectors under
 `tests/SpecVectors/`, so other implementations can verify byte-for-byte.
+
+### The query engine grows up *(v3.3+)*
+
+The sidecar turns into a small SQL-shaped engine — all answered by
+reading only the blocks that can match, and all addressable by header
+name (not just 1-based index):
+
+```php
+// One call makes an export fully queryable (index + zone maps + sketches):
+$writer->queryable([1, 3, 4]);                 // writer side, before startFile()
+
+// Multi-predicate AND — intersects each predicate's surviving blocks, so
+// two differently-clustered columns read far fewer blocks than either alone:
+$reader->rowsWhereAll([
+    ['region', '=', 3],
+    ['amount', 'between', 500, 5000],
+]);
+
+// ORDER BY amount DESC LIMIT 10 — on a sorted column, one seek + early exit:
+$reader->topRows('amount', 10, desc: true);
+
+// Plan a query WITHOUT running it — zero I/O, straight from the sidecar:
+$reader->estimatedRows('amount', '>=', 1000);  // ['upper' => .., 'estimate' => ..]
+$reader->explain([['region', '=', 3], ['amount', '>=', 500]]);
+//   ['strategy' => 'zone-map-prune', 'candidateBlocks' => .., 'runs' => ..,
+//    'estimatedRows' => [...], 'estimatedBytes' => ..]   // the S3 range budget
+
+// GROUP BY month over a date column — Bucket:: helpers keep the pushdown:
+use Kolay\XlsxStream\Readers\Bucket;
+$reader->groupStats('order_date', 'total', Bucket::month());   // one row per YYYYMM
+
+// A uniform, reproducible random sample without a full scan (≈k block reads):
+$reader->sampleRows(1000, seed: 42);
+
+// Know when a query silently falls back to a full scan (no index for it):
+$reader->onFullScan(fn (array $ctx) => logger()->warning('full scan', $ctx));
+```
+
+### Integrity — verified reads & writes *(v3.3+)*
+
+For data that matters (payroll, HR, audit exports):
+
+```php
+// Read side: check every block against the CRC the writer pinned at each
+// sync point. One inflate pass, O(1) memory; names the block that went bad.
+$report = $reader->verify();
+// ['ok' => true, 'sheets' => [['ok' => true, 'corrupt_blocks' => [], ...]]]
+
+// Write side: S3 verifies each part's Content-MD5 and rejects a corrupted
+// one — a bad byte never enters the object.
+$sink = new S3MultipartSink($s3, $bucket, $key, verifyParts: true);
+```
+
+### Bigger, cheaper writes *(v3.3+)*
+
+```php
+// Compact output: drop the optional r attributes on cells/rows (ECMA-376
+// allows it). ~52–62% smaller compressed sheets; opens in Excel/LibreOffice/
+// Numbers. Classic output is byte-identical when off.
+$writer->compact();
+
+// Group-aligned blocks: align index blocks to a sorted group column so
+// groupStats() folds each block from the sidecar — zero row reads.
+$writer->syncAtGroupBoundaries(2);
+```
+
+> **S3 writes are now O(1) memory.** Multipart uploads default to
+> synchronous (`concurrency: 1`): part memory stays flat at ~part-size no
+> matter the file size. (Earlier versions defaulted to a parallel window
+> that could grow memory toward the whole file.) Parallel is still an opt-in
+> for high-latency links — see [UPGRADE.md](UPGRADE.md).
 
 ### Parallel reads — shard a sheet across queue workers *(v3.1+)*
 
