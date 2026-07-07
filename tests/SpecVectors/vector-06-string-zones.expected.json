@@ -1,0 +1,114 @@
+{
+    "sync_period": 50,
+    "sheets": [
+        {
+            "entry": "xl/worksheets/sheet1.xml",
+            "total_rows": 201,
+            "sheet_crc32": 1550736484,
+            "sync_points": [
+                {
+                    "row": 52,
+                    "comp_offset": 1200,
+                    "uncomp_offset": 8333
+                },
+                {
+                    "row": 102,
+                    "comp_offset": 2246,
+                    "uncomp_offset": 16412
+                },
+                {
+                    "row": 152,
+                    "comp_offset": 3292,
+                    "uncomp_offset": 24732
+                },
+                {
+                    "row": 202,
+                    "comp_offset": 4346,
+                    "uncomp_offset": 33012
+                }
+            ],
+            "sync_point_crcs": [
+                3528676353,
+                2104941008,
+                734863453,
+                2317335871
+            ],
+            "column_stats": {},
+            "column_sketches": {},
+            "string_zones": {
+                "2": {
+                    "sorted_asc": true,
+                    "sorted_desc": false,
+                    "blocks": [
+                        {
+                            "min": "INV-2024-00000001",
+                            "max": "invoice",
+                            "count": 51,
+                            "other": 0
+                        },
+                        {
+                            "min": "INV-2024-00000051",
+                            "max": "INV-2024-00000100",
+                            "count": 50,
+                            "other": 0
+                        },
+                        {
+                            "min": "INV-2024-00000101",
+                            "max": "INV-2024-00000150",
+                            "count": 50,
+                            "other": 0
+                        },
+                        {
+                            "min": "INV-2024-00000151",
+                            "max": "INV-2024-00000200",
+                            "count": 50,
+                            "other": 0
+                        },
+                        {
+                            "min": null,
+                            "max": null,
+                            "count": 0,
+                            "other": 0
+                        }
+                    ]
+                },
+                "3": {
+                    "sorted_asc": false,
+                    "sorted_desc": false,
+                    "blocks": [
+                        {
+                            "min": "alpha-0",
+                            "max": "tag",
+                            "count": 50,
+                            "other": 1
+                        },
+                        {
+                            "min": "alpha-0",
+                            "max": "echo-6",
+                            "count": 49,
+                            "other": 1
+                        },
+                        {
+                            "min": "alpha-0",
+                            "max": "echo-6",
+                            "count": 49,
+                            "other": 1
+                        },
+                        {
+                            "min": "alpha-0",
+                            "max": "echo-6",
+                            "count": 48,
+                            "other": 2
+                        },
+                        {
+                            "min": null,
+                            "max": null,
+                            "count": 0,
+                            "other": 0
+                        }
+                    ]
+                }
+            }
+        }
+    ]
+}

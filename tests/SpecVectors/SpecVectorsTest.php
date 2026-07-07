@@ -31,6 +31,7 @@ class SpecVectorsTest extends TestCase
             'multi-sheet + stats' => ['vector-03-multisheet'],
             'sorted + unsorted stats' => ['vector-04-sorted'],
             'sketches (TDIG + CHLL)' => ['vector-05-sketches'],
+            'string zone maps (STRZ)' => ['vector-06-string-zones'],
         ];
     }
 

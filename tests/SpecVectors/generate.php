@@ -91,7 +91,14 @@ function generateVector(string $name, callable $write): void
                 'distinct' => $index->columnHll($entry, $col)?->count(),
             ];
         }
-        $sheets[] = [
+        // String zone maps (STRZ). Added only when present so the pre-STRZ
+        // vectors' goldens stay byte-for-byte unchanged.
+        $stringZones = [];
+        foreach ($index->stringStatsColumns($entry) as $col) {
+            $stringZones[(string) $col] = $index->columnStringStats($entry, $col);
+        }
+
+        $sheet = [
             'entry' => $entry,
             'total_rows' => $index->totalRows($entry),
             'sheet_crc32' => $index->sheetCrc32($entry),
@@ -100,6 +107,10 @@ function generateVector(string $name, callable $write): void
             'column_stats' => $columnStats === [] ? new stdClass() : $columnStats,
             'column_sketches' => $columnSketches === [] ? new stdClass() : $columnSketches,
         ];
+        if ($stringZones !== []) {
+            $sheet['string_zones'] = $stringZones;
+        }
+        $sheets[] = $sheet;
     }
 
     $golden = [
@@ -192,6 +203,24 @@ generateVector('vector-05-sketches', function (SinkableXlsxWriter $w): void {
     for ($i = 1; $i <= 300; $i++) {
         $score = $i % 25 === 0 ? 'n/a' : (($i * 7) % 100) + 0.25;
         $w->writeRow([$i, $score, $cities[$i % 10].'-'.($i % 30)]);
+    }
+    $w->finishFile();
+});
+
+// Vector 6 — STRZ string zone maps. col 2 is a sorted invoice number with
+// a long shared prefix (exercises deferred separator truncation); col 3 is
+// a shuffled tag (unsorted string, weaker pruning); an empty cell every
+// 40th row exercises the null/other class. sync every 50 -> multiple blocks.
+generateVector('vector-06-string-zones', function (SinkableXlsxWriter $w): void {
+    $w->withRandomAccessIndex(every: 50);
+    $w->withStringStats([2, 3]);
+    $w->setBufferFlushInterval(50);
+    $w->startFile(['id', 'invoice', 'tag']);
+    $tags = ['alpha', 'bravo', 'charlie', 'delta', 'echo'];
+    for ($i = 1; $i <= 200; $i++) {
+        $invoice = sprintf('INV-2024-%08d', $i);
+        $tag = $i % 40 === 0 ? '' : $tags[$i % 5].'-'.($i % 7);
+        $w->writeRow([$i, $invoice, $tag]);
     }
     $w->finishFile();
 });

@@ -20,7 +20,7 @@ OPTIONAL in this document are to be interpreted as described in
 
 | | |
 |---|---|
-| Document version | **1.3.0** |
+| Document version | **1.4.0** |
 | Format version described | KXSI binary version **2** (the `version` header byte) |
 | Reference implementation | `kolay/xlsx-stream` ≥ 3.2.0 (PHP) — writer + reader |
 | Conformance suite | `tests/SpecVectors/` in the reference repository (§8) |
@@ -475,7 +475,71 @@ The reference writer emits both sections whenever
 optional for other writers (a quantile-only or distinct-only producer
 is conforming).
 
-### 4.5 Reserved tags
+### 4.5 Registered: `STRZ` — per-block lexicographic string zone maps
+
+The string analogue of `STAT` (§4.1): per-block `[min, max]` string
+prefixes for chosen columns, enabling block pruning for string range /
+prefix predicates and near-O(1) string point lookup. Same block model and
+the same `block_count == sync_count + 1` invariant as `STAT`.
+
+**Collation is NORMATIVE and locale-independent.** All comparison is
+unsigned byte-wise, which equals Unicode code-point order (UTF-8 preserves
+it). It is NOT a locale collation — e.g. Turkish İ/ı or ß-folding are out
+of scope (human-text range scans get a README caveat; the target case —
+invoice-no / SKU / e-mail equality — is exact).
+
+**Bounds are truncated prefixes, both sound.** `min` is truncated DOWN (a
+byte prefix is ≤ the value); `max` is truncated UP — the smallest string ≥
+every value sharing the stored prefix: increment the rightmost non-0xFF
+byte and drop the tail; an all-0xFF prefix keeps the value whole. Thus
+`min` ≤ every value ≤ `max`, so pruning never drops a match. A truncated
+`max` may be advanced past a byte boundary and be invalid UTF-8; that is
+fine — it is only a comparison bound and is never decoded.
+
+**Truncation length is chosen per column at `finishFile`, not per row**
+(deferred shortest-separator, cf. Bayer–Unterauer 1977). The writer keeps
+each block's full `min`/`max` capped to a bound (reference 64 B), then
+picks one length per column: one byte past the deepest divergence between
+sorted-adjacent block boundaries. This restores pruning on a common-prefix
+corpus (e.g. `INV-2024-…`) that a fixed truncation would collapse to one
+indistinguishable range, and is robust to a lone off-prefix boundary (e.g.
+a differently-cased header folded into block 0). When two boundaries are
+identical no length separates them — the cap bounds the cost and pruning
+honestly weakens at that one edge.
+
+**Payload**, repeated per sheet in core-body order:
+
+| Size | Field |
+|---|---|
+| 2 | `tracked_column_count` — uint16 |
+
+then per tracked column:
+
+| Size | Field |
+|---|---|
+| 2 | `column` — uint16, **1-based** |
+| 1 | `flags` — bit0 sorted ascending, bit1 sorted descending (lexicographic, data rows only); other bits reserved, MUST be 0 |
+| 4 | `block_count` — uint32, MUST be `sync_count + 1` |
+
+then per block:
+
+| Size | Field |
+|---|---|
+| 2 | `min_len` — uint16 |
+| `min_len` | `min` — truncated minimum prefix bytes |
+| 2 | `max_len` — uint16 |
+| `max_len` | `max` — truncated maximum prefix bytes |
+| 4 | `count` — uint32, string values folded into `[min, max]` |
+| 4 | `other` — uint32, nulls + empty strings in the block |
+
+A `count == 0` block carries empty `min`/`max` (length 0): the empty
+string is never a tracked value, so empty bounds unambiguously mean "no
+string value in this block", and readers MUST treat them as absent (the
+block matches no string predicate). The `STAT` laws (§4.1) apply
+identically — stats widen never narrow, and a lexicographically-matchable
+header string folds into block 0.
+
+### 4.6 Reserved tags
 
 The following tags are reserved; their payloads are deliberately
 unspecified in this document version. Writers MUST NOT emit them with
@@ -494,7 +558,6 @@ simply skip them, as with any unknown tag.
 | `TRGM` | Per-block trigram filters over opted-in text columns — substring-search pruning. |
 | `VHIS` | Version-history chain for appendable files (per-append tail snapshot enabling in-file time travel). |
 | `CSTR` | Columnar shadow stripes: raw numeric arrays for selected columns, block-aligned with `STAT`. |
-| `STRZ` | Per-block lexicographic **string** zone maps (truncated min/max prefixes) for string range / prefix pruning and string `findRow` — the string analogue of `STAT`. |
 | `TDGB` | Per-**superblock** t-digests for range- and group-scoped approximate quantiles (`quantile(col, q, from, to)`, `groupQuantile`). Reuses the `TDIG` sketch payload (§4.3) per superblock. |
 | `TOPK` | Per-column mergeable heavy-hitters sketch (SpaceSaving / Misra-Gries) — top-K values with counts, error bounded by `N/k`, plus a `saturated` bit (see commitments) that upgrades to an *exact* categorical distribution when column cardinality ≤ k. |
 | `CORR` | Per-column-pair co-moment accumulators (five per pair: n, Σx, Σy, Σxy, Σx², Σy²) for exact Pearson correlation from the sidecar alone. |
@@ -504,23 +567,9 @@ simply skip them, as with any unknown tag.
 **v3.4 design commitments (recorded before implementation; full byte
 layouts register per feature, each with a byte-pinned vector, exactly as
 `SCRC`/`TDIG`/`CHLL` did).** These fix the decisions so the format is
-committed ahead of code:
+committed ahead of code (`STRZ` has since graduated to a registered
+section, §4.5):
 
-- **`STRZ` collation is NORMATIVE and locale-independent:** comparison is
-  unsigned byte-wise over UTF-8, which equals Unicode code-point order
-  (UTF-8 preserves it). It is **not** a locale collation — e.g. Turkish
-  İ/ı or ß-folding are out of scope; human-text range scans get a README
-  caveat, while the target case (invoice-no / SKU / e-mail equality) is
-  exact. A truncated `max` prefix may be advanced past a byte boundary
-  and thus be invalid UTF-8; that is fine — it is only a comparison
-  bound and is never decoded.
-- **`STRZ` truncation is chosen at `finishFile`, not per row (deferred
-  shortest-separator, Bayer–Unterauer 1977):** the writer keeps full
-  block min/max (bounded cap, e.g. 64 B) in memory and picks, per column,
-  the shortest prefix that still separates adjacent block boundaries — so
-  a common-prefix corpus (e.g. `INV-2024-…`) still prunes instead of
-  collapsing to one indistinguishable range. The `STRZ` payload therefore
-  carries a variable, per-column truncation length.
 - **`TDGB` superblock size follows the √B rule:** `s = clamp(⌈√B⌉, 4, 32)`
   for `B` blocks, balancing sidecar cost (∝ B/s) against edge-scan cost
   (∝ s). A hierarchical / segment-tree digest is rejected (≈1.33·B
@@ -781,6 +830,7 @@ The vectors:
 | `vector-03-multisheet` | 2 sheets with different sync cadences — per-sheet record alignment in `STAT` and `SCRC` |
 | `vector-04-sorted` | Sortedness flags: one ascending, one descending, one unsorted numeric column |
 | `vector-05-sketches` | `TDIG` + `CHLL` on one mixed numeric column and one text column, no `STAT` (sections are orthogonal); golden pins quantile and distinct estimates computed from the committed sketch bytes |
+| `vector-06-string-zones` | `STRZ` on a sorted common-prefix column (exercises deferred separator truncation) and a shuffled tag column with empty cells (`other` class); golden pins the truncated per-block `[min, max]` |
 
 A conforming **reader** must, for each vector: decode
 `<name>.sidecar.hex` (or extract the part from the `.xlsx`) and
