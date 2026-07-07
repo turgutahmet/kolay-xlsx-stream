@@ -570,10 +570,25 @@ layouts register per feature, each with a byte-pinned vector, exactly as
 committed ahead of code (`STRZ` has since graduated to a registered
 section, §4.5):
 
-- **`TDGB` superblock size follows the √B rule:** `s = clamp(⌈√B⌉, 4, 32)`
-  for `B` blocks, balancing sidecar cost (∝ B/s) against edge-scan cost
-  (∝ s). A hierarchical / segment-tree digest is rejected (≈1.33·B
-  digests — Pareto-inferior at spreadsheet scale).
+- **`TDGB` superblocks are defined in ROW space, not block space**
+  (revised 2026-07-07; the original 1.3.0 note said `s = ⌈√B⌉` over `B`
+  *blocks* — the √-balance analysis was right in spirit but the unit was
+  wrong: what a range query scans is rows/bytes, and block count `B` is
+  user-controlled via `sync_period`, so a block-space rule lets live
+  writer memory grow without bound). A superblock spans a fixed row width
+  `S` (reference `S = 16384`), snapping its end to the FIRST sync point
+  after `S` rows accumulate — the same cadence-snap pattern the index
+  itself uses; when `sync_period > S` a superblock naturally degrades to
+  one block. Because a sheet is capped at 1,048,575 rows, this bounds
+  superblocks to ≤ 64 per sheet regardless of `B` — so the writer holds
+  ≤ 64 digests/column (≈77 KB) and builds each in a SINGLE pass from its
+  own value stream with zero write-time merges (merging happens only at
+  query time, over the range's fully-covered superblocks). The `TDGB`
+  payload carries each superblock's `end_row` (reader reads the
+  boundaries; it does not recompute a derivation rule). A hierarchical /
+  segment-tree digest is rejected (≈1.33·B digests, Pareto-inferior; and
+  repeated write-time merges would need their own merge-depth accuracy
+  gate, which the single-pass row-space build avoids entirely).
 - **`TOPK` mergeability is by construction** (Agarwal–Cormode et al.,
   *Mergeable Summaries*, 2012), so it composes across stitched / shard
   files like `TDIG`/`CHLL`. Reference default `k = 64`.
