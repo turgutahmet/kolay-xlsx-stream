@@ -804,13 +804,28 @@ class StreamingXlsxReader
      * decide whether an exact scan is worth it. Also null for a sketch
      * that saw no numeric values (e.g. a text column).
      */
-    public function quantile(int|string $column, float $q): ?float
+    public function quantile(int|string $column, float $q, ?int $from = null, ?int $to = null): ?float
     {
         if (\is_string($column)) {
             $column = $this->resolveColumnName($column) + 1;
         }
         if ($q < 0.0 || $q > 1.0) {
             throw new \InvalidArgumentException("quantile must be within [0, 1]; got {$q}");
+        }
+
+        // Range form: quantile of a sheet-row span, answered from the
+        // TDGB per-superblock digests. Single-sheet — the span is a
+        // current-sheet row range, not a logical-table one (chains index
+        // superblocks per member, and sheet-row coordinates would be
+        // ambiguous across members).
+        if ($from !== null || $to !== null) {
+            $from ??= 1;
+            $to ??= PHP_INT_MAX;
+            if ($from < 1 || $from > $to) {
+                throw new \InvalidArgumentException("quantile range must satisfy 1 <= from <= to; got from={$from}, to={$to}");
+            }
+
+            return $this->rangeQuantileDigest($this->currentEntry, $column, $from, $to)?->quantile($q);
         }
 
         $chain = $this->chain();
@@ -821,6 +836,144 @@ class StreamingXlsxReader
         $digest = $this->loadRandomAccessIndex()?->columnDigest($this->currentEntry, $column);
 
         return $digest?->quantile($q);
+    }
+
+    /**
+     * Build the t-digest for $column over the inclusive sheet-row span
+     * [$from, $to] by merging every TDGB superblock whose span lies wholly
+     * inside the range and scanning only the partial rows at the two
+     * edges. Fully-covered superblocks form one contiguous run (spans
+     * partition the sheet in order), so the uncovered remainder is at most
+     * two bounded row ranges — the √B edge cost the row-space layout was
+     * chosen for. A column without a TDGB section degrades to an honest
+     * scan of the whole span (announced via onFullScan). Returns null when
+     * the span holds no numeric values.
+     */
+    private function rangeQuantileDigest(string $entry, int $column, int $from, int $to): ?TDigest
+    {
+        $superblocks = $this->loadRandomAccessIndex()?->rangeQuantileSuperblocks($entry, $column);
+
+        if ($superblocks === null) {
+            $this->fireFullScan('quantile', $column, 'column-not-range-indexed', $entry);
+
+            return $this->scanRangeDigest($entry, $column, $from, $to, null);
+        }
+
+        // A superblock's digest holds the numeric values of the data rows
+        // (prevEnd, end_row]; the header (sheet row 1) carries no numeric
+        // value, so superblock 0's data starts at row 2. Clamp the query's
+        // lower bound to the first data row accordingly — this keeps a
+        // whole-column range (from = 1) from spuriously "edge-scanning"
+        // the header row.
+        $from = max($from, 2);
+
+        // Merge the superblocks whose data span (spanStart, end_row] sits
+        // entirely within [from, to]; track the covered region's row
+        // bounds so only the uncovered edges are scanned. The spans
+        // partition the data rows in order, so the covered set is one
+        // contiguous run and the remainder is at most two edge ranges.
+        $merged = null;
+        $coveredFirst = null;
+        $coveredLast = null;
+        $prevEnd = 1; // header boundary — data rows begin at 2
+        foreach ($superblocks as $sb) {
+            $spanStart = $prevEnd + 1;
+            $spanEnd = $sb['end_row'];
+            if ($from <= $spanStart && $to >= $spanEnd) {
+                if ($merged === null) {
+                    $merged = clone $sb['digest'];
+                    $coveredFirst = $spanStart;
+                } else {
+                    $merged->merge($sb['digest']);
+                }
+                $coveredLast = $spanEnd;
+            }
+            $prevEnd = $spanEnd;
+        }
+
+        if ($coveredFirst === null) {
+            // The span is narrower than any single superblock — scan it
+            // whole. Still bounded (< one superblock of rows).
+            return $this->scanRangeDigest($entry, $column, $from, $to, null);
+        }
+
+        // Left edge [from, coveredFirst - 1] and right edge
+        // [coveredLast + 1, to] — the rows the covered run does not span.
+        if ($from <= $coveredFirst - 1) {
+            $merged = $this->scanRangeDigest($entry, $column, $from, $coveredFirst - 1, $merged);
+        }
+        if ($to >= $coveredLast + 1) {
+            $merged = $this->scanRangeDigest($entry, $column, $coveredLast + 1, $to, $merged);
+        }
+
+        return $merged;
+    }
+
+    /**
+     * Scan the inclusive sheet-row span [$from, $to] of $entry, folding
+     * each numeric cell of $column (statNumericCell interpretation — the
+     * same the writer's digests were built from) into $into, allocating a
+     * fresh digest on first value. Only the blocks that overlap the span
+     * are read, as one merged run. Returns $into unchanged (possibly null)
+     * when the span holds no numeric values.
+     */
+    private function scanRangeDigest(string $entry, int $column, int $from, int $to, ?TDigest $into): ?TDigest
+    {
+        $index = $this->loadRandomAccessIndex();
+        $ranges = $index !== null ? $this->blockRanges($index, $entry) : null;
+
+        if ($ranges === null || $ranges === []) {
+            foreach ($this->openSheetReader([$column - 1], $entry)->rowsFromOffset(null, 1) as $rn => $row) {
+                if ($rn < $from) {
+                    continue;
+                }
+                if ($rn > $to) {
+                    break;
+                }
+                $v = $this->statNumericCell($row[$column - 1] ?? null);
+                if ($v !== null) {
+                    ($into ??= new TDigest())->add($v);
+                }
+            }
+
+            return $into;
+        }
+
+        // First block whose rows reach $from; last block that starts at
+        // or before $to. The span is contiguous, so this is one run.
+        $firstBlock = 0;
+        foreach ($ranges as $i => $r) {
+            if ($r['last_row'] >= $from) {
+                $firstBlock = $i;
+                break;
+            }
+        }
+        $lastBlock = $firstBlock;
+        for ($i = count($ranges) - 1; $i >= $firstBlock; $i--) {
+            if ($ranges[$i]['first_row'] <= $to) {
+                $lastBlock = $i;
+                break;
+            }
+        }
+
+        $start = $ranges[$firstBlock];
+        $stopRow = min($to, $ranges[$lastBlock]['last_row']);
+        $compLength = $this->runCompLength($ranges, $firstBlock, $lastBlock);
+
+        foreach ($this->openSheetReader([$column - 1], $entry)->rowsFromOffset($start['comp_offset'], $start['start_row_at_offset'] ?? 1, $start['first_row'], $compLength) as $rn => $row) {
+            if ($rn < $from) {
+                continue;
+            }
+            if ($rn > $stopRow) {
+                break;
+            }
+            $v = $this->statNumericCell($row[$column - 1] ?? null);
+            if ($v !== null) {
+                ($into ??= new TDigest())->add($v);
+            }
+        }
+
+        return $into;
     }
 
     /**
@@ -2124,6 +2277,224 @@ class StreamingXlsxReader
         }
 
         return array_values($groups);
+    }
+
+    /**
+     * Percentile GROUP BY: the approximate $q-quantile of $aggregate
+     * within each bucketed group of $groupBy — the composition of the two
+     * row-space primitives, not a stored per-group sketch. When the
+     * sidecar tracks the group column, saw it sorted, and carries TDGB
+     * range-quantiles for the aggregate (single sheet), each group's
+     * contiguous sheet-row span is resolved from the zone maps — whole
+     * group-pure blocks for free, boundary blocks scanned — and its
+     * quantile answered by the range path over that span: large groups
+     * merge whole superblocks, small groups scan their few rows. Any
+     * missing precondition (unsorted or untracked group column, aggregate
+     * without TDGB, or an auto-split chain) degrades to a single honest
+     * scan that routes each row into a per-group t-digest, announced via
+     * onFullScan — identical results, no pushdown.
+     *
+     * Grouping semantics match groupStats(): 1-based columns, a monotone
+     * non-decreasing $bucket (identity by default), the header row
+     * excluded, rows with a non-numeric group cell dropped, and a group
+     * whose aggregate cells are all non-numeric present with count 0 and a
+     * null quantile. Groups are returned in first-encounter sheet order.
+     *
+     * @param  callable(float): (int|float)  $bucket
+     * @return list<array{group: int|float, count: int, quantile: float|null}>
+     */
+    public function groupQuantile(int|string $groupBy, int|string $aggregate, float $q, ?callable $bucket = null): array
+    {
+        if (\is_string($groupBy)) {
+            $groupBy = $this->resolveColumnName($groupBy) + 1;
+        }
+        if (\is_string($aggregate)) {
+            $aggregate = $this->resolveColumnName($aggregate) + 1;
+        }
+        if ($groupBy < 1 || $aggregate < 1) {
+            throw new \InvalidArgumentException(
+                "groupQuantile() columns are 1-based; got groupBy={$groupBy}, aggregate={$aggregate}"
+            );
+        }
+        if ($q < 0.0 || $q > 1.0) {
+            throw new \InvalidArgumentException("quantile must be within [0, 1]; got {$q}");
+        }
+        $bucket ??= static fn (float $v): float => $v;
+
+        $chain = $this->chain();
+        $index = $this->loadRandomAccessIndex();
+        $entry = $this->currentEntry;
+        $groupCol = $chain === null ? $index?->columnStats($entry, $groupBy) : null;
+        $sorted = $groupCol !== null && ($groupCol['sorted_asc'] || $groupCol['sorted_desc']);
+        $aggTracked = $chain === null && $index !== null
+            && \in_array($aggregate, $index->rangeQuantileColumns($entry), true);
+
+        // Composition (pushdown) path.
+        if ($chain === null && $index !== null && $groupCol !== null && $sorted && $aggTracked) {
+            $out = [];
+            foreach ($this->groupRowSpans($entry, $groupBy, $bucket, $index, $groupCol) as $span) {
+                $digest = $this->rangeQuantileDigest($entry, $aggregate, $span['first'], $span['last']);
+                $out[] = [
+                    'group' => $span['group'],
+                    'count' => $digest?->count() ?? 0,
+                    'quantile' => $digest?->quantile($q),
+                ];
+            }
+
+            return $out;
+        }
+
+        // Honest-scan fallback (also the auto-split chain path): one pass
+        // per member, routing each row into a transient per-group digest.
+        $reason = match (true) {
+            $chain !== null => 'auto-split-chain',
+            $index === null || $groupCol === null => 'column-not-indexed',
+            ! $sorted => 'groupby-not-sorted',
+            default => 'aggregate-not-range-indexed',
+        };
+
+        /** @var array<string, array{group: int|float, digest: TDigest|null}> $groups */
+        $groups = [];
+        foreach ($chain ?? [['entry' => $entry]] as $m) {
+            $this->scanGroupQuantile($m['entry'], $groupBy, $aggregate, $bucket, $reason, $groups);
+        }
+
+        $out = [];
+        foreach ($groups as $gp) {
+            $out[] = [
+                'group' => $gp['group'],
+                'count' => $gp['digest']?->count() ?? 0,
+                'quantile' => $gp['digest']?->quantile($q),
+            ];
+        }
+
+        return $out;
+    }
+
+    /**
+     * Resolve each group's contiguous sheet-row span for the pushdown
+     * groupQuantile() path, in first-encounter order. Reuses groupStats()'s
+     * block classification: a group-pure block contributes its whole
+     * [first_row, last_row] to its group for free, while boundary blocks
+     * (and block 0, which carries the header) are scanned so the exact
+     * split rows between groups are found. Because the group column is
+     * sorted, a group's rows are contiguous, so min(first_row)/max(last_row)
+     * over its blocks and scanned rows is exactly its span.
+     *
+     * @param  callable(float): (int|float)  $bucket
+     * @param  array{blocks: list<array{min: float, max: float, count: int, other: int}>, sorted_asc: bool, sorted_desc: bool}  $groupCol
+     * @return list<array{group: int|float, first: int, last: int}>
+     */
+    private function groupRowSpans(string $entry, int $groupBy, callable $bucket, RandomAccessIndex $index, array $groupCol): array
+    {
+        $ranges = $this->blockRanges($index, $entry);
+
+        /** @var array<string, array{group: int|float, first: int, last: int}> $spans */
+        $spans = [];
+        $record = static function (int|float $g, int $firstRow, int $lastRow) use (&$spans): void {
+            $key = (string) $g;
+            if (! isset($spans[$key])) {
+                $spans[$key] = ['group' => $g, 'first' => $firstRow, 'last' => $lastRow];
+
+                return;
+            }
+            $spans[$key]['first'] = min($spans[$key]['first'], $firstRow);
+            $spans[$key]['last'] = max($spans[$key]['last'], $lastRow);
+        };
+
+        // Plan pass — identical classification to foldGroupStatsFor().
+        /** @var list<array{stats: array{0: int|float, 1: int}}|array{scan: array{0: int, 1: int}}> $plan */
+        $plan = [];
+        $scanRun = null;
+        foreach ($groupCol['blocks'] as $i => $block) {
+            if ($block['count'] === 0) {
+                if ($scanRun !== null) {
+                    $plan[] = ['scan' => $scanRun];
+                    $scanRun = null;
+                }
+
+                continue;
+            }
+            $g = $bucket($block['min']);
+            if ($i !== 0 && $block['other'] === 0 && $g == $bucket($block['max'])) {
+                if ($scanRun !== null) {
+                    $plan[] = ['scan' => $scanRun];
+                    $scanRun = null;
+                }
+                $plan[] = ['stats' => [$g, $i]];
+
+                continue;
+            }
+            $scanRun === null ? $scanRun = [$i, $i] : $scanRun[1] = $i;
+        }
+        if ($scanRun !== null) {
+            $plan[] = ['scan' => $scanRun];
+        }
+
+        // Execute pass.
+        foreach ($plan as $step) {
+            if (isset($step['stats'])) {
+                [$g, $i] = $step['stats'];
+                $record($g, $ranges[$i]['first_row'], $ranges[$i]['last_row']);
+
+                continue;
+            }
+
+            [$first, $last] = $step['scan'];
+            $start = $ranges[$first];
+            $stopRow = $ranges[$last]['last_row'];
+            $compLength = $this->runCompLength($ranges, $first, $last);
+            foreach ($this->openSheetReader([$groupBy - 1], $entry)->rowsFromOffset($start['comp_offset'], $start['start_row_at_offset'] ?? 1, $start['first_row'], $compLength) as $rn => $row) {
+                if ($rn > $stopRow) {
+                    break;
+                }
+                if ($rn === 1) {
+                    continue;
+                }
+                $gv = $this->statNumericCell($row[$groupBy - 1] ?? null);
+                if ($gv === null) {
+                    continue;
+                }
+                $record($bucket($gv), $rn, $rn);
+            }
+        }
+
+        return array_values($spans);
+    }
+
+    /**
+     * Honest-scan engine behind groupQuantile()'s fallback: one inflate
+     * pass over $entry, folding each data row's aggregate value into a
+     * transient per-group t-digest kept in $groups. A group is registered
+     * the moment a numeric group cell is seen, so groups whose aggregate
+     * cells are all non-numeric still surface (with a null digest → count
+     * 0, null quantile). Fires onFullScan once for the sheet, mirroring
+     * groupStats()'s degradation.
+     *
+     * @param  callable(float): (int|float)  $bucket
+     * @param  array<string, array{group: int|float, digest: TDigest|null}>  $groups
+     */
+    private function scanGroupQuantile(string $entry, int $groupBy, int $aggregate, callable $bucket, string $reason, array &$groups): void
+    {
+        $this->fireFullScan('groupQuantile', $groupBy, $reason, $entry);
+        foreach ($this->openSheetReader([$groupBy - 1, $aggregate - 1], $entry)->rowsFromOffset(null, 1) as $rn => $row) {
+            if ($rn === 1) {
+                continue;
+            }
+            $gv = $this->statNumericCell($row[$groupBy - 1] ?? null);
+            if ($gv === null) {
+                continue;
+            }
+            $g = $bucket($gv);
+            $key = (string) $g;
+            if (! isset($groups[$key])) {
+                $groups[$key] = ['group' => $g, 'digest' => null];
+            }
+            $av = $this->statNumericCell($row[$aggregate - 1] ?? null);
+            if ($av !== null) {
+                ($groups[$key]['digest'] ??= new TDigest())->add($av);
+            }
+        }
     }
 
     /**
