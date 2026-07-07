@@ -133,6 +133,8 @@ class RandomAccessIndex
 
     public const TAG_STRING_ZONE = 'STRZ';
 
+    public const TAG_RANGE_QUANTILE = 'TDGB';
+
     public const SORTED_ASC = 0x01;
     public const SORTED_DESC = 0x02;
 
@@ -161,7 +163,7 @@ class RandomAccessIndex
      *     1-based column => serialized HyperLogLog payload. Pass [] to omit
      *     the CHLL section entirely.
      */
-    public static function encode(int $syncPeriod, array $sheets, array $columnStats = [], array $syncPointCrcs = [], array $columnDigests = [], array $columnHlls = [], array $columnStringStats = []): string
+    public static function encode(int $syncPeriod, array $sheets, array $columnStats = [], array $syncPointCrcs = [], array $columnDigests = [], array $columnHlls = [], array $columnStringStats = [], array $columnRangeQuantiles = []): string
     {
         $body = '';
         foreach ($sheets as $sheet) {
@@ -258,6 +260,27 @@ class RandomAccessIndex
                 }
             }
             $body .= self::TAG_STRING_ZONE.pack('V', strlen($strz)).$strz;
+        }
+
+        // TDGB — per-superblock t-digests (row-space). Per sheet in
+        // core-body order: tracked column count, then per column its
+        // superblock count and, per superblock, the last row it covers plus
+        // a length-prefixed TDIG payload. Row spans are read (end_row), not
+        // recomputed.
+        if ($columnRangeQuantiles !== []) {
+            $tdgb = '';
+            foreach ($sheets as $sheet) {
+                $cols = $columnRangeQuantiles[$sheet['entry']] ?? [];
+                ksort($cols);
+                $tdgb .= pack('v', count($cols));
+                foreach ($cols as $col => $superblocks) {
+                    $tdgb .= pack('vV', $col, count($superblocks));
+                    foreach ($superblocks as $sb) {
+                        $tdgb .= pack('VV', $sb['end_row'], strlen($sb['payload'])).$sb['payload'];
+                    }
+                }
+            }
+            $body .= self::TAG_RANGE_QUANTILE.pack('V', strlen($tdgb)).$tdgb;
         }
 
         $header = self::MAGIC;

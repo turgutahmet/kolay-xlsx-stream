@@ -42,6 +42,8 @@ class RandomAccessIndex
 
     public const TAG_STRING_ZONE = 'STRZ';
 
+    public const TAG_RANGE_QUANTILE = 'TDGB';
+
     public const SORTED_ASC = 0x01;
     public const SORTED_DESC = 0x02;
 
@@ -122,7 +124,16 @@ class RandomAccessIndex
      */
     private array $columnStringStatsByEntry = [];
 
-    private function __construct(int $syncPeriod, array $totals, array $crcs, array $syncs, array $columnStats = [], array $syncPointCrcs = [], array $columnDigestPayloads = [], array $columnHllPayloads = [], array $columnStringStats = [])
+    /**
+     * Per-superblock t-digest payloads from the "TDGB" TLV — one list per
+     * (entry, column), each entry `{end_row, payload}`. Deserialized lazily
+     * by rangeQuantileSuperblocks().
+     *
+     * @var array<string, array<int, list<array{end_row: int, payload: string}>>>
+     */
+    private array $columnRangeQuantilesByEntry = [];
+
+    private function __construct(int $syncPeriod, array $totals, array $crcs, array $syncs, array $columnStats = [], array $syncPointCrcs = [], array $columnDigestPayloads = [], array $columnHllPayloads = [], array $columnStringStats = [], array $columnRangeQuantiles = [])
     {
         $this->syncPeriod = $syncPeriod;
         $this->totalRowsByEntry = $totals;
@@ -133,6 +144,7 @@ class RandomAccessIndex
         $this->columnDigestPayloads = $columnDigestPayloads;
         $this->columnHllPayloads = $columnHllPayloads;
         $this->columnStringStatsByEntry = $columnStringStats;
+        $this->columnRangeQuantilesByEntry = $columnRangeQuantiles;
     }
 
     public static function decode(string $payload): self
@@ -318,6 +330,7 @@ class RandomAccessIndex
         $columnDigestPayloads = [];
         $columnHllPayloads = [];
         $columnStringStats = [];
+        $columnRangeQuantiles = [];
         $entryOrder = array_keys($totals);
         while ($cursor + 8 <= $bodyLen) {
             $tag = substr($body, $cursor, 4);
@@ -360,12 +373,17 @@ class RandomAccessIndex
                     $entryOrder,
                     $syncs
                 );
+            } elseif ($tag === self::TAG_RANGE_QUANTILE) {
+                $columnRangeQuantiles = self::decodeTdgbSection(
+                    substr($body, $cursor, $length),
+                    $entryOrder
+                );
             }
 
             $cursor += $length;
         }
 
-        return new self($syncPeriod, $totals, $crcs, $syncs, $columnStats, $syncPointCrcs, $columnDigestPayloads, $columnHllPayloads, $columnStringStats);
+        return new self($syncPeriod, $totals, $crcs, $syncs, $columnStats, $syncPointCrcs, $columnDigestPayloads, $columnHllPayloads, $columnStringStats, $columnRangeQuantiles);
     }
 
     /**
@@ -575,6 +593,61 @@ class RandomAccessIndex
     }
 
     /**
+     * Parse the "TDGB" TLV payload — per-superblock t-digests. Per sheet
+     * in core-body order: tracked column count; per column: its superblock
+     * count and, per superblock, `end_row` (uint32) + a length-prefixed
+     * TDIG payload (kept opaque, deserialized lazily by the accessor).
+     *
+     * @param  list<string>  $entryOrder  sheet entries in core-body order
+     * @return array<string, array<int, list<array{end_row: int, payload: string}>>>
+     */
+    private static function decodeTdgbSection(string $data, array $entryOrder): array
+    {
+        $result = [];
+        $cursor = 0;
+        $len = strlen($data);
+
+        foreach ($entryOrder as $entry) {
+            if ($cursor + 2 > $len) {
+                throw XlsxReadException::corruptCentralDirectory('truncated TDGB section sheet header');
+            }
+            $colCount = unpack('v', substr($data, $cursor, 2))[1];
+            $cursor += 2;
+
+            for ($c = 0; $c < $colCount; $c++) {
+                if ($cursor + 6 > $len) {
+                    throw XlsxReadException::corruptCentralDirectory('truncated TDGB column header');
+                }
+                $col = unpack('v', substr($data, $cursor, 2))[1];
+                $sbCount = unpack('V', substr($data, $cursor + 2, 4))[1];
+                $cursor += 6;
+
+                if ($col < 1) {
+                    throw XlsxReadException::corruptCentralDirectory('TDGB section column index must be 1-based');
+                }
+
+                $superblocks = [];
+                for ($s = 0; $s < $sbCount; $s++) {
+                    if ($cursor + 8 > $len) {
+                        throw XlsxReadException::corruptCentralDirectory("truncated TDGB superblock header for sheet '{$entry}' column {$col}");
+                    }
+                    $head = unpack('Vend/Vplen', substr($data, $cursor, 8));
+                    $cursor += 8;
+                    if ($cursor + $head['plen'] > $len) {
+                        throw XlsxReadException::corruptCentralDirectory("truncated TDGB superblock payload for sheet '{$entry}' column {$col}");
+                    }
+                    $superblocks[] = ['end_row' => $head['end'], 'payload' => substr($data, $cursor, $head['plen'])];
+                    $cursor += $head['plen'];
+                }
+
+                $result[$entry][$col] = $superblocks;
+            }
+        }
+
+        return $result;
+    }
+
+    /**
      * Parse a "TDIG" or "CHLL" TLV payload — both share one frame:
      * per-sheet records in core-body order, each listing (column,
      * payload_len, payload) triples. Only the framing is validated
@@ -686,6 +759,35 @@ class RandomAccessIndex
     public function stringStatsColumns(string $sheetEntry): array
     {
         return array_keys($this->columnStringStatsByEntry[$sheetEntry] ?? []);
+    }
+
+    /**
+     * Per-superblock t-digests for one column (KXSI "TDGB" section), or
+     * null when the sidecar carries none for that entry/column. Each entry
+     * pairs the superblock's last row (`end_row`) with its deserialized
+     * digest; a range query merges the digests whose spans fall inside the
+     * requested row range and scans the edges.
+     *
+     * @return list<array{end_row: int, digest: TDigest}>|null
+     */
+    public function rangeQuantileSuperblocks(string $sheetEntry, int $column): ?array
+    {
+        $raw = $this->columnRangeQuantilesByEntry[$sheetEntry][$column] ?? null;
+        if ($raw === null) {
+            return null;
+        }
+        $out = [];
+        foreach ($raw as $sb) {
+            $out[] = ['end_row' => $sb['end_row'], 'digest' => TDigest::deserialize($sb['payload'])];
+        }
+
+        return $out;
+    }
+
+    /** @return list<int> 1-based columns that carry range-quantile digests for the sheet */
+    public function rangeQuantileColumns(string $sheetEntry): array
+    {
+        return array_keys($this->columnRangeQuantilesByEntry[$sheetEntry] ?? []);
     }
 
     /**

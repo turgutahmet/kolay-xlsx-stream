@@ -307,6 +307,27 @@ abstract class BaseXlsxWriter
     /** @var array<string, array<int, string>> finished sheets: entry => col => serialized HyperLogLog */
     protected array $indexColumnHlls = [];
 
+    // Range/group quantiles (TDGB) — opt-in via withRangeQuantiles. One
+    // t-digest per ROW-SPACE superblock per column: a superblock spans
+    // SUPERBLOCK_ROWS rows, its end snapped to the first sync point past
+    // that width, so a sheet holds ≤64 superblocks regardless of block
+    // count and each digest is built single-pass (no write-time merges).
+
+    /** Superblock row width; end snaps to the first sync point past it. */
+    protected const SUPERBLOCK_ROWS = 16384;
+
+    /** @var list<int> 1-based columns tracked for range/group quantiles */
+    protected array $rangeQuantileColumns = [];
+
+    /** @var array<int, \Kolay\XlsxStream\Sketches\TDigest> current open superblock digest per column */
+    protected array $rangeDigestAccum = [];
+
+    /** Rows accumulated in the current (shared) open superblock. */
+    protected int $rangeSuperblockRows = 0;
+
+    /** @var array<string, array<int, list<array{end_row: int, payload: string}>>> closed superblocks: entry => col => list */
+    protected array $indexRangeSuperblocks = [];
+
     public function __construct()
     {
         $this->styles = new StyleRegistry();
@@ -648,6 +669,43 @@ abstract class BaseXlsxWriter
         $columns = array_values(array_unique($columns));
         sort($columns);
         $this->sketchColumns = $columns;
+
+        return $this;
+    }
+
+    /**
+     * Opt in to per-superblock t-digests (TDGB) for the given 1-based
+     * columns — range- and group-scoped approximate quantiles
+     * (`quantile(col, q, from, to)`, and group quantiles composed over a
+     * group's row range). Unlike withColumnSketches (one whole-sheet
+     * digest), this keeps one digest per ROW-SPACE superblock so a query
+     * can merge just the superblocks covering its range. Implies the
+     * random-access index. Numeric values only (same inclusion rule as
+     * withColumnStats). Must be called before startFile().
+     */
+    public function withRangeQuantiles(array $columns): self
+    {
+        if ($this->started) {
+            throw XlsxStreamException::alreadyStarted();
+        }
+        if ($columns === []) {
+            throw new XlsxStreamException('withRangeQuantiles() needs at least one column index.');
+        }
+        foreach ($columns as $col) {
+            if (! is_int($col) || $col < 1 || $col > self::MAX_COLUMNS) {
+                throw new XlsxStreamException(
+                    'withRangeQuantiles() expects 1-based integer column indexes; got: '.var_export($col, true)
+                );
+            }
+        }
+
+        if (! $this->randomAccessIndexEnabled) {
+            $this->withRandomAccessIndex();
+        }
+
+        $columns = array_values(array_unique($columns));
+        sort($columns);
+        $this->rangeQuantileColumns = $columns;
 
         return $this;
     }
@@ -1083,6 +1141,9 @@ abstract class BaseXlsxWriter
         if ($this->sketchColumns !== []) {
             $this->accumulateColumnSketches($row);
         }
+        if ($this->rangeQuantileColumns !== []) {
+            $this->accumulateRangeQuantiles($row);
+        }
 
         $rowXml = $this->buildRowXml($this->currentSheetRow, $row, $styleId);
 
@@ -1396,6 +1457,13 @@ abstract class BaseXlsxWriter
             $this->closeStatsBlock($entry);
         }
 
+        // Snap the superblock to this sync boundary once it has spanned at
+        // least SUPERBLOCK_ROWS rows (syncPeriod > SUPERBLOCK_ROWS ⇒ one
+        // block per superblock — the natural degenerate case).
+        if ($this->rangeQuantileColumns !== [] && $this->rangeSuperblockRows >= self::SUPERBLOCK_ROWS) {
+            $this->closeRangeSuperblock($entry, $this->currentSheetRow);
+        }
+
         $this->rowsSinceSync = 0;
         $this->rowBuffer = '';
         $this->rowBufferCount = 0;
@@ -1540,6 +1608,43 @@ abstract class BaseXlsxWriter
         if (++$this->sketchRowsBuffered >= self::SKETCH_FLUSH_ROWS) {
             $this->flushSketchBuffers();
         }
+    }
+
+    /**
+     * Fold one data row's tracked numeric values into the current open
+     * superblock digest (TDGB). One shared row counter drives the
+     * sync-snapped superblock close in flushRowBuffer.
+     */
+    protected function accumulateRangeQuantiles(array $row): void
+    {
+        if (! array_is_list($row)) {
+            $row = array_values($row);
+        }
+        foreach ($this->rangeQuantileColumns as $col) {
+            $v = $this->statNumericValue($row[$col - 1] ?? null);
+            if ($v !== null && is_finite($v)) {
+                $this->rangeDigestAccum[$col]->add($v);
+            }
+        }
+        $this->rangeSuperblockRows++;
+    }
+
+    /**
+     * Close the current open superblock at a sync point: serialize each
+     * column's digest with the superblock's last row, then reset. Called
+     * from flushRowBuffer once ≥ SUPERBLOCK_ROWS have accumulated (snap to
+     * the sync boundary), and once at sheet finalize for the remainder.
+     */
+    protected function closeRangeSuperblock(string $entry, int $endRow): void
+    {
+        foreach ($this->rangeQuantileColumns as $col) {
+            $this->indexRangeSuperblocks[$entry][$col][] = [
+                'end_row' => $endRow,
+                'payload' => $this->rangeDigestAccum[$col]->serialize(),
+            ];
+            $this->rangeDigestAccum[$col] = new TDigest();
+        }
+        $this->rangeSuperblockRows = 0;
     }
 
     /**
@@ -1870,7 +1975,8 @@ abstract class BaseXlsxWriter
             $syncPointCrcs,
             $this->indexColumnDigests,
             $this->indexColumnHlls,
-            $columnStringStats
+            $columnStringStats,
+            $this->indexRangeSuperblocks
         );
     }
 
@@ -1975,6 +2081,15 @@ abstract class BaseXlsxWriter
                 $this->sketchStrBuffer[$col] = [];
             }
             $this->sketchRowsBuffered = 0;
+        }
+
+        // Fresh sheet -> fresh open superblock digests (per-sheet, like the
+        // sketches). No header fold: quantiles estimate the data.
+        if ($this->rangeQuantileColumns !== []) {
+            foreach ($this->rangeQuantileColumns as $col) {
+                $this->rangeDigestAccum[$col] = new TDigest();
+            }
+            $this->rangeSuperblockRows = 0;
         }
 
         [$mtime, $mdate] = $this->dosTimeParts(time());
@@ -2317,6 +2432,13 @@ abstract class BaseXlsxWriter
                 $this->indexColumnDigests[$entry][$col] = $this->sketchDigestAccum[$col]->serialize();
                 $this->indexColumnHlls[$entry][$col] = $this->sketchHllAccum[$col]->serialize();
             }
+        }
+
+        // Close the final (partial) superblock — the rows since the last
+        // sync-snap. Guard on the row counter so a sheet that snapped
+        // exactly on its last sync point does not emit an empty trailer.
+        if ($this->rangeQuantileColumns !== [] && $this->rangeSuperblockRows > 0) {
+            $this->closeRangeSuperblock($sheetInfo['filename'], $this->currentSheetRow);
         }
     }
 
