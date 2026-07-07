@@ -981,7 +981,7 @@ class StreamingXlsxReader
      *
      * @return \Generator<int, array<int, mixed>>
      */
-    public function rowsWhere(int|string $column, string $op, int|float $value, int|float|null $value2 = null): \Generator
+    public function rowsWhere(int|string $column, string $op, int|float|string $value, int|float|string|null $value2 = null): \Generator
     {
         if (\is_string($column)) {
             $column = $this->resolveColumnName($column) + 1;
@@ -1509,8 +1509,16 @@ class StreamingXlsxReader
      *
      * @return \Generator<int, array<int, mixed>>
      */
-    private function matchRowsIn(string $entry, int $column, string $op, int|float $value, int|float|null $value2): \Generator
+    private function matchRowsIn(string $entry, int $column, string $op, int|float|string $value, int|float|string|null $value2): \Generator
     {
+        // A string predicate value routes to the STRZ (string zone map)
+        // path; a numeric value keeps the STAT path below.
+        if (\is_string($value)) {
+            yield from $this->matchRowsStringIn($entry, $column, $op, $value, is_string($value2) ? $value2 : null);
+
+            return;
+        }
+
         [$lo, $hi] = $this->pruneBounds($op, $value, $value2);
 
         $index = $this->loadRandomAccessIndex();
@@ -1550,6 +1558,54 @@ class StreamingXlsxReader
                     break;
                 }
                 if ($this->cellMatches($row[$column - 1] ?? null, $op, $value, $value2)) {
+                    yield $rn => $row;
+                }
+            }
+        }
+    }
+
+    /**
+     * String analogue of matchRowsIn: prune with the STRZ lexicographic
+     * zone maps, scan the surviving run(s), filter per cell with strcmp.
+     * Ops: '=', '<', '<=', '>', '>=', 'between', 'prefix'. Yields LOCAL
+     * 1-based row => raw row (casts belong to the caller).
+     *
+     * @return \Generator<int, array<int, mixed>>
+     */
+    private function matchRowsStringIn(string $entry, int $column, string $op, string $value, ?string $value2): \Generator
+    {
+        [$lo, $hi] = $this->pruneBoundsString($op, $value, $value2);
+
+        $index = $this->loadRandomAccessIndex();
+        $stats = $index?->columnStringStats($entry, $column);
+
+        if ($stats === null) {
+            $this->fireFullScan('rowsWhere', $column, 'column-not-string-indexed', $entry);
+            foreach ($this->openSheetReader([$column - 1], $entry)->rowsFromOffset(null, 1) as $rn => $row) {
+                if ($this->cellMatchesString($row[$column - 1] ?? null, $op, $value, $value2)) {
+                    yield $rn => $row;
+                }
+            }
+
+            return;
+        }
+
+        $ranges = $this->blockRanges($index, $entry);
+        $runs = $this->planRuns($this->survivingBlocksString($stats['blocks'], $lo, $hi), $ranges, $this->maxBridgeBytes());
+
+        foreach ($runs as [$firstBlock, $lastBlock]) {
+            $start = $ranges[$firstBlock];
+            $stopRow = $ranges[$lastBlock]['last_row'];
+            $compLength = $this->runCompLength($ranges, $firstBlock, $lastBlock);
+
+            foreach ($this->openSheetReader([$column - 1], $entry)->rowsFromOffset($start['comp_offset'], $start['start_row_at_offset'] ?? 1, $start['first_row'], $compLength) as $rn => $row) {
+                if ($rn < $start['first_row']) {
+                    continue;
+                }
+                if ($rn > $stopRow) {
+                    break;
+                }
+                if ($this->cellMatchesString($row[$column - 1] ?? null, $op, $value, $value2)) {
                     yield $rn => $row;
                 }
             }
@@ -1973,7 +2029,7 @@ class StreamingXlsxReader
      *
      * @return array{row: int, values: array<int, mixed>}|null
      */
-    public function findRow(int|string $column, int|float $value): ?array
+    public function findRow(int|string $column, int|float|string $value): ?array
     {
         foreach ($this->rowsWhere($column, '=', $value) as $rn => $row) {
             return ['row' => $rn, 'values' => $row];
@@ -2563,6 +2619,102 @@ class StreamingXlsxReader
             '>=' => $v >= $value,
             'between' => $v >= min($value, $value2) && $v <= max($value, $value2),
             default => false, // unreachable — pruneBounds validated $op
+        };
+    }
+
+    /**
+     * Lexicographic (STRZ) counterpart of pruneBounds. Returns the query
+     * range as `[lo, hi]` strings; a null side is unbounded (there is no
+     * −∞/+∞ string). Comparison is unsigned byte-wise (= code-point order).
+     *
+     * @return array{0: ?string, 1: ?string}
+     */
+    private function pruneBoundsString(string $op, string $value, ?string $value2): array
+    {
+        return match ($op) {
+            '=' => [$value, $value],
+            '<', '<=' => [null, $value],
+            '>', '>=' => [$value, null],
+            'prefix' => [$value, $this->stringPrefixUpper($value)],
+            'between' => $value2 === null
+                ? throw new \InvalidArgumentException("rowsWhere('between') requires a second bound")
+                : (strcmp($value, $value2) <= 0 ? [$value, $value2] : [$value2, $value]),
+            default => throw new \InvalidArgumentException(
+                "rowsWhere() string op must be one of =, <, <=, >, >=, between, prefix; got '{$op}'"
+            ),
+        };
+    }
+
+    /**
+     * Smallest string strictly greater than every string with prefix $v —
+     * the exclusive upper bound of the $v-prefix range. Increment the
+     * rightmost non-0xFF byte and drop the tail; null when $v is empty or
+     * all 0xFF (no finite upper bound, so the high side is unbounded).
+     */
+    private function stringPrefixUpper(string $v): ?string
+    {
+        for ($i = strlen($v) - 1; $i >= 0; $i--) {
+            $b = ord($v[$i]);
+            if ($b < 0xFF) {
+                return substr($v, 0, $i).chr($b + 1);
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * STRZ block survivor test for a `[lo, hi]` string range (null = that
+     * side is unbounded). A block survives when its truncated
+     * `[min, max]` overlaps `[lo, hi]`; the truncated min/max are sound
+     * (min ≤ every value, max ≥ every value), so pruning never drops a
+     * matching block. Empty blocks (count 0, null min/max) are skipped.
+     *
+     * @param  list<array{min: ?string, max: ?string, count: int, other: int}>  $stringBlocks
+     * @return list<int>
+     */
+    private function survivingBlocksString(array $stringBlocks, ?string $lo, ?string $hi): array
+    {
+        $survivors = [];
+        foreach ($stringBlocks as $i => $b) {
+            if ($b['count'] === 0 || $b['min'] === null || $b['max'] === null) {
+                continue;
+            }
+            if (($lo === null || strcmp($b['max'], $lo) >= 0)
+                && ($hi === null || strcmp($b['min'], $hi) <= 0)) {
+                $survivors[] = $i;
+            }
+        }
+
+        return $survivors;
+    }
+
+    /**
+     * Exact per-cell lexicographic predicate. Null / empty cells never
+     * match (they are the STRZ `other` class, never a tracked value);
+     * every other cell is compared by its string form via strcmp.
+     */
+    private function cellMatchesString(mixed $cell, string $op, string $value, ?string $value2): bool
+    {
+        if ($cell === null) {
+            return false;
+        }
+        $s = (string) $cell;
+        if ($s === '') {
+            return false;
+        }
+
+        return match ($op) {
+            '=' => strcmp($s, $value) === 0,
+            '<' => strcmp($s, $value) < 0,
+            '<=' => strcmp($s, $value) <= 0,
+            '>' => strcmp($s, $value) > 0,
+            '>=' => strcmp($s, $value) >= 0,
+            'prefix' => str_starts_with($s, $value),
+            'between' => $value2 !== null
+                && strcmp($s, strcmp($value, $value2) <= 0 ? $value : $value2) >= 0
+                && strcmp($s, strcmp($value, $value2) <= 0 ? $value2 : $value) <= 0,
+            default => false,
         };
     }
 
