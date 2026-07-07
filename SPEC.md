@@ -20,7 +20,7 @@ OPTIONAL in this document are to be interpreted as described in
 
 | | |
 |---|---|
-| Document version | **1.2.0** |
+| Document version | **1.3.0** |
 | Format version described | KXSI binary version **2** (the `version` header byte) |
 | Reference implementation | `kolay/xlsx-stream` ≥ 3.2.0 (PHP) — writer + reader |
 | Conformance suite | `tests/SpecVectors/` in the reference repository (§8) |
@@ -494,6 +494,76 @@ simply skip them, as with any unknown tag.
 | `TRGM` | Per-block trigram filters over opted-in text columns — substring-search pruning. |
 | `VHIS` | Version-history chain for appendable files (per-append tail snapshot enabling in-file time travel). |
 | `CSTR` | Columnar shadow stripes: raw numeric arrays for selected columns, block-aligned with `STAT`. |
+| `STRZ` | Per-block lexicographic **string** zone maps (truncated min/max prefixes) for string range / prefix pruning and string `findRow` — the string analogue of `STAT`. |
+| `TDGB` | Per-**superblock** t-digests for range- and group-scoped approximate quantiles (`quantile(col, q, from, to)`, `groupQuantile`). Reuses the `TDIG` sketch payload (§4.3) per superblock. |
+| `TOPK` | Per-column mergeable heavy-hitters sketch (SpaceSaving / Misra-Gries) — top-K values with counts, error bounded by `N/k`, plus a `saturated` bit (see commitments) that upgrades to an *exact* categorical distribution when column cardinality ≤ k. |
+| `CORR` | Per-column-pair co-moment accumulators (five per pair: n, Σx, Σy, Σxy, Σx², Σy²) for exact Pearson correlation from the sidecar alone. |
+| `ARGP` | Per-block argmin / argmax **row numbers**, block-aligned 1:1 with `STAT`. A *separate* section — deliberately **not** an extension of a `STAT` block — because current `STAT` readers parse fixed 32-byte blocks; widening those blocks would strand them, while a new tag is skipped by construction. |
+| `SMPL` | Seeded reservoir **row sample**: K real rows (reference K = 256) drawn by unbiased Vitter-R, with their row numbers — a zero-row-read preview grid and the sample-value column of `profile()`. Weighted-reservoir mergeable, so it composes across stitch / `kxsd` like the sketch family. (Distinct from the shipped `sampleRows()`, which *computes* a sample by reading blocks; `SMPL` *stores* one for zero-read access.) |
+
+**v3.4 design commitments (recorded before implementation; full byte
+layouts register per feature, each with a byte-pinned vector, exactly as
+`SCRC`/`TDIG`/`CHLL` did).** These fix the decisions so the format is
+committed ahead of code:
+
+- **`STRZ` collation is NORMATIVE and locale-independent:** comparison is
+  unsigned byte-wise over UTF-8, which equals Unicode code-point order
+  (UTF-8 preserves it). It is **not** a locale collation — e.g. Turkish
+  İ/ı or ß-folding are out of scope; human-text range scans get a README
+  caveat, while the target case (invoice-no / SKU / e-mail equality) is
+  exact. A truncated `max` prefix may be advanced past a byte boundary
+  and thus be invalid UTF-8; that is fine — it is only a comparison
+  bound and is never decoded.
+- **`STRZ` truncation is chosen at `finishFile`, not per row (deferred
+  shortest-separator, Bayer–Unterauer 1977):** the writer keeps full
+  block min/max (bounded cap, e.g. 64 B) in memory and picks, per column,
+  the shortest prefix that still separates adjacent block boundaries — so
+  a common-prefix corpus (e.g. `INV-2024-…`) still prunes instead of
+  collapsing to one indistinguishable range. The `STRZ` payload therefore
+  carries a variable, per-column truncation length.
+- **`TDGB` superblock size follows the √B rule:** `s = clamp(⌈√B⌉, 4, 32)`
+  for `B` blocks, balancing sidecar cost (∝ B/s) against edge-scan cost
+  (∝ s). A hierarchical / segment-tree digest is rejected (≈1.33·B
+  digests — Pareto-inferior at spreadsheet scale).
+- **`TOPK` mergeability is by construction** (Agarwal–Cormode et al.,
+  *Mergeable Summaries*, 2012), so it composes across stitched / shard
+  files like `TDIG`/`CHLL`. Reference default `k = 64`.
+- One sketch family only: **t-digest, not KLL.** `TDIG` is shipped and
+  its measured error suffices; a second family is spec/impl weight. KLL
+  stays available as a future reserved tag if adversarial accuracy ever
+  demands it.
+- **`TOPK` carries a `saturated` bit** (freeze it into the layout now).
+  Misra-Gries/SpaceSaving has a proven property: if no counter was ever
+  evicted, the surviving counts are *exact* (cardinality ≤ k ⇒ exact
+  histogram). The writer sets `saturated` on the first eviction. Reader
+  semantics: `saturated == 0` ⇒ `top_values` is the **complete, exact**
+  categorical distribution ("status: paid 84.2% — exact"); `saturated == 1`
+  ⇒ top-k with error ≤ N/k. Merge rule:
+  `saturated_out = saturated_a OR saturated_b OR (the merge itself evicts)`.
+  Conformance: two fixtures, one saturated and one not.
+- **Rank certificates (informative, zero format change; ships in the
+  `profile()` release):** `STAT` block `[min, max, count]` and `TDIG` are
+  independent — one *deterministic*, one *statistical*. Combining them
+  bounds the true rank of any threshold `x` from the sidecar alone, with
+  **mathematical certainty**:
+  - `lowerRank(x)` = Σ `count` over blocks with `max < x` — a proven lower
+    bound on `#{v < x}` (rests on STAT Law 1: `max` is a true upper bound).
+  - `upperRank(x)` = Σ `count` over blocks with `min ≤ x` — a proven upper
+    bound on `#{v ≤ x}`.
+  - Sandwich: `lowerRank(x) ≤ rank(x) ≤ upperRank(x)` (tie-safe by the
+    strict/non-strict asymmetry). **Block 0 is always counted as uncertain**
+    (dropped from `lower`, forced into `upper`) because the header folds
+    into block 0's `STAT` (Law 2) while `TDIG` excludes it — costing the
+    certificate exactly one block of width. So a digest estimate `x̂` for
+    quantile `q` ships with a deterministic rank interval, and an *exact*
+    quantile is recoverable by scanning only the blocks the bounds cannot
+    prune. The two prune sides are **independent**: certifying the
+    below-side (`upperRank(xLo) < t`) and the above-side
+    (`lowerRank(xHi) ≥ t`) are separate; one failing MUST NOT collapse the
+    other (else a single unprovable side scans the whole file). Verified
+    on the reference library (200k rows / 21 blocks): 0 sandwich violations
+    over 400 probes; clustered data prunes to 4–5 of 21 blocks for exact
+    mode; uniform data honestly reports 100% width and scans nearly all.
 
 Regardless of any section's presence, the primary worksheet entry stream
 MUST remain decodable by a dictionary-unaware sequential inflater.
@@ -616,6 +686,36 @@ Known false-positive: a hand-built workbook whose sheets are exactly
 indistinguishable from an auto-split chain — and is treated as one.
 Semantically such a file *is* a continuation chain, so the reference
 implementation accepts this deliberately.
+
+### 6.2 The `profile()` surface (informative)
+
+`profile()` is not a format feature — it is a reader convenience that
+**composes the sidecar sections into one per-column report, reading zero
+rows**. It is documented here so independent implementations expose the
+same shape and so the section set below is understood as a coherent whole
+rather than isolated tags. Every field is answered from a section already
+specified (or reserved) above; a field is simply absent when its backing
+section is not present.
+
+Per column, in sheet order:
+
+| Field | Source section | Notes |
+|---|---|---|
+| `min` / `max` / `avg` / `count` / `other` | `STAT` | avg = sum ÷ count |
+| `p50` / `p95` / arbitrary `quantile` | `TDIG` (+ `STAT`) | digest estimate, each carrying a deterministic `rank_lo`/`rank_hi` **certificate** from the STAT+TDIG sandwich above (100% width = "no deterministic bound here", stated honestly) |
+| `histogram(bins)` | `TDIG` | `count · (rank(edge₊₁) − rank(edge))` per bin — no row read |
+| `distinct` | `CHLL` | HyperLogLog estimate |
+| `top_values` | `TOPK` | value → approximate count, error ≤ N/k |
+| `empty_count` | `STAT` | the block `other` counters (nulls + non-numeric), folded |
+| `correlations` | `CORR` | Pearson r for notable column pairs |
+| `string_min` / `string_max` | `STRZ` | truncated prefixes (a bound, not the exact value) |
+
+**Cost honesty.** `profile()` costs **one range request** (the sidecar) —
+that is an I/O statement, not a latency one. Computing the report still
+spends CPU proportional to the number of columns and the work each
+estimator does (quantile/rank inversions, HLL merges, TOPK folds); a
+conforming implementation SHOULD document that per-column CPU cost rather
+than let "one request" imply "instant". No field ever touches a data row.
 
 ## 7. Security considerations
 
