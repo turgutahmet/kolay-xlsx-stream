@@ -124,6 +124,47 @@ class ColumnStatsIndexTest extends TestCase
         $this->assertSame(4, $stats['blocks'][0]['count']);
     }
 
+    /**
+     * Forward-compat gate for the still-reserved v3.4 tags (SPEC §4.5):
+     * TDGB, TOPK, CORR, ARGP, SMPL are not yet registered, so today's
+     * reader MUST skip every one of them and still parse STAT + the core
+     * body. (STRZ graduated to a registered section in v3.4.) This is the load-bearing proof that v3.4's new TLVs ship
+     * additively without stranding a v3.3 reader — the same guarantee
+     * 'ZZZZ' proves generically, pinned to the concrete reserved tags.
+     */
+    public function test_decoder_skips_v34_reserved_tags(): void
+    {
+        $entry = 'xl/worksheets/sheet1.xml';
+        $payload = RandomAccessIndex::encode(
+            100,
+            [['entry' => $entry, 'total_rows' => 10, 'sheet_crc32' => 7, 'sync_points' => []]],
+            [$entry => [['col' => 1, 'sorted_asc' => false, 'sorted_desc' => false, 'blocks' => [
+                ['min' => 5.0, 'max' => 9.0, 'sum' => 30.0, 'count' => 4, 'other' => 6],
+            ]]]]
+        );
+
+        $body = substr($payload, 16);
+        $statPos = strpos($body, 'STAT');
+
+        // Splice every still-reserved v3.4 tag (varied lengths, incl. 0)
+        // before STAT. STRZ is intentionally absent — it is registered as
+        // of v3.4 and now decoded, so it is no longer a skip-only tag.
+        $spliced = '';
+        foreach (['TDGB' => 0, 'TOPK' => 21, 'CORR' => 3, 'ARGP' => 16, 'SMPL' => 9] as $tag => $len) {
+            $spliced .= $tag.pack('V', $len).str_repeat("\x5A", $len);
+        }
+        $body = substr($body, 0, $statPos).$spliced.substr($body, $statPos);
+
+        $header = substr($payload, 0, 12).pack('V', crc32($body));
+        $decoded = ReaderIndex::decode($header.$body);
+
+        // Every reserved section skipped; STAT + core survive untouched.
+        $stats = $decoded->columnStats($entry, 1);
+        $this->assertNotNull($stats, 'STAT lost behind a reserved tag — skip is broken');
+        $this->assertSame(4, $stats['blocks'][0]['count']);
+        $this->assertSame(10, $decoded->totalRows($entry));
+    }
+
     public function test_decoder_rejects_block_count_mismatch(): void
     {
         $entry = 'xl/worksheets/sheet1.xml';

@@ -40,6 +40,8 @@ class RandomAccessIndex
 
     public const TAG_HLL = 'CHLL';
 
+    public const TAG_STRING_ZONE = 'STRZ';
+
     public const SORTED_ASC = 0x01;
     public const SORTED_DESC = 0x02;
 
@@ -108,7 +110,19 @@ class RandomAccessIndex
     /** @var array<string, array<int, HyperLogLog>> memoized deserialized HLLs */
     private array $columnHlls = [];
 
-    private function __construct(int $syncPeriod, array $totals, array $crcs, array $syncs, array $columnStats = [], array $syncPointCrcs = [], array $columnDigestPayloads = [], array $columnHllPayloads = [])
+    /**
+     * Per-block lexicographic string zone maps from the "STRZ" TLV
+     * section (the string analogue of columnStatsByEntry).
+     *
+     * @var array<string, array<int, array{
+     *     sorted_asc: bool,
+     *     sorted_desc: bool,
+     *     blocks: list<array{min: ?string, max: ?string, count: int, other: int}>
+     * }>> entry path => 1-based column => string stats
+     */
+    private array $columnStringStatsByEntry = [];
+
+    private function __construct(int $syncPeriod, array $totals, array $crcs, array $syncs, array $columnStats = [], array $syncPointCrcs = [], array $columnDigestPayloads = [], array $columnHllPayloads = [], array $columnStringStats = [])
     {
         $this->syncPeriod = $syncPeriod;
         $this->totalRowsByEntry = $totals;
@@ -118,6 +132,7 @@ class RandomAccessIndex
         $this->syncPointCrcsByEntry = $syncPointCrcs;
         $this->columnDigestPayloads = $columnDigestPayloads;
         $this->columnHllPayloads = $columnHllPayloads;
+        $this->columnStringStatsByEntry = $columnStringStats;
     }
 
     public static function decode(string $payload): self
@@ -302,6 +317,7 @@ class RandomAccessIndex
         $syncPointCrcs = [];
         $columnDigestPayloads = [];
         $columnHllPayloads = [];
+        $columnStringStats = [];
         $entryOrder = array_keys($totals);
         while ($cursor + 8 <= $bodyLen) {
             $tag = substr($body, $cursor, 4);
@@ -338,12 +354,18 @@ class RandomAccessIndex
                     $entryOrder,
                     self::TAG_HLL
                 );
+            } elseif ($tag === self::TAG_STRING_ZONE) {
+                $columnStringStats = self::decodeStringZoneSection(
+                    substr($body, $cursor, $length),
+                    $entryOrder,
+                    $syncs
+                );
             }
 
             $cursor += $length;
         }
 
-        return new self($syncPeriod, $totals, $crcs, $syncs, $columnStats, $syncPointCrcs, $columnDigestPayloads, $columnHllPayloads);
+        return new self($syncPeriod, $totals, $crcs, $syncs, $columnStats, $syncPointCrcs, $columnDigestPayloads, $columnHllPayloads, $columnStringStats);
     }
 
     /**
@@ -407,6 +429,91 @@ class RandomAccessIndex
                         'other' => $vals['other'],
                     ];
                     $cursor += 32;
+                }
+
+                $result[$entry][$col] = [
+                    'sorted_asc' => (bool) ($flags & self::SORTED_ASC),
+                    'sorted_desc' => (bool) ($flags & self::SORTED_DESC),
+                    'blocks' => $blocks,
+                ];
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * Parse the "STRZ" TLV payload — per-block lexicographic string zone
+     * maps. Same per-sheet/per-column/per-block skeleton as STAT (and the
+     * same block_count == sync_count + 1 invariant), but each block's
+     * min/max are length-prefixed strings; an empty min/max pairs with a
+     * count-0 block (absent value).
+     *
+     * @param  list<string>  $entryOrder  sheet entries in core-body order
+     * @param  array<string, list<array{row: int, comp_offset: int, uncomp_offset: int}>>  $syncs
+     * @return array<string, array<int, array{sorted_asc: bool, sorted_desc: bool, blocks: list<array{min: ?string, max: ?string, count: int, other: int}>}>>
+     */
+    private static function decodeStringZoneSection(string $strz, array $entryOrder, array $syncs): array
+    {
+        $result = [];
+        $cursor = 0;
+        $len = strlen($strz);
+
+        foreach ($entryOrder as $entry) {
+            if ($cursor + 2 > $len) {
+                throw XlsxReadException::corruptCentralDirectory('truncated STRZ section sheet header');
+            }
+            $colCount = unpack('v', substr($strz, $cursor, 2))[1];
+            $cursor += 2;
+
+            $expectedBlocks = count($syncs[$entry] ?? []) + 1;
+
+            for ($c = 0; $c < $colCount; $c++) {
+                if ($cursor + 7 > $len) {
+                    throw XlsxReadException::corruptCentralDirectory('truncated STRZ column header');
+                }
+                $col = unpack('v', substr($strz, $cursor, 2))[1];
+                $flags = ord($strz[$cursor + 2]);
+                $blockCount = unpack('V', substr($strz, $cursor + 3, 4))[1];
+                $cursor += 7;
+
+                if ($col < 1) {
+                    throw XlsxReadException::corruptCentralDirectory('STRZ section column index must be 1-based');
+                }
+                if ($blockCount !== $expectedBlocks) {
+                    throw XlsxReadException::corruptCentralDirectory(
+                        "STRZ section block count {$blockCount} does not match sync points + 1 ({$expectedBlocks}) for sheet '{$entry}'"
+                    );
+                }
+
+                $blocks = [];
+                for ($b = 0; $b < $blockCount; $b++) {
+                    if ($cursor + 2 > $len) {
+                        throw XlsxReadException::corruptCentralDirectory("truncated STRZ block (min length) for sheet '{$entry}' column {$col}");
+                    }
+                    $minLen = unpack('v', substr($strz, $cursor, 2))[1];
+                    $cursor += 2;
+                    if ($cursor + $minLen + 2 > $len) {
+                        throw XlsxReadException::corruptCentralDirectory("truncated STRZ block (min/max) for sheet '{$entry}' column {$col}");
+                    }
+                    $min = substr($strz, $cursor, $minLen);
+                    $cursor += $minLen;
+                    $maxLen = unpack('v', substr($strz, $cursor, 2))[1];
+                    $cursor += 2;
+                    if ($cursor + $maxLen + 8 > $len) {
+                        throw XlsxReadException::corruptCentralDirectory("truncated STRZ block (max/counts) for sheet '{$entry}' column {$col}");
+                    }
+                    $max = substr($strz, $cursor, $maxLen);
+                    $cursor += $maxLen;
+                    $counts = unpack('Vcount/Vother', substr($strz, $cursor, 8));
+                    $cursor += 8;
+
+                    $blocks[] = [
+                        'min' => $counts['count'] === 0 ? null : $min,
+                        'max' => $counts['count'] === 0 ? null : $max,
+                        'count' => $counts['count'],
+                        'other' => $counts['other'],
+                    ];
                 }
 
                 $result[$entry][$col] = [
@@ -562,6 +669,23 @@ class RandomAccessIndex
     public function statsColumns(string $sheetEntry): array
     {
         return array_keys($this->columnStatsByEntry[$sheetEntry] ?? []);
+    }
+
+    /**
+     * String zone maps for one sheet (KXSI "STRZ" section), or null when
+     * the sidecar carries none for that entry/column.
+     *
+     * @return array{sorted_asc: bool, sorted_desc: bool, blocks: list<array{min: ?string, max: ?string, count: int, other: int}>}|null
+     */
+    public function columnStringStats(string $sheetEntry, int $column): ?array
+    {
+        return $this->columnStringStatsByEntry[$sheetEntry][$column] ?? null;
+    }
+
+    /** @return list<int> 1-based columns that carry string zone maps for the sheet */
+    public function stringStatsColumns(string $sheetEntry): array
+    {
+        return array_keys($this->columnStringStatsByEntry[$sheetEntry] ?? []);
     }
 
     /**

@@ -131,6 +131,8 @@ class RandomAccessIndex
 
     public const TAG_HLL = 'CHLL';
 
+    public const TAG_STRING_ZONE = 'STRZ';
+
     public const SORTED_ASC = 0x01;
     public const SORTED_DESC = 0x02;
 
@@ -159,7 +161,7 @@ class RandomAccessIndex
      *     1-based column => serialized HyperLogLog payload. Pass [] to omit
      *     the CHLL section entirely.
      */
-    public static function encode(int $syncPeriod, array $sheets, array $columnStats = [], array $syncPointCrcs = [], array $columnDigests = [], array $columnHlls = []): string
+    public static function encode(int $syncPeriod, array $sheets, array $columnStats = [], array $syncPointCrcs = [], array $columnDigests = [], array $columnHlls = [], array $columnStringStats = []): string
     {
         $body = '';
         foreach ($sheets as $sheet) {
@@ -230,6 +232,32 @@ class RandomAccessIndex
         if ($columnHlls !== []) {
             $chll = self::encodeSketchSection($sheets, $columnHlls);
             $body .= self::TAG_HLL.pack('V', strlen($chll)).$chll;
+        }
+
+        // STRZ — string zone maps. STAT's per-sheet/per-column/per-block
+        // skeleton, but each block's min/max are length-prefixed strings
+        // (variable) instead of the fixed 32-byte numeric record. A block
+        // with no string value (count == 0) stores empty min/max — since
+        // '' is never a tracked value, empty unambiguously means "absent".
+        if ($columnStringStats !== []) {
+            $strz = '';
+            foreach ($sheets as $sheet) {
+                $cols = $columnStringStats[$sheet['entry']] ?? [];
+                $strz .= pack('v', count($cols));
+                foreach ($cols as $colStat) {
+                    $flags = ($colStat['sorted_asc'] ? self::SORTED_ASC : 0)
+                        | ($colStat['sorted_desc'] ? self::SORTED_DESC : 0);
+                    $strz .= pack('vCV', $colStat['col'], $flags, count($colStat['blocks']));
+                    foreach ($colStat['blocks'] as $block) {
+                        $min = $block['min'] ?? '';
+                        $max = $block['max'] ?? '';
+                        $strz .= pack('v', strlen($min)).$min;
+                        $strz .= pack('v', strlen($max)).$max;
+                        $strz .= pack('VV', $block['count'], $block['other']);
+                    }
+                }
+            }
+            $body .= self::TAG_STRING_ZONE.pack('V', strlen($strz)).$strz;
         }
 
         $header = self::MAGIC;

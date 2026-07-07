@@ -241,6 +241,31 @@ abstract class BaseXlsxWriter
     /** @var array<string, array<int, array{asc: bool, desc: bool}>> final sortedness per sheet: entry => col => flags */
     protected array $indexColumnSorted = [];
 
+    // String zone maps (STRZ) — opt-in via withStringStats, orthogonal to
+    // withColumnStats. Per-block lexicographic [min, max] string prefixes
+    // for string range/prefix pruning. Full min/max are kept per open
+    // block, capped to STRING_STAT_CAP at block close, then the truncation
+    // length is chosen per column at finishFile (deferred shortest
+    // separator — restores pruning on common-prefix corpora).
+
+    /** Max bytes of a stored block min/max prefix. */
+    protected const STRING_STAT_CAP = 64;
+
+    /** @var list<int> 1-based columns tracked for string zone maps */
+    protected array $stringStatsColumns = [];
+
+    /** @var array<int, array{min: ?string, max: ?string, count: int, other: int}> current-block string accumulator */
+    protected array $stringAccum = [];
+
+    /** @var array<int, array{asc: bool, desc: bool, prev: ?string}> per-sheet lexicographic sortedness */
+    protected array $stringSorted = [];
+
+    /** @var array<string, array<int, list<array{min: ?string, max: ?string, count: int, other: int}>>> closed string blocks: entry => col => blocks */
+    protected array $indexStringBlocks = [];
+
+    /** @var array<string, array<int, array{asc: bool, desc: bool}>> final string sortedness per sheet */
+    protected array $indexStringSorted = [];
+
     // Column sketches (opt-in via withColumnSketches, orthogonal to
     // withColumnStats). For each tracked column the writer feeds one
     // whole-sheet t-digest (numeric values, same inclusion rule as STAT)
@@ -527,6 +552,42 @@ abstract class BaseXlsxWriter
         $columns = array_values(array_unique($columns));
         sort($columns);
         $this->statsColumns = $columns;
+
+        return $this;
+    }
+
+    /**
+     * Opt in to per-block STRING zone maps (STRZ) for the given 1-based
+     * columns — the lexicographic analogue of withColumnStats(), enabling
+     * string range / prefix pruning and string findRow. Comparison is
+     * unsigned byte-wise (= Unicode code-point order, NOT a locale
+     * collation; see SPEC §4.5). Like STAT, this implies the random-access
+     * index. Orthogonal to withColumnStats(): a column may carry numeric
+     * stats, string zone maps, both, or neither.
+     */
+    public function withStringStats(array $columns): self
+    {
+        if ($this->started) {
+            throw XlsxStreamException::alreadyStarted();
+        }
+        if ($columns === []) {
+            throw new XlsxStreamException('withStringStats() needs at least one column index.');
+        }
+        foreach ($columns as $col) {
+            if (! is_int($col) || $col < 1 || $col > self::MAX_COLUMNS) {
+                throw new XlsxStreamException(
+                    'withStringStats() expects 1-based integer column indexes; got: '.var_export($col, true)
+                );
+            }
+        }
+
+        if (! $this->randomAccessIndexEnabled) {
+            $this->withRandomAccessIndex();
+        }
+
+        $columns = array_values(array_unique($columns));
+        sort($columns);
+        $this->stringStatsColumns = $columns;
 
         return $this;
     }
@@ -1016,6 +1077,9 @@ abstract class BaseXlsxWriter
         if ($this->statsColumns !== []) {
             $this->accumulateColumnStats($row);
         }
+        if ($this->stringStatsColumns !== []) {
+            $this->accumulateStringStats($row);
+        }
         if ($this->sketchColumns !== []) {
             $this->accumulateColumnSketches($row);
         }
@@ -1328,7 +1392,7 @@ abstract class BaseXlsxWriter
         // The rows flushed above complete an index block; snapshot the
         // column-stat accumulators so block k always spans exactly the
         // rows between sync points k-1 and k.
-        if ($this->statsColumns !== []) {
+        if ($this->statsColumns !== [] || $this->stringStatsColumns !== []) {
             $this->closeStatsBlock($entry);
         }
 
@@ -1563,6 +1627,139 @@ abstract class BaseXlsxWriter
     }
 
     /**
+     * String analogue of accumulateColumnStats: fold each tracked cell's
+     * canonical string into the current block's lexicographic [min, max]
+     * (unsigned byte compare = strcmp). Empty/null cells count as `other`
+     * (mirrors the sketch canonical rule), so a string predicate that can
+     * never match them is not widened by them. $trackOrder = false for the
+     * header fold, exactly like the numeric path.
+     */
+    protected function accumulateStringStats(array $row, bool $trackOrder = true): void
+    {
+        if (! array_is_list($row)) {
+            $row = array_values($row);
+        }
+
+        foreach ($this->stringStatsColumns as $col) {
+            $s = $this->sketchCanonicalString($row[$col - 1] ?? null);
+            $acc = &$this->stringAccum[$col];
+
+            if ($s === null) {
+                $acc['other']++;
+                unset($acc);
+
+                continue;
+            }
+
+            if ($acc['count'] === 0) {
+                $acc['min'] = $s;
+                $acc['max'] = $s;
+            } else {
+                if (strcmp($s, $acc['min']) < 0) {
+                    $acc['min'] = $s;
+                }
+                if (strcmp($s, $acc['max']) > 0) {
+                    $acc['max'] = $s;
+                }
+            }
+            $acc['count']++;
+            unset($acc);
+
+            if (! $trackOrder) {
+                continue;
+            }
+
+            $so = &$this->stringSorted[$col];
+            if ($so['prev'] !== null) {
+                if (strcmp($s, $so['prev']) < 0) {
+                    $so['asc'] = false;
+                }
+                if (strcmp($s, $so['prev']) > 0) {
+                    $so['desc'] = false;
+                }
+            }
+            $so['prev'] = $s;
+            unset($so);
+        }
+    }
+
+    /** Byte-wise common prefix length of two strings. */
+    protected static function commonPrefixLen(string $a, string $b): int
+    {
+        $n = min(strlen($a), strlen($b));
+        $i = 0;
+        while ($i < $n && $a[$i] === $b[$i]) {
+            $i++;
+        }
+
+        return $i;
+    }
+
+    /**
+     * Deferred shortest-separator truncation length for one column: one
+     * byte past the DEEPEST divergence between adjacent boundary strings
+     * (the classic B-tree separator), so every block boundary stays
+     * distinguishable after truncation — restoring pruning on a
+     * common-prefix corpus, capped at STRING_STAT_CAP.
+     *
+     * The adjacent-pair (sorted) measure is deliberately robust to
+     * outliers: a lone off-prefix boundary (e.g. a differently-cased
+     * header folded into block 0) does NOT drag the length down the way a
+     * whole-set common prefix would. When two boundaries are identical
+     * (a key straddling a block edge) no length separates them; the cap
+     * bounds the cost and pruning honestly weakens at that one edge.
+     *
+     * @param  list<string>  $boundaries  every block's stored min and max
+     */
+    protected static function stringTruncationLength(array $boundaries): int
+    {
+        if (count($boundaries) <= 1) {
+            return self::STRING_STAT_CAP;
+        }
+        sort($boundaries, SORT_STRING); // byte order = strcmp = the STRZ collation
+
+        $maxAdjacent = 0;
+        for ($i = 1, $n = count($boundaries); $i < $n; $i++) {
+            $lcp = self::commonPrefixLen($boundaries[$i - 1], $boundaries[$i]);
+            if ($lcp > $maxAdjacent) {
+                $maxAdjacent = $lcp;
+            }
+        }
+
+        // +4 past the deepest adjacent divergence: enough to separate every
+        // boundary plus a little slack for query values sharing the prefix.
+        return max(1, min(self::STRING_STAT_CAP, $maxAdjacent + 4));
+    }
+
+    /** Sound LOWER bound: the first $len bytes are a prefix, always ≤ $s. */
+    protected static function truncateStringMin(string $s, int $len): string
+    {
+        return substr($s, 0, $len);
+    }
+
+    /**
+     * Sound UPPER bound: the smallest string ≥ every string sharing $s's
+     * $len-byte prefix. Increment the rightmost non-0xFF byte of the
+     * prefix and drop the tail; if $s already fits in $len it is exact; an
+     * all-0xFF prefix cannot be bumped, so $s is kept whole.
+     */
+    protected static function truncateStringMax(string $s, int $len): string
+    {
+        if (strlen($s) <= $len) {
+            return $s;
+        }
+        $p = substr($s, 0, $len);
+        for ($i = $len - 1; $i >= 0; $i--) {
+            $b = ord($p[$i]);
+            if ($b < 0xFF) {
+                return substr($p, 0, $i).chr($b + 1);
+            }
+        }
+
+        return $s;
+    }
+
+    /**
      * Snapshot the per-column accumulators as one closed index block for
      * the sheet and reset them for the next block.
      */
@@ -1571,6 +1768,20 @@ abstract class BaseXlsxWriter
         foreach ($this->statsColumns as $col) {
             $this->indexColumnBlocks[$entry][$col][] = $this->statsAccum[$col];
             $this->statsAccum[$col] = ['min' => 0.0, 'max' => 0.0, 'sum' => 0.0, 'count' => 0, 'other' => 0];
+        }
+
+        // String blocks: cap the full min/max to STRING_STAT_CAP now (sound
+        // bounds — min truncates down, max up); the shorter per-column
+        // separator length is chosen later at finishFile.
+        foreach ($this->stringStatsColumns as $col) {
+            $acc = $this->stringAccum[$col];
+            $this->indexStringBlocks[$entry][$col][] = [
+                'min' => $acc['min'] === null ? null : self::truncateStringMin($acc['min'], self::STRING_STAT_CAP),
+                'max' => $acc['max'] === null ? null : self::truncateStringMax($acc['max'], self::STRING_STAT_CAP),
+                'count' => $acc['count'],
+                'other' => $acc['other'],
+            ];
+            $this->stringAccum[$col] = ['min' => null, 'max' => null, 'count' => 0, 'other' => 0];
         }
     }
 
@@ -1583,6 +1794,7 @@ abstract class BaseXlsxWriter
     {
         $sheetSections = [];
         $columnStats = [];
+        $columnStringStats = [];
         $syncPointCrcs = [];
         foreach ($this->sheets as $sheet) {
             $entry = $sheet['filename'];
@@ -1610,6 +1822,45 @@ abstract class BaseXlsxWriter
                 }
                 $columnStats[$entry] = $cols;
             }
+
+            if ($this->stringStatsColumns !== []) {
+                $cols = [];
+                foreach ($this->stringStatsColumns as $col) {
+                    $blocks = $this->indexStringBlocks[$entry][$col] ?? [];
+
+                    // Deferred separator truncation: choose one length for
+                    // the whole column from its block boundaries, then
+                    // truncate every block's min (down) / max (up) to it.
+                    $boundaries = [];
+                    foreach ($blocks as $b) {
+                        if ($b['min'] !== null) {
+                            $boundaries[] = $b['min'];
+                        }
+                        if ($b['max'] !== null) {
+                            $boundaries[] = $b['max'];
+                        }
+                    }
+                    $len = self::stringTruncationLength($boundaries);
+                    foreach ($blocks as &$b) {
+                        if ($b['min'] !== null) {
+                            $b['min'] = self::truncateStringMin($b['min'], $len);
+                        }
+                        if ($b['max'] !== null) {
+                            $b['max'] = self::truncateStringMax($b['max'], $len);
+                        }
+                    }
+                    unset($b);
+
+                    $sorted = $this->indexStringSorted[$entry][$col] ?? ['asc' => false, 'desc' => false];
+                    $cols[] = [
+                        'col' => $col,
+                        'sorted_asc' => $sorted['asc'],
+                        'sorted_desc' => $sorted['desc'],
+                        'blocks' => $blocks,
+                    ];
+                }
+                $columnStringStats[$entry] = $cols;
+            }
         }
 
         return RandomAccessIndex::encode(
@@ -1618,7 +1869,8 @@ abstract class BaseXlsxWriter
             $columnStats,
             $syncPointCrcs,
             $this->indexColumnDigests,
-            $this->indexColumnHlls
+            $this->indexColumnHlls,
+            $columnStringStats
         );
     }
 
@@ -1695,6 +1947,17 @@ abstract class BaseXlsxWriter
             // stats for out-of-data-range values matching the header.
             if ($this->columns !== []) {
                 $this->accumulateColumnStats($this->columns, trackOrder: false);
+            }
+        }
+
+        // Same fresh-sheet reset + header fold for string zone maps.
+        if ($this->stringStatsColumns !== []) {
+            foreach ($this->stringStatsColumns as $col) {
+                $this->stringAccum[$col] = ['min' => null, 'max' => null, 'count' => 0, 'other' => 0];
+                $this->stringSorted[$col] = ['asc' => true, 'desc' => true, 'prev' => null];
+            }
+            if ($this->columns !== []) {
+                $this->accumulateStringStats($this->columns, trackOrder: false);
             }
         }
 
@@ -2030,12 +2293,16 @@ abstract class BaseXlsxWriter
         // Close the tail block (rows after the last sync point — possibly
         // empty, still emitted so block_count == sync_count + 1 holds for
         // every sheet) and pin the sheet's sortedness verdict.
-        if ($this->statsColumns !== []) {
+        if ($this->statsColumns !== [] || $this->stringStatsColumns !== []) {
             $entry = $sheetInfo['filename'];
             $this->closeStatsBlock($entry);
             foreach ($this->statsColumns as $col) {
                 $s = $this->statsSorted[$col];
                 $this->indexColumnSorted[$entry][$col] = ['asc' => $s['asc'], 'desc' => $s['desc']];
+            }
+            foreach ($this->stringStatsColumns as $col) {
+                $so = $this->stringSorted[$col];
+                $this->indexStringSorted[$entry][$col] = ['asc' => $so['asc'], 'desc' => $so['desc']];
             }
         }
 
