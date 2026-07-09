@@ -98,6 +98,27 @@ function generateVector(string $name, callable $write): void
             $stringZones[(string) $col] = $index->columnStringStats($entry, $col);
         }
 
+        // Range-quantile superblocks (TDGB). Like the whole-column sketch
+        // above, the golden pins each superblock's end_row plus the
+        // quantiles its committed t-digest reproduces. Added only when
+        // present so pre-TDGB goldens stay byte-for-byte unchanged.
+        $rangeQuantiles = [];
+        foreach ($index->rangeQuantileColumns($entry) as $col) {
+            $superblocks = [];
+            foreach ($index->rangeQuantileSuperblocks($entry, $col) as $sb) {
+                $quantiles = [];
+                foreach (['0', '0.5', '1'] as $q) {
+                    $quantiles[$q] = $sb['digest']->quantile((float) $q);
+                }
+                $superblocks[] = [
+                    'end_row' => $sb['end_row'],
+                    'numeric_count' => $sb['digest']->count(),
+                    'quantiles' => $quantiles,
+                ];
+            }
+            $rangeQuantiles[(string) $col] = $superblocks;
+        }
+
         $sheet = [
             'entry' => $entry,
             'total_rows' => $index->totalRows($entry),
@@ -109,6 +130,9 @@ function generateVector(string $name, callable $write): void
         ];
         if ($stringZones !== []) {
             $sheet['string_zones'] = $stringZones;
+        }
+        if ($rangeQuantiles !== []) {
+            $sheet['range_quantiles'] = $rangeQuantiles;
         }
         $sheets[] = $sheet;
     }
@@ -221,6 +245,27 @@ generateVector('vector-06-string-zones', function (SinkableXlsxWriter $w): void 
         $invoice = sprintf('INV-2024-%08d', $i);
         $tag = $i % 40 === 0 ? '' : $tags[$i % 5].'-'.($i % 7);
         $w->writeRow([$i, $invoice, $tag]);
+    }
+    $w->finishFile();
+});
+
+// Vector 7 — TDGB range-quantile superblocks. The sheet is far under the
+// 16384-row superblock width, so col 2 yields a SINGLE superblock whose
+// end_row is the last data sheet row; the golden pins that boundary and
+// the quantiles its committed t-digest reproduces. Non-numeric cells
+// ('n/a' every 10th row) are excluded from the digest, so numeric_count
+// pins the STAT-interpretation population rule. Multi-superblock spans
+// (>16384 rows) are exercised by RangeQuantileTest rather than committed
+// as a heavyweight fixture; the per-superblock frame repeats exactly like
+// STAT's per-block frame, which the other vectors already pin.
+generateVector('vector-07-range-quantiles', function (SinkableXlsxWriter $w): void {
+    $w->withRandomAccessIndex(every: 100);
+    $w->withRangeQuantiles([2]);
+    $w->setBufferFlushInterval(100);
+    $w->startFile(['id', 'amount']);
+    for ($i = 1; $i <= 300; $i++) {
+        $amount = $i % 10 === 0 ? 'n/a' : (($i * 7) % 100) + 0.5;
+        $w->writeRow([$i, $amount]);
     }
     $w->finishFile();
 });

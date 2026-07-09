@@ -125,12 +125,13 @@ class ColumnStatsIndexTest extends TestCase
     }
 
     /**
-     * Forward-compat gate for the still-reserved v3.4 tags (SPEC §4.6):
+     * Forward-compat gate for the still-reserved v3.4 tags (SPEC §4.7):
      * TOPK, CORR, ARGP, SMPL are not yet registered, so today's reader
      * MUST skip every one of them and still parse STAT + the core body.
-     * (STRZ and TDGB graduated to registered sections in v3.4.) This is the load-bearing proof that v3.4's new TLVs ship
-     * additively without stranding a v3.3 reader — the same guarantee
-     * 'ZZZZ' proves generically, pinned to the concrete reserved tags.
+     * (STRZ and TDGB graduated to registered sections in v3.4.) This is
+     * the load-bearing proof that v3.4's new TLVs ship additively without
+     * stranding a v3.3 reader — the same guarantee 'ZZZZ' proves
+     * generically, pinned to the concrete reserved tags.
      */
     public function test_decoder_skips_v34_reserved_tags(): void
     {

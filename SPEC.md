@@ -20,7 +20,7 @@ OPTIONAL in this document are to be interpreted as described in
 
 | | |
 |---|---|
-| Document version | **1.4.0** |
+| Document version | **1.5.0** |
 | Format version described | KXSI binary version **2** (the `version` header byte) |
 | Reference implementation | `kolay/xlsx-stream` ≥ 3.2.0 (PHP) — writer + reader |
 | Conformance suite | `tests/SpecVectors/` in the reference repository (§8) |
@@ -539,7 +539,64 @@ block matches no string predicate). The `STAT` laws (§4.1) apply
 identically — stats widen never narrow, and a lexicographically-matchable
 header string folds into block 0.
 
-### 4.6 Reserved tags
+### 4.6 Registered: `TDGB` — per-superblock t-digests (range / group quantiles)
+
+Where `TDIG` (§4.3) carries one whole-sheet digest per column, `TDGB`
+carries a sequence of digests, one per **superblock** — a contiguous span
+of data rows — so a reader can answer a quantile scoped to a row range
+(`quantile(col, q, from, to)`) or to a sorted group (`groupQuantile`) by
+merging only the superblocks the range fully covers and scanning the few
+rows at each edge. Each superblock's digest is exactly a `TDIG` sketch
+payload (§4.3), reused verbatim.
+
+**Superblocks are defined in ROW space, not block space.** A superblock
+spans a fixed row width `S` (reference `S = 16384`), snapping its end to
+the FIRST sync point after `S` rows have accumulated — the same
+cadence-snap the index itself uses, so a superblock boundary is always a
+sync boundary. When `sync_period > S` a superblock degrades to a single
+block. Because a worksheet is capped at 1,048,575 rows, this bounds a
+sheet to ≤ 64 superblocks per column regardless of block count `B`, so the
+writer holds ≤ 64 digests/column (≈ 77 KB) and builds each in a SINGLE
+pass from its own value stream with **zero write-time merges** — merging
+happens only at query time, over a range's fully-covered superblocks.
+(Block-space `s = ⌈√B⌉` was rejected: `B` is user-controlled via
+`sync_period`, so it would let live writer memory grow without bound. A
+hierarchical / segment-tree digest was rejected too — ≈1.33·B digests and
+a merge-depth accuracy gate the single-pass row-space build avoids.)
+
+Value population follows `TDIG` exactly: a cell feeds its superblock's
+digest iff numeric under the `STAT` interpretation (§4.1) **and** finite;
+the header row (row 1) is excluded. A superblock's digest thus covers the
+numeric values of the data rows `(previous end_row, end_row]`, with the
+first superblock's span opening just after the header.
+
+**Payload**, repeated per sheet in core-body order:
+
+| Size | Field |
+|---|---|
+| 2 | `tracked_column_count` — uint16 (0 when the sheet has none) |
+
+then per tracked column, in ascending column order:
+
+| Size | Field |
+|---|---|
+| 2 | `column` — uint16, **1-based**; MUST be ≥ 1 |
+| 4 | `superblock_count` — uint32 |
+
+then per superblock, in ascending row order:
+
+| Size | Field |
+|---|---|
+| 4 | `end_row` — uint32, the last sheet row (1-based, header = 1) the superblock covers. MUST be strictly increasing within the column; the final superblock's `end_row` equals the sheet's last data row. |
+| 4 | `payload_len` — uint32, byte length of the following sketch payload |
+| N | `payload` — a `TDIG` t-digest payload (§4.3), the digest of this superblock's numeric values |
+
+The `end_row` boundaries are stored, not derived: a reader reads them
+rather than recomputing the snap rule, so a future change to `S` cannot
+strand old files. A superblock whose rows were all non-numeric still
+appears, carrying a `count == 0` digest.
+
+### 4.7 Reserved tags
 
 The following tags are reserved; their payloads are deliberately
 unspecified in this document version. Writers MUST NOT emit them with
@@ -558,7 +615,6 @@ simply skip them, as with any unknown tag.
 | `TRGM` | Per-block trigram filters over opted-in text columns — substring-search pruning. |
 | `VHIS` | Version-history chain for appendable files (per-append tail snapshot enabling in-file time travel). |
 | `CSTR` | Columnar shadow stripes: raw numeric arrays for selected columns, block-aligned with `STAT`. |
-| `TDGB` | Per-**superblock** t-digests for range- and group-scoped approximate quantiles (`quantile(col, q, from, to)`, `groupQuantile`). Reuses the `TDIG` sketch payload (§4.3) per superblock. |
 | `TOPK` | Per-column mergeable heavy-hitters sketch (SpaceSaving / Misra-Gries) — top-K values with counts, error bounded by `N/k`, plus a `saturated` bit (see commitments) that upgrades to an *exact* categorical distribution when column cardinality ≤ k. |
 | `CORR` | Per-column-pair co-moment accumulators (five per pair: n, Σx, Σy, Σxy, Σx², Σy²) for exact Pearson correlation from the sidecar alone. |
 | `ARGP` | Per-block argmin / argmax **row numbers**, block-aligned 1:1 with `STAT`. A *separate* section — deliberately **not** an extension of a `STAT` block — because current `STAT` readers parse fixed 32-byte blocks; widening those blocks would strand them, while a new tag is skipped by construction. |
@@ -567,28 +623,9 @@ simply skip them, as with any unknown tag.
 **v3.4 design commitments (recorded before implementation; full byte
 layouts register per feature, each with a byte-pinned vector, exactly as
 `SCRC`/`TDIG`/`CHLL` did).** These fix the decisions so the format is
-committed ahead of code (`STRZ` has since graduated to a registered
-section, §4.5):
+committed ahead of code (`STRZ` and `TDGB` have since graduated to
+registered sections, §4.5 and §4.6):
 
-- **`TDGB` superblocks are defined in ROW space, not block space**
-  (revised 2026-07-07; the original 1.3.0 note said `s = ⌈√B⌉` over `B`
-  *blocks* — the √-balance analysis was right in spirit but the unit was
-  wrong: what a range query scans is rows/bytes, and block count `B` is
-  user-controlled via `sync_period`, so a block-space rule lets live
-  writer memory grow without bound). A superblock spans a fixed row width
-  `S` (reference `S = 16384`), snapping its end to the FIRST sync point
-  after `S` rows accumulate — the same cadence-snap pattern the index
-  itself uses; when `sync_period > S` a superblock naturally degrades to
-  one block. Because a sheet is capped at 1,048,575 rows, this bounds
-  superblocks to ≤ 64 per sheet regardless of `B` — so the writer holds
-  ≤ 64 digests/column (≈77 KB) and builds each in a SINGLE pass from its
-  own value stream with zero write-time merges (merging happens only at
-  query time, over the range's fully-covered superblocks). The `TDGB`
-  payload carries each superblock's `end_row` (reader reads the
-  boundaries; it does not recompute a derivation rule). A hierarchical /
-  segment-tree digest is rejected (≈1.33·B digests, Pareto-inferior; and
-  repeated write-time merges would need their own merge-depth accuracy
-  gate, which the single-pass row-space build avoids entirely).
 - **`TOPK` mergeability is by construction** (Agarwal–Cormode et al.,
   *Mergeable Summaries*, 2012), so it composes across stitched / shard
   files like `TDIG`/`CHLL`. Reference default `k = 64`.
@@ -682,11 +719,13 @@ Structural (on the payload alone):
 12. `STAT`: per column, `column` ≥ 1 and
     `block_count` == `sync_count + 1`.
 13. `SCRC`: per sheet, `count` == `sync_count`.
-14. `TDIG`/`CHLL`: per column, `column` ≥ 1, every `payload_len` stays
-    inside the section, and — before a sketch is *used* — its payload
-    satisfies the internal invariants of §4.3/§4.4 (exact length,
+14. `TDIG`/`CHLL`/`TDGB`: per column, `column` ≥ 1, every `payload_len`
+    stays inside the section, and — before a sketch is *used* — its
+    payload satisfies the internal invariants of §4.3/§4.4 (exact length,
     positive finite weights, ascending means, weight/count agreement;
-    register values within the rank bound). The reference decoder
+    register values within the rank bound). For `TDGB` additionally: each
+    column's `end_row` values strictly increase, and every superblock
+    payload is a valid `TDIG` payload (§4.3). The reference decoder
     validates framing at decode time and payload internals lazily at
     first access.
 
@@ -846,6 +885,7 @@ The vectors:
 | `vector-04-sorted` | Sortedness flags: one ascending, one descending, one unsorted numeric column |
 | `vector-05-sketches` | `TDIG` + `CHLL` on one mixed numeric column and one text column, no `STAT` (sections are orthogonal); golden pins quantile and distinct estimates computed from the committed sketch bytes |
 | `vector-06-string-zones` | `STRZ` on a sorted common-prefix column (exercises deferred separator truncation) and a shuffled tag column with empty cells (`other` class); golden pins the truncated per-block `[min, max]` |
+| `vector-07-range-quantiles` | `TDGB` on a mixed numeric column; a single superblock (sheet under the `S` row width), so the golden pins the superblock's `end_row`, its numeric population (`n/a` cells excluded), and the quantiles its committed t-digest reproduces |
 
 A conforming **reader** must, for each vector: decode
 `<name>.sidecar.hex` (or extract the part from the `.xlsx`) and

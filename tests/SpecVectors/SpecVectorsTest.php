@@ -32,6 +32,7 @@ class SpecVectorsTest extends TestCase
             'sorted + unsorted stats' => ['vector-04-sorted'],
             'sketches (TDIG + CHLL)' => ['vector-05-sketches'],
             'string zone maps (STRZ)' => ['vector-06-string-zones'],
+            'range quantiles (TDGB)' => ['vector-07-range-quantiles'],
         ];
     }
 
@@ -93,6 +94,28 @@ class SpecVectorsTest extends TestCase
                 ];
             }
             $this->assertEquals($sheet['column_sketches'] ?? [], $actualSketches, $entry);
+
+            // TDGB goldens pin each superblock's end_row and the quantiles
+            // its committed t-digest reproduces — the range-scoped analogue
+            // of the whole-column sketch check. Pre-TDGB vectors carry no
+            // key, so the default [] keeps them unaffected.
+            $actualRangeQuantiles = [];
+            foreach ($index->rangeQuantileColumns($entry) as $col) {
+                $superblocks = [];
+                foreach ($index->rangeQuantileSuperblocks($entry, $col) as $sb) {
+                    $quantiles = [];
+                    foreach (['0', '0.5', '1'] as $q) {
+                        $quantiles[$q] = $sb['digest']->quantile((float) $q);
+                    }
+                    $superblocks[] = [
+                        'end_row' => $sb['end_row'],
+                        'numeric_count' => $sb['digest']->count(),
+                        'quantiles' => $quantiles,
+                    ];
+                }
+                $actualRangeQuantiles[(string) $col] = $superblocks;
+            }
+            $this->assertEquals($sheet['range_quantiles'] ?? [], $actualRangeQuantiles, $entry);
         }
     }
 
