@@ -4,6 +4,7 @@ namespace Kolay\XlsxStream\Writers;
 
 use Kolay\XlsxStream\Exceptions\XlsxStreamException;
 use Kolay\XlsxStream\Sketches\HyperLogLog;
+use Kolay\XlsxStream\Sketches\MisraGries;
 use Kolay\XlsxStream\Sketches\TDigest;
 use Kolay\XlsxStream\Styles\StyleRegistry;
 
@@ -327,6 +328,17 @@ abstract class BaseXlsxWriter
 
     /** @var array<string, array<int, list<array{end_row: int, payload: string}>>> closed superblocks: entry => col => list */
     protected array $indexRangeSuperblocks = [];
+
+    /** @var list<int> 1-based columns tracked for top-K frequent values (TOPK) */
+    protected array $topValuesColumns = [];
+
+    protected int $topValuesK = MisraGries::DEFAULT_K;
+
+    /** @var array<int, MisraGries> current-sheet Misra-Gries sketch per tracked column */
+    protected array $topValueSketches = [];
+
+    /** @var array<string, array<int, string>> finished sheets: entry => col => serialized MisraGries */
+    protected array $indexTopValues = [];
 
     public function __construct()
     {
@@ -669,6 +681,46 @@ abstract class BaseXlsxWriter
         $columns = array_values(array_unique($columns));
         sort($columns);
         $this->sketchColumns = $columns;
+
+        return $this;
+    }
+
+    /**
+     * Track the top-K most frequent values of each given column (1-based),
+     * answerable from the sidecar (topValues() / the categorical slice of
+     * profile()) with zero row reads. Values fold as their canonical string
+     * form (the CHLL rule, §4.4), so text and numeric columns are both
+     * covered. Bounded to k counters per column (reference k = 64): while a
+     * column's cardinality stays ≤ k the stored counts are EXACT — the
+     * complete categorical distribution — and above k they become top-k
+     * with error ≤ N/k, distinguished by the sketch's saturated bit. The
+     * header row is excluded, as for the other sketches. Implies the
+     * random-access index. Must be called before startFile().
+     */
+    public function withTopValues(array $columns, int $k = MisraGries::DEFAULT_K): self
+    {
+        if ($this->started) {
+            throw XlsxStreamException::alreadyStarted();
+        }
+        if ($columns === []) {
+            throw new XlsxStreamException('withTopValues() needs at least one column index.');
+        }
+        foreach ($columns as $col) {
+            if (! is_int($col) || $col < 1 || $col > self::MAX_COLUMNS) {
+                throw new XlsxStreamException(
+                    'withTopValues() expects 1-based integer column indexes; got: '.var_export($col, true)
+                );
+            }
+        }
+
+        if (! $this->randomAccessIndexEnabled) {
+            $this->withRandomAccessIndex();
+        }
+
+        $columns = array_values(array_unique($columns));
+        sort($columns);
+        $this->topValuesColumns = $columns;
+        $this->topValuesK = $k;
 
         return $this;
     }
@@ -1143,6 +1195,9 @@ abstract class BaseXlsxWriter
         }
         if ($this->rangeQuantileColumns !== []) {
             $this->accumulateRangeQuantiles($row);
+        }
+        if ($this->topValuesColumns !== []) {
+            $this->accumulateTopValues($row);
         }
 
         $rowXml = $this->buildRowXml($this->currentSheetRow, $row, $styleId);
@@ -1630,6 +1685,25 @@ abstract class BaseXlsxWriter
     }
 
     /**
+     * Fold one data row's tracked values into their Misra-Gries sketches
+     * (TOPK), keyed by the same canonical string form the HyperLogLog uses
+     * (§4.4). Empty cells (null / '') are not values and are skipped, so a
+     * column of mostly-empty cells does not spend a counter on ''.
+     */
+    protected function accumulateTopValues(array $row): void
+    {
+        if (! array_is_list($row)) {
+            $row = array_values($row);
+        }
+        foreach ($this->topValuesColumns as $col) {
+            $canonical = $this->sketchCanonicalString($row[$col - 1] ?? null);
+            if ($canonical !== null) {
+                $this->topValueSketches[$col]->add($canonical);
+            }
+        }
+    }
+
+    /**
      * Close the current open superblock at a sync point: serialize each
      * column's digest with the superblock's last row, then reset. Called
      * from flushRowBuffer once ≥ SUPERBLOCK_ROWS have accumulated (snap to
@@ -1976,7 +2050,8 @@ abstract class BaseXlsxWriter
             $this->indexColumnDigests,
             $this->indexColumnHlls,
             $columnStringStats,
-            $this->indexRangeSuperblocks
+            $this->indexRangeSuperblocks,
+            $this->indexTopValues
         );
     }
 
@@ -2090,6 +2165,14 @@ abstract class BaseXlsxWriter
                 $this->rangeDigestAccum[$col] = new TDigest();
             }
             $this->rangeSuperblockRows = 0;
+        }
+
+        // Fresh sheet -> fresh Misra-Gries sketches (per-sheet, mergeable;
+        // header not folded, same reasoning as the other sketches).
+        if ($this->topValuesColumns !== []) {
+            foreach ($this->topValuesColumns as $col) {
+                $this->topValueSketches[$col] = new MisraGries($this->topValuesK);
+            }
         }
 
         [$mtime, $mdate] = $this->dosTimeParts(time());
@@ -2439,6 +2522,14 @@ abstract class BaseXlsxWriter
         // exactly on its last sync point does not emit an empty trailer.
         if ($this->rangeQuantileColumns !== [] && $this->rangeSuperblockRows > 0) {
             $this->closeRangeSuperblock($sheetInfo['filename'], $this->currentSheetRow);
+        }
+
+        // Snapshot the sheet's Misra-Gries sketches in serialized form.
+        if ($this->topValuesColumns !== []) {
+            $entry = $sheetInfo['filename'];
+            foreach ($this->topValuesColumns as $col) {
+                $this->indexTopValues[$entry][$col] = $this->topValueSketches[$col]->serialize();
+            }
         }
     }
 

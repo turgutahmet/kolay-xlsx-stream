@@ -4,6 +4,7 @@ namespace Kolay\XlsxStream\Readers;
 
 use Kolay\XlsxStream\Exceptions\XlsxReadException;
 use Kolay\XlsxStream\Sketches\HyperLogLog;
+use Kolay\XlsxStream\Sketches\MisraGries;
 use Kolay\XlsxStream\Sketches\TDigest;
 
 /**
@@ -43,6 +44,8 @@ class RandomAccessIndex
     public const TAG_STRING_ZONE = 'STRZ';
 
     public const TAG_RANGE_QUANTILE = 'TDGB';
+
+    public const TAG_TOP_VALUES = 'TOPK';
 
     public const SORTED_ASC = 0x01;
     public const SORTED_DESC = 0x02;
@@ -133,7 +136,13 @@ class RandomAccessIndex
      */
     private array $columnRangeQuantilesByEntry = [];
 
-    private function __construct(int $syncPeriod, array $totals, array $crcs, array $syncs, array $columnStats = [], array $syncPointCrcs = [], array $columnDigestPayloads = [], array $columnHllPayloads = [], array $columnStringStats = [], array $columnRangeQuantiles = [])
+    /** @var array<string, array<int, string>> entry path => 1-based column => serialized MisraGries (TOPK) */
+    private array $columnTopValuePayloads = [];
+
+    /** @var array<string, array<int, MisraGries>> memoized deserialized Misra-Gries sketches */
+    private array $columnTopValues = [];
+
+    private function __construct(int $syncPeriod, array $totals, array $crcs, array $syncs, array $columnStats = [], array $syncPointCrcs = [], array $columnDigestPayloads = [], array $columnHllPayloads = [], array $columnStringStats = [], array $columnRangeQuantiles = [], array $columnTopValues = [])
     {
         $this->syncPeriod = $syncPeriod;
         $this->totalRowsByEntry = $totals;
@@ -145,6 +154,7 @@ class RandomAccessIndex
         $this->columnHllPayloads = $columnHllPayloads;
         $this->columnStringStatsByEntry = $columnStringStats;
         $this->columnRangeQuantilesByEntry = $columnRangeQuantiles;
+        $this->columnTopValuePayloads = $columnTopValues;
     }
 
     public static function decode(string $payload): self
@@ -331,6 +341,7 @@ class RandomAccessIndex
         $columnHllPayloads = [];
         $columnStringStats = [];
         $columnRangeQuantiles = [];
+        $columnTopValues = [];
         $entryOrder = array_keys($totals);
         while ($cursor + 8 <= $bodyLen) {
             $tag = substr($body, $cursor, 4);
@@ -378,12 +389,18 @@ class RandomAccessIndex
                     substr($body, $cursor, $length),
                     $entryOrder
                 );
+            } elseif ($tag === self::TAG_TOP_VALUES) {
+                $columnTopValues = self::decodeSketchSection(
+                    substr($body, $cursor, $length),
+                    $entryOrder,
+                    self::TAG_TOP_VALUES
+                );
             }
 
             $cursor += $length;
         }
 
-        return new self($syncPeriod, $totals, $crcs, $syncs, $columnStats, $syncPointCrcs, $columnDigestPayloads, $columnHllPayloads, $columnStringStats, $columnRangeQuantiles);
+        return new self($syncPeriod, $totals, $crcs, $syncs, $columnStats, $syncPointCrcs, $columnDigestPayloads, $columnHllPayloads, $columnStringStats, $columnRangeQuantiles, $columnTopValues);
     }
 
     /**
@@ -851,6 +868,37 @@ class RandomAccessIndex
     public function hllColumns(string $sheetEntry): array
     {
         return array_keys($this->columnHllPayloads[$sheetEntry] ?? []);
+    }
+
+    /**
+     * Misra-Gries frequent-items sketch for one column (KXSI "TOPK"
+     * section), or null when the sidecar carries none for that
+     * entry/column. Deserialized lazily and memoized, like columnHll().
+     */
+    public function columnTopValues(string $sheetEntry, int $column): ?MisraGries
+    {
+        $payload = $this->columnTopValuePayloads[$sheetEntry][$column] ?? null;
+        if ($payload === null) {
+            return null;
+        }
+
+        if (! isset($this->columnTopValues[$sheetEntry][$column])) {
+            try {
+                $this->columnTopValues[$sheetEntry][$column] = MisraGries::deserialize($payload);
+            } catch (\InvalidArgumentException $e) {
+                throw XlsxReadException::corruptCentralDirectory(
+                    "TOPK sketch for sheet '{$sheetEntry}' column {$column} is invalid: ".$e->getMessage()
+                );
+            }
+        }
+
+        return $this->columnTopValues[$sheetEntry][$column];
+    }
+
+    /** @return list<int> 1-based columns that carry a TOPK sketch for the sheet */
+    public function topValueColumns(string $sheetEntry): array
+    {
+        return array_keys($this->columnTopValuePayloads[$sheetEntry] ?? []);
     }
 
     /**

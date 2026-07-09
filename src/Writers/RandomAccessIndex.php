@@ -135,6 +135,8 @@ class RandomAccessIndex
 
     public const TAG_RANGE_QUANTILE = 'TDGB';
 
+    public const TAG_TOP_VALUES = 'TOPK';
+
     public const SORTED_ASC = 0x01;
     public const SORTED_DESC = 0x02;
 
@@ -163,7 +165,7 @@ class RandomAccessIndex
      *     1-based column => serialized HyperLogLog payload. Pass [] to omit
      *     the CHLL section entirely.
      */
-    public static function encode(int $syncPeriod, array $sheets, array $columnStats = [], array $syncPointCrcs = [], array $columnDigests = [], array $columnHlls = [], array $columnStringStats = [], array $columnRangeQuantiles = []): string
+    public static function encode(int $syncPeriod, array $sheets, array $columnStats = [], array $syncPointCrcs = [], array $columnDigests = [], array $columnHlls = [], array $columnStringStats = [], array $columnRangeQuantiles = [], array $columnTopValues = []): string
     {
         $body = '';
         foreach ($sheets as $sheet) {
@@ -281,6 +283,15 @@ class RandomAccessIndex
                 }
             }
             $body .= self::TAG_RANGE_QUANTILE.pack('V', strlen($tdgb)).$tdgb;
+        }
+
+        // TOPK — per-column Misra-Gries frequent-items sketches. Shares the
+        // generic sketch frame with TDIG/CHLL (§4.3): the payload is a
+        // serialized MisraGries, self-describing (carries its own k and the
+        // saturated bit).
+        if ($columnTopValues !== []) {
+            $topk = self::encodeSketchSection($sheets, $columnTopValues);
+            $body .= self::TAG_TOP_VALUES.pack('V', strlen($topk)).$topk;
         }
 
         $header = self::MAGIC;
