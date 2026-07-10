@@ -119,6 +119,18 @@ function generateVector(string $name, callable $write): void
             $rangeQuantiles[(string) $col] = $superblocks;
         }
 
+        // Frequent-items sketches (TOPK). The golden pins each column's
+        // saturated bit and its (value, count) list in the sketch's own
+        // deterministic order. Added only when present.
+        $topValues = [];
+        foreach ($index->topValueColumns($entry) as $col) {
+            $sketch = $index->columnTopValues($entry, $col);
+            $topValues[(string) $col] = [
+                'saturated' => $sketch->saturated(),
+                'values' => $sketch->topValues(),
+            ];
+        }
+
         $sheet = [
             'entry' => $entry,
             'total_rows' => $index->totalRows($entry),
@@ -133,6 +145,9 @@ function generateVector(string $name, callable $write): void
         }
         if ($rangeQuantiles !== []) {
             $sheet['range_quantiles'] = $rangeQuantiles;
+        }
+        if ($topValues !== []) {
+            $sheet['top_values'] = $topValues;
         }
         $sheets[] = $sheet;
     }
@@ -266,6 +281,28 @@ generateVector('vector-07-range-quantiles', function (SinkableXlsxWriter $w): vo
     for ($i = 1; $i <= 300; $i++) {
         $amount = $i % 10 === 0 ? 'n/a' : (($i * 7) % 100) + 0.5;
         $w->writeRow([$i, $amount]);
+    }
+    $w->finishFile();
+});
+
+// Vector 8 — TOPK frequent-items sketches, both branches of the exactness
+// switch in one file at k=8: col 2 'status' has 4 distinct values (≤ k →
+// saturated=false, the golden pins the exact complete distribution), col 3
+// 'region' has 20 distinct (> k → saturated=true, top-k with the N/k
+// bound). The golden pins each column's saturated bit and (value, count)
+// list; the hexdump pins the payload byte layout.
+generateVector('vector-08-top-values', function (SinkableXlsxWriter $w): void {
+    $w->withRandomAccessIndex(every: 100);
+    $w->withTopValues([2, 3], 8);
+    $w->setBufferFlushInterval(100);
+    $w->startFile(['id', 'status', 'region']);
+    $statuses = ['paid', 'pending', 'refunded', 'failed'];
+    for ($i = 1; $i <= 300; $i++) {
+        $status = $i % 100 < 70 ? 'paid' : $statuses[$i % 4];
+        // Two hot regions + an 18-way cold tail → 20 distinct > k, so the
+        // sketch saturates while the heavy hitters survive with real counts.
+        $region = $i % 100 < 55 ? 'r'.($i % 2) : 'r'.(2 + $i % 18);
+        $w->writeRow([$i, $status, $region]);
     }
     $w->finishFile();
 });

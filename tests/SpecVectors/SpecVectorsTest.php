@@ -33,6 +33,7 @@ class SpecVectorsTest extends TestCase
             'sketches (TDIG + CHLL)' => ['vector-05-sketches'],
             'string zone maps (STRZ)' => ['vector-06-string-zones'],
             'range quantiles (TDGB)' => ['vector-07-range-quantiles'],
+            'top values (TOPK)' => ['vector-08-top-values'],
         ];
     }
 
@@ -116,6 +117,19 @@ class SpecVectorsTest extends TestCase
                 $actualRangeQuantiles[(string) $col] = $superblocks;
             }
             $this->assertEquals($sheet['range_quantiles'] ?? [], $actualRangeQuantiles, $entry);
+
+            // TOPK goldens pin each column's saturated bit and its
+            // (value, count) list, reproduced from the committed sketch
+            // bytes. Pre-TOPK vectors carry no key.
+            $actualTopValues = [];
+            foreach ($index->topValueColumns($entry) as $col) {
+                $sketch = $index->columnTopValues($entry, $col);
+                $actualTopValues[(string) $col] = [
+                    'saturated' => $sketch->saturated(),
+                    'values' => $sketch->topValues(),
+                ];
+            }
+            $this->assertEquals($sheet['top_values'] ?? [], $actualTopValues, $entry);
         }
     }
 

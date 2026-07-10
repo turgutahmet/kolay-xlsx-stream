@@ -20,7 +20,7 @@ OPTIONAL in this document are to be interpreted as described in
 
 | | |
 |---|---|
-| Document version | **1.5.0** |
+| Document version | **1.6.0** |
 | Format version described | KXSI binary version **2** (the `version` header byte) |
 | Reference implementation | `kolay/xlsx-stream` ≥ 3.2.0 (PHP) — writer + reader |
 | Conformance suite | `tests/SpecVectors/` in the reference repository (§8) |
@@ -596,7 +596,55 @@ rather than recomputing the snap rule, so a future change to `S` cannot
 strand old files. A superblock whose rows were all non-numeric still
 appears, carrying a `count == 0` digest.
 
-### 4.7 Reserved tags
+### 4.7 Registered: `TOPK` — per-column frequent-items sketches (heavy hitters)
+
+One Misra-Gries frequent-items sketch (Misra-Gries 1982; the mergeable
+variant of Agarwal-Cormode, *Mergeable Summaries*, 2012) per tracked
+column per sheet — the top-K most frequent values with counts, so a reader
+can answer `topValues` / the categorical slice of `profile()` from the
+sidecar alone. Values are the canonical string form (§4.4), so text and
+numeric columns are both covered; the header row is excluded, as for the
+other sketches (§4.3).
+
+`TOPK` shares the generic **section frame** with `TDIG`/`CHLL` (§4.3):
+`tracked_column_count`, then per column `column` / `payload_len` /
+`payload`. The payload is one self-describing sketch:
+
+| Size | Field |
+|---|---|
+| 2 | `format_version` — uint16, `1`. Readers MUST reject other values. |
+| 2 | `k` — uint16, the counter budget (reference `k = 64`); MUST be ≥ 1 |
+| 1 | `flags` — bit0 `saturated`; other bits reserved, MUST be 0 |
+| 4 | `counter_count` — uint32; MUST be ≤ `k` |
+| — | `counter_count` counters follow |
+
+then per counter, in `count` descending then `value` ascending order (a
+total order, so the bytes are deterministic):
+
+| Size | Field |
+|---|---|
+| 4 | `count` — uint32; MUST be ≥ 1 |
+| 2 | `value_len` — uint16 |
+| `value_len` | `value` — canonical-string bytes |
+
+**Guarantee.** A stored count never OVER-estimates the true frequency and
+under-estimates it by at most N/k, and every value with true frequency
+above N/k is retained — the true heavy hitters always survive.
+
+**The `saturated` bit is the exactness switch.** Misra-Gries has a proven
+property: if no counter was ever evicted, the surviving counts are
+*exact*. The writer sets `saturated` on the first eviction (the
+decrement-all when a k-full sketch meets an unmonitored value). Reader
+semantics: `saturated == 0` ⇒ the sketch is the **complete, exact**
+categorical distribution (cardinality was ≤ k — "status: paid 84.2%,
+exact"); `saturated == 1` ⇒ top-k with error ≤ N/k. **Mergeability is by
+construction**, so `TOPK` composes across auto-split members, shards, and
+future stitched files like `TDIG`/`CHLL`: sum shared counters, and if the
+union exceeds k, subtract the (k+1)-th largest count and drop the
+non-positive ones. Merge rule for the bit:
+`saturated_out = saturated_a OR saturated_b OR (the merge pruned)`.
+
+### 4.8 Reserved tags
 
 The following tags are reserved; their payloads are deliberately
 unspecified in this document version. Writers MUST NOT emit them with
@@ -615,7 +663,6 @@ simply skip them, as with any unknown tag.
 | `TRGM` | Per-block trigram filters over opted-in text columns — substring-search pruning. |
 | `VHIS` | Version-history chain for appendable files (per-append tail snapshot enabling in-file time travel). |
 | `CSTR` | Columnar shadow stripes: raw numeric arrays for selected columns, block-aligned with `STAT`. |
-| `TOPK` | Per-column mergeable heavy-hitters sketch (SpaceSaving / Misra-Gries) — top-K values with counts, error bounded by `N/k`, plus a `saturated` bit (see commitments) that upgrades to an *exact* categorical distribution when column cardinality ≤ k. |
 | `CORR` | Per-column-pair co-moment accumulators (five per pair: n, Σx, Σy, Σxy, Σx², Σy²) for exact Pearson correlation from the sidecar alone. |
 | `ARGP` | Per-block argmin / argmax **row numbers**, block-aligned 1:1 with `STAT`. A *separate* section — deliberately **not** an extension of a `STAT` block — because current `STAT` readers parse fixed 32-byte blocks; widening those blocks would strand them, while a new tag is skipped by construction. |
 | `SMPL` | Seeded reservoir **row sample**: K real rows (reference K = 256) drawn by unbiased Vitter-R, with their row numbers — a zero-row-read preview grid and the sample-value column of `profile()`. Weighted-reservoir mergeable, so it composes across stitch / `kxsd` like the sketch family. (Distinct from the shipped `sampleRows()`, which *computes* a sample by reading blocks; `SMPL` *stores* one for zero-read access.) |
@@ -623,25 +670,13 @@ simply skip them, as with any unknown tag.
 **v3.4 design commitments (recorded before implementation; full byte
 layouts register per feature, each with a byte-pinned vector, exactly as
 `SCRC`/`TDIG`/`CHLL` did).** These fix the decisions so the format is
-committed ahead of code (`STRZ` and `TDGB` have since graduated to
-registered sections, §4.5 and §4.6):
+committed ahead of code (`STRZ`, `TDGB` and `TOPK` have since graduated to
+registered sections, §4.5, §4.6 and §4.7):
 
-- **`TOPK` mergeability is by construction** (Agarwal–Cormode et al.,
-  *Mergeable Summaries*, 2012), so it composes across stitched / shard
-  files like `TDIG`/`CHLL`. Reference default `k = 64`.
 - One sketch family only: **t-digest, not KLL.** `TDIG` is shipped and
   its measured error suffices; a second family is spec/impl weight. KLL
   stays available as a future reserved tag if adversarial accuracy ever
   demands it.
-- **`TOPK` carries a `saturated` bit** (freeze it into the layout now).
-  Misra-Gries/SpaceSaving has a proven property: if no counter was ever
-  evicted, the surviving counts are *exact* (cardinality ≤ k ⇒ exact
-  histogram). The writer sets `saturated` on the first eviction. Reader
-  semantics: `saturated == 0` ⇒ `top_values` is the **complete, exact**
-  categorical distribution ("status: paid 84.2% — exact"); `saturated == 1`
-  ⇒ top-k with error ≤ N/k. Merge rule:
-  `saturated_out = saturated_a OR saturated_b OR (the merge itself evicts)`.
-  Conformance: two fixtures, one saturated and one not.
 - **Rank certificates (informative, zero format change; ships in the
   `profile()` release):** `STAT` block `[min, max, count]` and `TDIG` are
   independent — one *deterministic*, one *statistical*. Combining them
@@ -725,9 +760,10 @@ Structural (on the payload alone):
     positive finite weights, ascending means, weight/count agreement;
     register values within the rank bound). For `TDGB` additionally: each
     column's `end_row` values strictly increase, and every superblock
-    payload is a valid `TDIG` payload (§4.3). The reference decoder
-    validates framing at decode time and payload internals lazily at
-    first access.
+    payload is a valid `TDIG` payload (§4.3). For `TOPK` (§4.7): `k` ≥ 1,
+    `counter_count` ≤ `k`, every `count` ≥ 1, and every `value_len` stays
+    inside the payload. The reference decoder validates framing at decode
+    time and payload internals lazily at first access.
 
 Container cross-checks (against the live ZIP central directory —
 REQUIRED whenever the index will be used for seeking):
@@ -886,6 +922,7 @@ The vectors:
 | `vector-05-sketches` | `TDIG` + `CHLL` on one mixed numeric column and one text column, no `STAT` (sections are orthogonal); golden pins quantile and distinct estimates computed from the committed sketch bytes |
 | `vector-06-string-zones` | `STRZ` on a sorted common-prefix column (exercises deferred separator truncation) and a shuffled tag column with empty cells (`other` class); golden pins the truncated per-block `[min, max]` |
 | `vector-07-range-quantiles` | `TDGB` on a mixed numeric column; a single superblock (sheet under the `S` row width), so the golden pins the superblock's `end_row`, its numeric population (`n/a` cells excluded), and the quantiles its committed t-digest reproduces |
+| `vector-08-top-values` | `TOPK` on two columns: a low-cardinality status column (≤ k → `saturated=false`, the golden pins the exact complete distribution) and a high-cardinality column with small `k` (→ `saturated=true`, top-k with the N/k bound). Both branches of the exactness switch in one file |
 
 A conforming **reader** must, for each vector: decode
 `<name>.sidecar.hex` (or extract the part from the `.xlsx`) and

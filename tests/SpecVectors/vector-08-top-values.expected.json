@@ -1,0 +1,78 @@
+{
+    "sync_period": 100,
+    "sheets": [
+        {
+            "entry": "xl/worksheets/sheet1.xml",
+            "total_rows": 301,
+            "sheet_crc32": 461831435,
+            "sync_points": [
+                {
+                    "row": 102,
+                    "comp_offset": 1732,
+                    "uncomp_offset": 14765
+                },
+                {
+                    "row": 202,
+                    "comp_offset": 3309,
+                    "uncomp_offset": 29761
+                },
+                {
+                    "row": 302,
+                    "comp_offset": 4881,
+                    "uncomp_offset": 44754
+                }
+            ],
+            "sync_point_crcs": [
+                440711239,
+                886047172,
+                3587906450
+            ],
+            "column_stats": {},
+            "column_sketches": {},
+            "top_values": {
+                "2": {
+                    "saturated": false,
+                    "values": [
+                        {
+                            "value": "paid",
+                            "count": 231
+                        },
+                        {
+                            "value": "failed",
+                            "count": 24
+                        },
+                        {
+                            "value": "refunded",
+                            "count": 24
+                        },
+                        {
+                            "value": "pending",
+                            "count": 21
+                        }
+                    ]
+                },
+                "3": {
+                    "saturated": true,
+                    "values": [
+                        {
+                            "value": "r0",
+                            "count": 65
+                        },
+                        {
+                            "value": "r1",
+                            "count": 62
+                        },
+                        {
+                            "value": "r12",
+                            "count": 1
+                        },
+                        {
+                            "value": "r13",
+                            "count": 1
+                        }
+                    ]
+                }
+            }
+        }
+    ]
+}
