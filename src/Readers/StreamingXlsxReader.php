@@ -7,6 +7,7 @@ use Kolay\XlsxStream\Contracts\ProvidesCostHints;
 use Kolay\XlsxStream\Contracts\Source;
 use Kolay\XlsxStream\Exceptions\XlsxReadException;
 use Kolay\XlsxStream\Sketches\HyperLogLog;
+use Kolay\XlsxStream\Sketches\MisraGries;
 use Kolay\XlsxStream\Sketches\TDigest;
 use Kolay\XlsxStream\Sources\LocalFileSource;
 use Kolay\XlsxStream\Sources\S3RangeSource;
@@ -168,6 +169,9 @@ class StreamingXlsxReader
 
     /** @var array<string, HyperLogLog|null> merged chain HLLs, keyed chain-head|column */
     private array $chainHllCache = [];
+
+    /** @var array<string, MisraGries|null> merged chain TOPK sketches, keyed chain-head|column */
+    private array $chainTopValuesCache = [];
 
     /** @var array<int, callable> */
     private array $columnCasts = [];
@@ -1084,6 +1088,79 @@ class StreamingXlsxReader
         }
 
         return $this->chainHllCache[$key] = $merged;
+    }
+
+    /**
+     * The most frequent values of a column, answered from the sidecar's
+     * Misra-Gries sketch (KXSI "TOPK") alone — zero row reads. Returns
+     * `['exact' => bool, 'values' => list<{value, count}>]`, values ordered
+     * by count descending then value ascending, or null when the file
+     * carries no TOPK sketch for the column.
+     *
+     * `exact` is true exactly when the column's cardinality stayed within
+     * the sketch's k: then `values` is the COMPLETE categorical
+     * distribution and every count is exact. When false the sketch spilled
+     * — `values` are the top heavy hitters with counts underestimated by at
+     * most N/k (never overestimated), and low-frequency values may be
+     * absent. Values are canonical string forms (the CHLL rule, SPEC §4.4),
+     * so text and numeric columns are both covered.
+     *
+     * @return array{exact: bool, values: list<array{value: string, count: int}>}|null
+     */
+    public function topValues(int|string $column): ?array
+    {
+        if (\is_string($column)) {
+            $column = $this->resolveColumnName($column) + 1;
+        }
+
+        $chain = $this->chain();
+        $sketch = $chain !== null
+            ? $this->chainTopValues($chain, $column)
+            : $this->loadRandomAccessIndex()?->columnTopValues($this->currentEntry, $column);
+
+        if ($sketch === null) {
+            return null;
+        }
+
+        return ['exact' => ! $sketch->saturated(), 'values' => $sketch->topValues()];
+    }
+
+    /**
+     * Merged Misra-Gries sketch across a chain's members — the sketch is
+     * mergeable by construction, so per-sheet sections compose into one
+     * logical-table answer. Same all-or-nothing and clone-first rules as
+     * chainDigest()/chainHll(): a member without the sketch (or a k
+     * mismatch, impossible from one writer run) answers null rather than
+     * covering only part of the table. Memoized per (chain, column).
+     *
+     * @param  list<array{entry: string, total: int, dataStartLocal: int, globalStart: int}>  $chain
+     */
+    private function chainTopValues(array $chain, int $column): ?MisraGries
+    {
+        $key = $chain[0]['entry'].'|'.$column;
+        if (array_key_exists($key, $this->chainTopValuesCache)) {
+            return $this->chainTopValuesCache[$key];
+        }
+
+        $index = $this->loadRandomAccessIndex();
+        $merged = null;
+        foreach ($chain as $m) {
+            $sketch = $index?->columnTopValues($m['entry'], $column);
+            if ($sketch === null) {
+                return $this->chainTopValuesCache[$key] = null;
+            }
+            if ($merged === null) {
+                $merged = clone $sketch;
+            } else {
+                try {
+                    $merged->merge($sketch);
+                } catch (\InvalidArgumentException) {
+                    return $this->chainTopValuesCache[$key] = null;
+                }
+            }
+        }
+
+        return $this->chainTopValuesCache[$key] = $merged;
     }
 
     /**

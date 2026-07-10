@@ -55,6 +55,7 @@ class AutoSplitSpanTest extends TestCase
         $writer->withRandomAccessIndex(every: 10_000);
         $writer->withColumnStats([1, 2]);
         $writer->withColumnSketches([1, 2]);
+        $writer->withTopValues([3]); // city: 5 distinct ≤ k → exact across the chain
         $writer->startFile(['id', 'amount', 'city', 'flag']);
 
         for ($i = 1; $i <= self::DATA_ROWS; $i++) {
@@ -226,6 +227,35 @@ class AutoSplitSpanTest extends TestCase
         $distinct = $reader->countDistinct(1);
         $this->assertNotNull($distinct);
         $this->assertEqualsWithDelta(self::DATA_ROWS, $distinct, self::DATA_ROWS * 0.05);
+    }
+
+    public function test_top_values_span_the_chain(): void
+    {
+        $reader = $this->reader();
+
+        // city = 'c'.(id % 5): 5 distinct values ≤ k, so the merged sketch
+        // is EXACT and every count is the whole-chain total, not sheet 1's.
+        $result = $reader->topValues(3);
+        $this->assertNotNull($result);
+        $this->assertTrue($result['exact'], 'cardinality ≤ k over the chain must stay exact');
+
+        // Exact per-value oracle over 1..DATA_ROWS: value 'c'.(i%5).
+        $oracle = [];
+        for ($r = 0; $r < 5; $r++) {
+            $oracle['c'.$r] = 0;
+        }
+        for ($i = 1; $i <= self::DATA_ROWS; $i++) {
+            $oracle['c'.($i % 5)]++;
+        }
+        arsort($oracle);
+
+        $got = [];
+        foreach ($result['values'] as $p) {
+            $got[$p['value']] = $p['count'];
+        }
+        $this->assertEquals($oracle, $got, 'chain-merged top values must equal the exact whole-table counts');
+        // Sanity: the totals actually span both full sheets, not just one.
+        $this->assertSame(self::DATA_ROWS, array_sum($got));
     }
 
     public function test_shards_cover_every_chain_sheet(): void
