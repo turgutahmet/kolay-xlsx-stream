@@ -106,6 +106,55 @@ class HistogramTest extends TestCase
         $reader->close();
     }
 
+    public function test_equi_depth_spreads_a_skewed_column(): void
+    {
+        // Heavily right-skewed: 90% of the mass in the low tenth of the
+        // range. Equi-width crushes it into one bin; equi-depth spreads it.
+        mt_srand(71);
+        $data = [];
+        for ($i = 1; $i <= 6000; $i++) {
+            // 90% in [0, 100), 10% up to ~100000.
+            $data[] = $i % 10 === 0
+                ? (float) mt_rand(100, 100000)
+                : (float) mt_rand(0, 100);
+        }
+        $this->write($data);
+
+        $reader = StreamingXlsxReader::fromFile($this->testFile);
+        $bins = 10;
+
+        $width = $reader->histogram('amount', $bins, 'width');
+        $depth = $reader->histogram('amount', $bins, 'depth');
+        $this->assertNotNull($depth);
+
+        // Both cover the whole column.
+        $this->assertSame(6000, array_sum(array_column($width, 'count')));
+        $this->assertSame(6000, array_sum(array_column($depth, 'count')));
+
+        // Equi-width piles most mass into the first bin; equi-depth does not.
+        $widthMax = max(array_column($width, 'count'));
+        $depthMax = max(array_column($depth, 'count'));
+        $this->assertGreaterThan(4000, $widthMax, 'equi-width crushes the skew into one bin');
+        $this->assertLessThan($widthMax, $depthMax, 'equi-depth spreads the mass');
+        // Each equi-depth bin is near count/bins.
+        foreach ($depth as $bin) {
+            $this->assertEqualsWithDelta(6000 / $bins, $bin['count'], 6000 / $bins, 'depth bins ≈ equal');
+        }
+        $reader->close();
+    }
+
+    public function test_invalid_mode_throws(): void
+    {
+        $this->write([1.0, 2.0, 3.0]);
+        $reader = StreamingXlsxReader::fromFile($this->testFile);
+        $this->expectException(\InvalidArgumentException::class);
+        try {
+            $reader->histogram('amount', 10, 'nonsense');
+        } finally {
+            $reader->close();
+        }
+    }
+
     public function test_constant_column_collapses_to_one_bin(): void
     {
         $data = array_fill(0, 300, 42.0);

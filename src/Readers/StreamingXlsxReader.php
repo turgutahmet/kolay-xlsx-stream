@@ -1405,30 +1405,41 @@ class StreamingXlsxReader
     }
 
     /**
-     * Equi-width histogram of a column over [min, max] — the shape of its
-     * distribution, answered from the t-digest CDF alone (zero row I/O).
-     * Returns $bins bins as `{lo, hi, count}` in ascending order: bin 0 is
-     * [min, edge₁] and each later bin (edgeᵢ, edgeᵢ₊₁], so they tile the
-     * range with no gap and no overlap. Counts come from the digest rank
-     * (CDF) at each edge and are accumulated with cumulative rounding, so
-     * they sum to the exact numeric total (columnStats count) with no drift.
+     * Histogram of a column's distribution, answered from the t-digest CDF
+     * alone (zero row I/O). Returns $bins bins as `{lo, hi, count}` in
+     * ascending order: bin 0 is [min, edge₁] and each later bin (edgeᵢ,
+     * edgeᵢ₊₁], tiling the range with no gap. Counts come from the digest
+     * rank (CDF) at each edge, accumulated with cumulative rounding so they
+     * sum to the exact numeric total (columnStats count).
      *
-     * The counts are estimates (digest rank error, typically well under 1%
-     * of the column); the edges are exact. A constant column (max == min)
-     * has no range to divide and collapses to a single [min, max] bin
-     * holding every value. Chain-aware (min/max/count and the CDF all span
-     * an auto-split table). Null when the column has no t-digest to read a
-     * distribution from, or holds no numeric value.
+     * Two edge strategies via $mode:
+     *   - 'width' (default): equi-WIDTH bins over [min, max]. On a skewed
+     *     column (money, counts) most mass piles into one bin and the
+     *     interesting tail is invisible.
+     *   - 'depth': equi-DEPTH bins whose edges are the quantiles q = i/bins,
+     *     so every bin holds ≈ count/bins values — the shape of a skewed
+     *     column is spread out rather than crushed. Same digest math, no
+     *     extra I/O. Tied data can collapse adjacent edges (a zero-width bin
+     *     over a heavy value), reported honestly.
+     *
+     * Counts are estimates (digest rank error, typically well under 1% of
+     * the column); the edges are exact for 'width', digest estimates for
+     * 'depth'. A constant column (max == min) collapses to one [min, max]
+     * bin. Chain-aware. Null when the column has no t-digest or no numeric
+     * value.
      *
      * @return list<array{lo: float, hi: float, count: int}>|null
      */
-    public function histogram(int|string $column, int $bins = 10): ?array
+    public function histogram(int|string $column, int $bins = 10, string $mode = 'width'): ?array
     {
         if (\is_string($column)) {
             $column = $this->resolveColumnName($column) + 1;
         }
         if ($bins < 1) {
             throw new \InvalidArgumentException("histogram bins must be >= 1; got {$bins}");
+        }
+        if ($mode !== 'width' && $mode !== 'depth') {
+            throw new \InvalidArgumentException("histogram mode must be 'width' or 'depth'; got '{$mode}'");
         }
 
         $stats = $this->columnStats($column);
@@ -1452,16 +1463,25 @@ class StreamingXlsxReader
             return [['lo' => $min, 'hi' => $max, 'count' => $count]];
         }
 
+        // Edges: linear for equi-width, digest quantiles for equi-depth
+        // (clamped monotone — a tie can make two quantiles coincide).
+        $span = $max - $min;
+        $edges = [$min];
+        for ($i = 1; $i < $bins; $i++) {
+            $e = $mode === 'depth'
+                ? ($digest->quantile($i / $bins) ?? $min)
+                : $min + $i * $span / $bins;
+            $edges[$i] = max($e, $edges[$i - 1]);
+        }
+        $edges[$bins] = $max;
+
         $result = [];
         $cumPrev = 0;
-        $span = $max - $min;
         for ($i = 0; $i < $bins; $i++) {
-            $lo = $min + $i * $span / $bins;
-            $hi = $min + ($i + 1) * $span / $bins;
             // Last bin closes at max, where rank == 1, so the counts total
             // exactly $count; earlier edges take the digest's CDF fraction.
-            $cumHi = $i === $bins - 1 ? $count : (int) round($count * ($digest->rank($hi) ?? 1.0));
-            $result[] = ['lo' => $lo, 'hi' => $hi, 'count' => max(0, $cumHi - $cumPrev)];
+            $cumHi = $i === $bins - 1 ? $count : (int) round($count * ($digest->rank($edges[$i + 1]) ?? 1.0));
+            $result[] = ['lo' => $edges[$i], 'hi' => $edges[$i + 1], 'count' => max(0, $cumHi - $cumPrev)];
             $cumPrev = $cumHi;
         }
 
