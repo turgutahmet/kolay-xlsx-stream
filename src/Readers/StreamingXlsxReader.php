@@ -183,6 +183,35 @@ class StreamingXlsxReader
     private bool $autoDetectWithTime = true;
 
     /**
+     * Late-materialization mode for rowsWhere / rowsWhereAll scans:
+     * null = auto (the planner decides per query from row width and the
+     * sidecar's selectivity estimate), true = force on, false = force off.
+     * The default (auto) is the shipping behaviour; the forced modes exist
+     * for A/B measurement and callers who know their shape.
+     */
+    private ?bool $lateMaterialization = null;
+
+    /**
+     * Auto planner's selectivity ceiling: when the sidecar estimates that
+     * more than this fraction of the scanned (candidate-block) rows match,
+     * nearly every row is materialized anyway, so probing first is pure
+     * overhead and late materialization is left off. Below the ceiling the
+     * rejected rows skip their body parse and the scan wins. The named
+     * "≈100% selectivity → late-mat OFF" regression rides on this bound.
+     */
+    private const LATEMAT_MAX_SELECTIVITY = 0.85;
+
+    /**
+     * Auto planner's string-predicate gate: without a lexicographic
+     * distribution sketch there is no numeric selectivity estimate, so a
+     * STRZ scan uses block pruning as the proxy — late materialization is
+     * enabled only when the surviving blocks are at most this fraction of
+     * the column's blocks (a predicate that pruned little is likely
+     * unselective, where probing would not pay). Force-on bypasses it.
+     */
+    private const LATEMAT_MAX_STRING_SURVIVOR_RATIO = 0.5;
+
+    /**
      * cellXfs index → is-date bitmap from xl/styles.xml, resolved
      * lazily like the sst (styles are workbook-wide, so no per-sheet
      * invalidation). null when the archive has no styles.xml.
@@ -1276,6 +1305,94 @@ class StreamingXlsxReader
         return $this;
     }
 
+    /**
+     * Control late materialization on rowsWhere / rowsWhereAll scans.
+     *
+     * In auto mode (the default, and the shipping behaviour) the planner
+     * decides per query from the sidecar alone: when the predicate is
+     * estimated selective, each candidate row is probed on the predicate
+     * column alone and fully tokenized only when it matches, so rejected
+     * rows skip the cost of parsing every other cell. When the estimate
+     * says nearly everything matches — or there is no estimate — it stays
+     * off and the eager scan runs unchanged. The results are identical
+     * either way; only the work to reach them differs.
+     *
+     * Pass true to force it on or false to force it off (for A/B
+     * measurement or a caller that knows its shape); pass null to restore
+     * auto. Returns $this for chaining.
+     */
+    public function useLateMaterialization(?bool $mode): self
+    {
+        $this->lateMaterialization = $mode;
+
+        return $this;
+    }
+
+    /**
+     * Planner decision for a single-column predicate: should the scan probe
+     * the predicate column and defer full tokenization to matches? Forced
+     * modes short-circuit. Auto turns it on only when the sidecar predicts
+     * the predicate is selective — a numeric predicate needs a sketch
+     * estimate under the selectivity ceiling; a string predicate falls back
+     * to the STRZ block-prune ratio as a selectivity proxy. No estimate ⇒
+     * off, so auto never regresses an unindexed or unsketched column. The
+     * decision is answered entirely from the sidecar (zero row I/O): the
+     * selectivity gate alone catches the only case that loses — nearly
+     * everything matching, where probing before the inevitable tokenize is
+     * pure overhead — so no row-width read is needed to guard it.
+     */
+    private function planLateMaterialize(int $column, string $op, int|float|string $value, int|float|string|null $value2): bool
+    {
+        if ($this->lateMaterialization !== null) {
+            return $this->lateMaterialization;
+        }
+
+        if (\is_string($value)) {
+            $ratio = $this->stringSurvivorRatio($column, $op, $value, \is_string($value2) ? $value2 : null);
+
+            return $ratio !== null && $ratio <= self::LATEMAT_MAX_STRING_SURVIVOR_RATIO;
+        }
+
+        $survivors = $this->survivingRowCount($column, $op, $value, $value2);
+        $estimate = $this->estimateSelectivity($column, $op, $value, $value2);
+        if ($survivors === null || $survivors === 0 || $estimate === null) {
+            return false;
+        }
+
+        return $estimate / $survivors <= self::LATEMAT_MAX_SELECTIVITY;
+    }
+
+    /**
+     * Fraction of a string column's STRZ blocks that survive a predicate's
+     * lexicographic prune, summed across chain members — the string-side
+     * selectivity proxy for the late-mat planner. Null when the column
+     * carries no STRZ section (no basis to gate on).
+     */
+    private function stringSurvivorRatio(int $column, string $op, string $value, ?string $value2): ?float
+    {
+        $index = $this->loadRandomAccessIndex();
+        if ($index === null) {
+            return null;
+        }
+
+        [$lo, $hi] = $this->pruneBoundsString($op, $value, $value2);
+        $chain = $this->chain();
+        $entries = $chain !== null ? array_map(fn ($m) => $m['entry'], $chain) : [$this->currentEntry];
+
+        $total = 0;
+        $survivors = 0;
+        foreach ($entries as $entry) {
+            $stats = $index->columnStringStats($entry, $column);
+            if ($stats === null) {
+                return null;
+            }
+            $total += \count($stats['blocks']);
+            $survivors += \count($this->survivingBlocksString($stats['blocks'], $lo, $hi));
+        }
+
+        return $total === 0 ? null : $survivors / $total;
+    }
+
     private function fireFullScan(string $query, ?int $column, string $reason, string $entry): void
     {
         if ($this->onFullScan !== null) {
@@ -1318,10 +1435,12 @@ class StreamingXlsxReader
         // filtered — it does not exist logically, and its local number
         // would collide with the previous member's last data row after
         // remapping.
+        $lateMat = $this->planLateMaterialize($column, $op, $value, $value2);
+
         $chain = $this->chain();
         if ($chain !== null) {
             foreach ($chain as $i => $m) {
-                foreach ($this->matchRowsIn($m['entry'], $column, $op, $value, $value2) as $rn => $row) {
+                foreach ($this->matchRowsIn($m['entry'], $column, $op, $value, $value2, $lateMat) as $rn => $row) {
                     if ($i > 0 && $rn === 1) {
                         continue;
                     }
@@ -1332,7 +1451,7 @@ class StreamingXlsxReader
             return;
         }
 
-        foreach ($this->matchRowsIn($this->currentEntry, $column, $op, $value, $value2) as $rn => $row) {
+        foreach ($this->matchRowsIn($this->currentEntry, $column, $op, $value, $value2, $lateMat) as $rn => $row) {
             yield $rn => $this->applyCasts($row);
         }
     }
@@ -1431,10 +1550,14 @@ class StreamingXlsxReader
      *     the row-count bound of the candidate blocks; estimate assumes
      *     predicate independence;
      *   - estimatedBytes: compressed bytes the scan would fetch (the S3
-     *     range budget — exactly what bounded streamFrom will request).
+     *     range budget — exactly what bounded streamFrom will request);
+     *   - lateMaterialization: whether a single-column scan would probe the
+     *     predicate column and defer full tokenization to matches (auto
+     *     planner decision; always false for a multi-predicate AND, which
+     *     runs the eager matcher). See useLateMaterialization().
      *
      * @param  list<array{0: int|string, 1: string, 2: int|float, 3?: int|float|null}>  $predicates
-     * @return array{strategy: string, candidateBlocks: int, runs: int, estimatedRows: array{upper: int|null, estimate: int|null}, estimatedBytes: int}
+     * @return array{strategy: string, candidateBlocks: int, runs: int, estimatedRows: array{upper: int|null, estimate: int|null}, estimatedBytes: int, lateMaterialization: bool}
      */
     public function explain(array $predicates): array
     {
@@ -1475,6 +1598,12 @@ class StreamingXlsxReader
             }
         }
 
+        // Late materialization is wired for single-column rowsWhere scans;
+        // a multi-predicate AND runs the eager matcher, so report false
+        // rather than imply a deferral the executor would not take.
+        $lateMat = \count($preds) === 1
+            && $this->planLateMaterialize($preds[0]['col'], $preds[0]['op'], $preds[0]['value'], $preds[0]['value2']);
+
         return [
             'strategy' => $pruned ? 'zone-map-prune' : 'full-scan',
             'candidateBlocks' => $candidateBlocks,
@@ -1484,6 +1613,7 @@ class StreamingXlsxReader
                 'estimate' => $this->estimateAnd($preds),
             ],
             'estimatedBytes' => $bytes,
+            'lateMaterialization' => $lateMat,
         ];
     }
 
@@ -1834,12 +1964,12 @@ class StreamingXlsxReader
      *
      * @return \Generator<int, array<int, mixed>>
      */
-    private function matchRowsIn(string $entry, int $column, string $op, int|float|string $value, int|float|string|null $value2): \Generator
+    private function matchRowsIn(string $entry, int $column, string $op, int|float|string $value, int|float|string|null $value2, bool $lateMat = false): \Generator
     {
         // A string predicate value routes to the STRZ (string zone map)
         // path; a numeric value keeps the STAT path below.
         if (\is_string($value)) {
-            yield from $this->matchRowsStringIn($entry, $column, $op, $value, is_string($value2) ? $value2 : null);
+            yield from $this->matchRowsStringIn($entry, $column, $op, $value, is_string($value2) ? $value2 : null, $lateMat);
 
             return;
         }
@@ -1855,7 +1985,17 @@ class StreamingXlsxReader
             // this generator's contract (and the pruned path below) is
             // 1-based sheet row numbers.
             $this->fireFullScan('rowsWhere', $column, 'column-not-indexed', $entry);
-            foreach ($this->openSheetReader([$column - 1], $entry)->rowsFromOffset(null, 1) as $rn => $row) {
+            $sr = $this->openSheetReader([$column - 1], $entry);
+            if ($lateMat) {
+                foreach ($sr->rawRowsFromOffset(null, 1) as $rn => $xml) {
+                    if ($this->cellMatches($sr->probeColumn($xml, $column - 1), $op, $value, $value2)) {
+                        yield $rn => $sr->materializeRow($xml);
+                    }
+                }
+
+                return;
+            }
+            foreach ($sr->rowsFromOffset(null, 1) as $rn => $row) {
                 if ($this->cellMatches($row[$column - 1] ?? null, $op, $value, $value2)) {
                     yield $rn => $row;
                 }
@@ -1874,8 +2014,28 @@ class StreamingXlsxReader
             $start = $ranges[$firstBlock];
             $stopRow = $ranges[$lastBlock]['last_row'];
             $compLength = $this->runCompLength($ranges, $firstBlock, $lastBlock);
+            $sr = $this->openSheetReader([$column - 1], $entry);
 
-            foreach ($this->openSheetReader([$column - 1], $entry)->rowsFromOffset($start['comp_offset'], $start['start_row_at_offset'] ?? 1, $start['first_row'], $compLength) as $rn => $row) {
+            if ($lateMat) {
+                // Late materialization: probe the predicate column of each
+                // raw row and pay the full tokenize only on a match, so a
+                // rejected row skips every other cell's body parse.
+                foreach ($sr->rawRowsFromOffset($start['comp_offset'], $start['start_row_at_offset'] ?? 1, $start['first_row'], $compLength) as $rn => $xml) {
+                    if ($rn < $start['first_row']) {
+                        continue;
+                    }
+                    if ($rn > $stopRow) {
+                        break;
+                    }
+                    if ($this->cellMatches($sr->probeColumn($xml, $column - 1), $op, $value, $value2)) {
+                        yield $rn => $sr->materializeRow($xml);
+                    }
+                }
+
+                continue;
+            }
+
+            foreach ($sr->rowsFromOffset($start['comp_offset'], $start['start_row_at_offset'] ?? 1, $start['first_row'], $compLength) as $rn => $row) {
                 if ($rn < $start['first_row']) {
                     continue;
                 }
@@ -1897,7 +2057,7 @@ class StreamingXlsxReader
      *
      * @return \Generator<int, array<int, mixed>>
      */
-    private function matchRowsStringIn(string $entry, int $column, string $op, string $value, ?string $value2): \Generator
+    private function matchRowsStringIn(string $entry, int $column, string $op, string $value, ?string $value2, bool $lateMat = false): \Generator
     {
         [$lo, $hi] = $this->pruneBoundsString($op, $value, $value2);
 
@@ -1906,7 +2066,17 @@ class StreamingXlsxReader
 
         if ($stats === null) {
             $this->fireFullScan('rowsWhere', $column, 'column-not-string-indexed', $entry);
-            foreach ($this->openSheetReader([$column - 1], $entry)->rowsFromOffset(null, 1) as $rn => $row) {
+            $sr = $this->openSheetReader([$column - 1], $entry);
+            if ($lateMat) {
+                foreach ($sr->rawRowsFromOffset(null, 1) as $rn => $xml) {
+                    if ($this->cellMatchesString($sr->probeColumn($xml, $column - 1), $op, $value, $value2)) {
+                        yield $rn => $sr->materializeRow($xml);
+                    }
+                }
+
+                return;
+            }
+            foreach ($sr->rowsFromOffset(null, 1) as $rn => $row) {
                 if ($this->cellMatchesString($row[$column - 1] ?? null, $op, $value, $value2)) {
                     yield $rn => $row;
                 }
@@ -1922,8 +2092,25 @@ class StreamingXlsxReader
             $start = $ranges[$firstBlock];
             $stopRow = $ranges[$lastBlock]['last_row'];
             $compLength = $this->runCompLength($ranges, $firstBlock, $lastBlock);
+            $sr = $this->openSheetReader([$column - 1], $entry);
 
-            foreach ($this->openSheetReader([$column - 1], $entry)->rowsFromOffset($start['comp_offset'], $start['start_row_at_offset'] ?? 1, $start['first_row'], $compLength) as $rn => $row) {
+            if ($lateMat) {
+                foreach ($sr->rawRowsFromOffset($start['comp_offset'], $start['start_row_at_offset'] ?? 1, $start['first_row'], $compLength) as $rn => $xml) {
+                    if ($rn < $start['first_row']) {
+                        continue;
+                    }
+                    if ($rn > $stopRow) {
+                        break;
+                    }
+                    if ($this->cellMatchesString($sr->probeColumn($xml, $column - 1), $op, $value, $value2)) {
+                        yield $rn => $sr->materializeRow($xml);
+                    }
+                }
+
+                continue;
+            }
+
+            foreach ($sr->rowsFromOffset($start['comp_offset'], $start['start_row_at_offset'] ?? 1, $start['first_row'], $compLength) as $rn => $row) {
                 if ($rn < $start['first_row']) {
                     continue;
                 }

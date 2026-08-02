@@ -196,6 +196,107 @@ class StreamingSheetReader
     }
 
     /**
+     * Raw-XML twin of rowsFromOffset(): identical seek / skip / slice
+     * behaviour, but yields each row's `<row>…</row>` blob UNTOKENIZED so
+     * the late-materialization scan path can test a predicate against one
+     * extracted column (CellTokenizer::tokenizeColumn) and pay the full
+     * tokenizeRow only for matches. rowsFromOffset() is left byte-for-byte
+     * untouched so the default row path carries no per-row branch — the
+     * same structural-duplication trade the two tokenizer loops make.
+     *
+     * Generator key is the 1-based row number, exactly as rowsFromOffset.
+     *
+     * @return \Generator<int, string>
+     */
+    public function rawRowsFromOffset(?int $compOffset, int $startingRowNumber, ?int $fastForwardTo = null, ?int $compLength = null): \Generator
+    {
+        $rowNumber = $startingRowNumber;
+        $buffer = '';
+        $skipRemaining = $fastForwardTo !== null ? max(0, $fastForwardTo - $startingRowNumber) : 0;
+        $carry = '';
+
+        foreach ($this->inflatedChunks($compOffset, $compLength) as $inflated) {
+            if ($skipRemaining > 0) {
+                $scan = $carry.$inflated;
+                $found = substr_count($scan, '</row>');
+                if ($found < $skipRemaining) {
+                    $skipRemaining -= $found;
+                    $carry = substr($scan, -5);
+
+                    continue;
+                }
+
+                $pos = 0;
+                for ($i = 0; $i < $skipRemaining; $i++) {
+                    $next = strpos($scan, '</row>', $pos);
+                    if ($next === false) {
+                        break;
+                    }
+                    $pos = $next + 6;
+                }
+                $buffer = substr($scan, $pos);
+                $rowNumber = $fastForwardTo;
+                $skipRemaining = 0;
+            } else {
+                $buffer .= $inflated;
+            }
+
+            $cursor = 0;
+            while (true) {
+                $rowStart = self::findRowOpen($buffer, $cursor);
+                if ($rowStart < 0) {
+                    break;
+                }
+                $rowEnd = strpos($buffer, '</row>', $rowStart);
+                if ($rowEnd === false) {
+                    break;
+                }
+                $rowXml = substr($buffer, $rowStart, $rowEnd + 6 - $rowStart);
+                $cursor = $rowEnd + 6;
+                yield $rowNumber => $rowXml;
+                $rowNumber++;
+            }
+
+            if ($cursor > 0) {
+                $buffer = substr($buffer, $cursor);
+            }
+
+            if (strlen($buffer) > self::MAX_ROW_XML_BYTES) {
+                throw XlsxReadException::corruptCentralDirectory(
+                    'in-progress row XML exceeds '.(self::MAX_ROW_XML_BYTES / 1024 / 1024).
+                    ' MB without a closing tag — sheet is malformed or malicious'
+                );
+            }
+        }
+    }
+
+    /**
+     * Tokenize a raw row blob yielded by rawRowsFromOffset() into the same
+     * dense array rowsFromOffset() would have produced for it — the "full
+     * materialize" the late-mat scan defers to once a predicate matches.
+     * Applies the reader's shared-strings and date-detection bundle so a
+     * matched row is byte-identical to the eager path.
+     *
+     * @return array<int, mixed>
+     */
+    public function materializeRow(string $rowXml): array
+    {
+        return CellTokenizer::tokenizeRow($rowXml, $this->sst, $this->dates);
+    }
+
+    /**
+     * Extract a single column's value from a raw row blob — the cheap
+     * predicate probe behind late materialization. Never applies date
+     * detection (predicate columns are compared raw, exactly as the eager
+     * scan already skips them), so the value matches what materializeRow()
+     * would place at $columnIndex for predicate purposes.
+     */
+    public function probeColumn(string $rowXml, int $columnIndex): mixed
+    {
+        return CellTokenizer::tokenizeColumn($rowXml, $columnIndex, $this->sst);
+    }
+
+    /**
      * Count the rows that rows() would yield — without tokenizing a
      * single cell.
      *
