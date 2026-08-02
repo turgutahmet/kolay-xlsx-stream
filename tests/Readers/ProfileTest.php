@@ -69,8 +69,12 @@ class ProfileTest extends TestCase
         $this->assertSame($stats['max'], $c2['max']);
         $this->assertSame($stats['avg'], $c2['avg']);
         $this->assertSame($reader->countEmpty(2), $c2['empty_count']);
-        $this->assertSame($reader->quantile(2, 0.5), $c2['percentiles']['p50']);
-        $this->assertSame($reader->quantile(2, 0.95), $c2['percentiles']['p95']);
+        // Percentiles carry the estimate AND its rank certificate.
+        $this->assertSame($reader->quantile(2, 0.5), $c2['percentiles']['p50']['value']);
+        $this->assertSame($reader->quantile(2, 0.95), $c2['percentiles']['p95']['value']);
+        $exp = $reader->explainQuantile(2, 0.5);
+        $this->assertSame($exp['rank_lo'], $c2['percentiles']['p50']['rank_lo'], 'certificate must match explainQuantile');
+        $this->assertSame($exp['rank_hi'], $c2['percentiles']['p50']['rank_hi']);
         $this->assertEquals($reader->histogram(2), $c2['histogram']);
         $this->assertSame($reader->countDistinct(2), $c2['distinct']);
         $this->assertNull($c2['top_values'], 'column 2 is not TOPK-tracked');
@@ -80,7 +84,7 @@ class ProfileTest extends TestCase
         $this->assertSame('status', $c4['name']);
         $this->assertNull($c4['numeric_count']);
         $this->assertNull($c4['min']);
-        $this->assertNull($c4['percentiles']['p50']);
+        $this->assertNull($c4['percentiles']['p50']['value']);
         $this->assertNull($c4['histogram']);
         $this->assertEquals($reader->topValues(4), $c4['top_values']);
 
@@ -101,7 +105,46 @@ class ProfileTest extends TestCase
         $this->assertSame([2], array_keys($profile['columns']));
         $this->assertNull($profile['columns'][2]['histogram'], 'histogram opted out');
         // Percentiles still there (cheap, same digest).
-        $this->assertNotNull($profile['columns'][2]['percentiles']['p50']);
+        $this->assertNotNull($profile['columns'][2]['percentiles']['p50']['value']);
+        $reader->close();
+    }
+
+    public function test_percentile_keys_are_lossless(): void
+    {
+        $this->writeRich();
+        $reader = StreamingXlsxReader::fromFile($this->testFile);
+        // p99 and p99.9 must NOT collide (the old floor(q*100) key did).
+        $profile = $reader->profile(['amount'], histogram: false, percentiles: [0.5, 0.99, 0.999]);
+        $keys = array_keys($profile['columns'][2]['percentiles']);
+        $this->assertSame(['p50', 'p99', 'p99.9'], $keys);
+        $reader->close();
+    }
+
+    public function test_negative_or_zero_column_is_rejected(): void
+    {
+        $this->writeRich();
+        $reader = StreamingXlsxReader::fromFile($this->testFile);
+        $this->expectException(\InvalidArgumentException::class);
+        try {
+            $reader->profile([0]);
+        } finally {
+            $reader->close();
+        }
+    }
+
+    public function test_no_sidecar_reports_null_data_rows(): void
+    {
+        $writer = new SinkableXlsxWriter(new FileSink($this->testFile));
+        $writer->setBufferFlushInterval(100);
+        $writer->startFile(['id', 'amount']);
+        for ($i = 1; $i <= 100; $i++) {
+            $writer->writeRow([$i, (float) $i]);
+        }
+        $writer->finishFile();
+
+        $reader = StreamingXlsxReader::fromFile($this->testFile);
+        // No index → do NOT scan the whole file just to count rows.
+        $this->assertNull($reader->profile()['data_rows']);
         $reader->close();
     }
 

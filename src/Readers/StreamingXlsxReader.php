@@ -334,6 +334,25 @@ class StreamingXlsxReader
             return $this->cachedHeader;
         }
 
+        // Bounded read when indexed: the header is row 1, always in the
+        // first block, so fetch only that block's compressed bytes. Without
+        // this, rows() streams from the sheet start to EOF — on S3 a ranged
+        // GET spanning the whole sheet just to pull one row (the leak that
+        // made profile()'s "zero row I/O" a lie).
+        $index = $this->loadRandomAccessIndex();
+        if ($index !== null) {
+            $ranges = $this->blockRanges($index, $this->currentEntry);
+            if ($ranges !== []) {
+                $first = $ranges[0];
+                $compLength = $this->blockBytesForRow($index, $this->currentEntry, 1) ?: null;
+                foreach ($this->openSheetReader()->rowsFromOffset($first['comp_offset'] ?? 0, $first['start_row_at_offset'] ?? 1, 1, $compLength) as $row) {
+                    return $this->cachedHeader = $row;
+                }
+
+                return $this->cachedHeader = [];
+            }
+        }
+
         foreach ($this->openSheetReader()->rows() as $row) {
             return $this->cachedHeader = $row;
         }
@@ -895,46 +914,73 @@ class StreamingXlsxReader
     }
 
     /**
-     * One-call data-profiling report for the workbook, assembled entirely
-     * from the sidecar. For each profiled column it packages what the
-     * tracked sections know — numeric_count/empty_count (STAT), min/max/avg
-     * (STAT), the percentiles and histogram (TDIG), distinct (CHLL),
-     * top_values (TOPK) — plus a top-level correlations map (CORR) and the
-     * data-row count. Fields whose backing section is absent are null, so a
-     * text column shows its top_values while its numeric fields stay empty.
+     * One-call data-profiling report for the workbook, assembled from the
+     * sidecar. For each profiled column it packages what the tracked sections
+     * know — numeric_count/empty_count and min/max/avg/sorted (STAT), the
+     * percentiles (TDIG) each with a deterministic rank certificate, the
+     * histogram (TDIG), distinct (CHLL), and top_values (TOPK) — plus a
+     * top-level correlations map (CORR) and the data-row count. Fields whose
+     * backing section is absent are null, so a text column shows its
+     * top_values while its numeric fields stay empty.
      *
-     * $columns selects the report (names or 1-based indexes); null profiles
-     * every column that carries at least one tracked section. $histogram
-     * toggles the per-column histogram (the one bulky field); $percentiles
-     * chooses which quantiles to report (keyed p{⌊100q⌋} in the output).
+     * A column carrying ONLY string zone maps (STRZ) is not auto-profiled:
+     * its stored [min, max] fold the (non-numeric) header cell into block 0,
+     * so a clean data-only string range cannot be recovered here. Such a
+     * column still appears if it also carries a numeric/categorical section.
      *
-     * ZERO row I/O — every number comes from the index cached at open, so on
-     * S3 a multi-GB file profiles from bytes already in hand. It is NOT free
-     * of CPU, though: each column runs its sketch math (quantile
-     * interpolation, HLL estimate, histogram, top-k) and each pair its
-     * correlation, so the cost is O(columns · sketch-work + pairs). "One
-     * range request" is a statement about I/O, not latency.
+     * Each percentile is `{value, rank_lo, rank_hi}`: the estimate and the
+     * zone-map certificate bounding its true rank (rank_hi − rank_lo is the
+     * residual uncertainty — see explainQuantile). The certificate is
+     * single-sheet; on an auto-split chain rank_lo/rank_hi are null. NOTE the
+     * width tracks ROW-ORDER LOCALITY, not value clustering: a column sorted
+     * or covarying with the sheet's order gets a tight bound, an unordered
+     * one is honestly reported as [0, N].
+     *
+     * $columns selects the report (names or 1-based indexes; a non-positive
+     * index is rejected); null profiles every column carrying a tracked
+     * section. $histogram toggles the one bulky field; $percentiles chooses
+     * the quantiles, keyed losslessly (0.5 → "p50", 0.999 → "p99.9").
+     *
+     * Reads NO data rows — every number comes from the index cached at open —
+     * except a single BOUNDED read of the header row to name columns (one
+     * small range request, not a scan; skipped when the header is already
+     * cached). It is not free of CPU: each column runs its sketch math and
+     * each pair its correlation, O(columns · sketch-work + pairs). "One range
+     * request" is a statement about I/O, not latency. Without a sidecar the
+     * report is empty and data_rows is null (no whole-file scan is done for a
+     * count profile() cannot otherwise fill).
      *
      * @param  list<int|string>|null  $columns
      * @param  list<float>  $percentiles
-     * @return array{data_rows: int, columns: array<int, array<string, mixed>>, correlations: array<string, float|null>}
+     * @return array{data_rows: int|null, columns: array<int, array<string, mixed>>, correlations: array<string, float|null>}
      */
     public function profile(?array $columns = null, bool $histogram = true, int $histogramBins = 10, array $percentiles = [0.5, 0.95]): array
     {
         $index = $this->loadRandomAccessIndex();
+        if ($index === null) {
+            return ['data_rows' => null, 'columns' => [], 'correlations' => []];
+        }
+
         $chain = $this->chain();
         $entry = $chain !== null ? $chain[0]['entry'] : $this->currentEntry;
-
-        if ($index === null) {
-            return ['data_rows' => max(0, $this->rowCount() - 1), 'columns' => [], 'correlations' => []];
-        }
+        $dataRows = max(0, $this->rowCount() - 1);
 
         if ($columns === null) {
             $cols = $this->trackedColumns($index, $entry);
         } else {
             $cols = [];
             foreach ($columns as $c) {
-                $cols[] = \is_string($c) ? $this->resolveColumnName($c) + 1 : $c;
+                if (\is_string($c)) {
+                    $cols[] = $this->resolveColumnName($c) + 1;
+
+                    continue;
+                }
+                if (! \is_int($c) || $c < 1) {
+                    throw new \InvalidArgumentException(
+                        'profile() columns must be 1-based indexes or header names; got: '.var_export($c, true)
+                    );
+                }
+                $cols[] = $c;
             }
             $cols = array_values(array_unique($cols));
             sort($cols);
@@ -944,17 +990,33 @@ class StreamingXlsxReader
         $report = [];
         foreach ($cols as $col) {
             $stats = $this->columnStats($col);
+            $numericCount = $stats['count'] ?? null;
+            // Raw single-sheet blocks back the rank certificate (undefined
+            // across a chain — like explainQuantile).
+            $rawBlocks = $chain === null ? ($index->columnStats($entry, $col)['blocks'] ?? null) : null;
 
             $pcts = [];
             foreach ($percentiles as $q) {
-                $pcts['p'.(int) floor($q * 100)] = $this->quantile($col, $q);
+                $value = $this->quantile($col, $q);
+                $rankLo = null;
+                $rankHi = null;
+                if ($value !== null && $rawBlocks !== null) {
+                    [$rankLo, $rankHi] = $this->rankBounds($rawBlocks, $value);
+                }
+                $key = $this->percentileKey($q);
+                if (isset($pcts[$key])) {
+                    throw new \InvalidArgumentException("profile() percentiles collide on key '{$key}'");
+                }
+                $pcts[$key] = ['value' => $value, 'rank_lo' => $rankLo, 'rank_hi' => $rankHi];
             }
 
             $report[$col] = [
                 'column' => $col,
                 'name' => $header[$col - 1] ?? null,
-                'numeric_count' => $stats['count'] ?? null,
-                'empty_count' => $this->countEmpty($col),
+                'numeric_count' => $numericCount,
+                // Inlined (data_rows − numeric_count) so STAT folds once per
+                // column here, not again inside countEmpty().
+                'empty_count' => $stats === null ? null : max(0, $dataRows - $numericCount),
                 'min' => $stats['min'] ?? null,
                 'max' => $stats['max'] ?? null,
                 'avg' => $stats['avg'] ?? null,
@@ -972,17 +1034,30 @@ class StreamingXlsxReader
         }
 
         return [
-            'data_rows' => max(0, $this->rowCount() - 1),
+            'data_rows' => $dataRows,
             'columns' => $report,
             'correlations' => $correlations,
         ];
     }
 
     /**
-     * The 1-based columns carrying at least one tracked section (STAT,
-     * STRZ, TDIG, CHLL, TOPK), ascending and de-duplicated — the default
-     * column set profile() reports. Read from a representative entry (chain
-     * members share one schema).
+     * Lossless percentile key: 0.5 → "p50", 0.95 → "p95", 0.999 → "p99.9".
+     * Trailing zeros are trimmed so no two distinct quantiles collapse onto
+     * one key (the old ⌊100q⌋ merged p99 and p99.9).
+     */
+    private function percentileKey(float $q): string
+    {
+        $pct = rtrim(rtrim(sprintf('%.6f', $q * 100), '0'), '.');
+
+        return 'p'.$pct;
+    }
+
+    /**
+     * The 1-based columns profile() reports by default: those carrying a
+     * numeric or categorical section (STAT, TDIG, CHLL, TOPK), ascending and
+     * de-duplicated. STRZ-only columns are excluded — profile() has no clean
+     * data-only field for them (see profile()). Read from a representative
+     * entry (chain members share one schema).
      *
      * @return list<int>
      */
@@ -990,7 +1065,6 @@ class StreamingXlsxReader
     {
         $cols = array_merge(
             $index->statsColumns($entry),
-            $index->stringStatsColumns($entry),
             $index->digestColumns($entry),
             $index->hllColumns($entry),
             $index->topValueColumns($entry),
@@ -1225,7 +1299,10 @@ class StreamingXlsxReader
      *   - estimate: the t-digest value at $q;
      *   - rank_lo / rank_hi: the STAT certificate bounding the estimate's
      *     true rank among the numeric data cells (rank_hi − rank_lo is the
-     *     residual uncertainty the zone maps could not resolve);
+     *     residual uncertainty the zone maps could not resolve). Its width
+     *     tracks ROW-ORDER LOCALITY, not value clustering: a column sorted by
+     *     or covarying with the sheet's row order certifies tightly, a
+     *     scattered one is honestly [0, N];
      *   - exact_would_scan_blocks / exact_est_bytes: the blocks and
      *     compressed bytes exactQuantile($column, $q) would read — 0 blocks
      *     for a sorted, fully-numeric column (a single indexed row), a

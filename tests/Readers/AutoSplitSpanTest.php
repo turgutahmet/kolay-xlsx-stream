@@ -127,6 +127,23 @@ class AutoSplitSpanTest extends TestCase
         $this->assertEqualsWithDelta(1.0, $this->reader()->correlation(1, 2), 1e-9);
     }
 
+    public function test_profile_spans_the_chain(): void
+    {
+        $profile = $this->reader()->profile();
+
+        // data_rows and correlations fold across every member.
+        $this->assertSame(self::DATA_ROWS, $profile['data_rows']);
+        $this->assertEqualsWithDelta(1.0, $profile['correlations']['1,2'], 1e-9);
+
+        // Numeric column 1 carries its chain-wide summary; the rank
+        // certificate is undefined on a chain (single-sheet only), so the
+        // percentile value is present but its bounds are null.
+        $c1 = $profile['columns'][1];
+        $this->assertSame(self::DATA_ROWS, $c1['numeric_count']);
+        $this->assertNotNull($c1['percentiles']['p50']['value']);
+        $this->assertNull($c1['percentiles']['p50']['rank_lo'], 'no single-sheet certificate over a chain');
+    }
+
     public function test_find_row_reaches_past_the_first_sheet(): void
     {
         $hit = $this->reader()->findRow(1, 2_000_000);

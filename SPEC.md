@@ -926,32 +926,51 @@ implementation accepts this deliberately.
 ### 6.2 The `profile()` surface (informative)
 
 `profile()` is not a format feature — it is a reader convenience that
-**composes the sidecar sections into one per-column report, reading zero
-rows**. It is documented here so independent implementations expose the
-same shape and so the section set below is understood as a coherent whole
-rather than isolated tags. Every field is answered from a section already
-specified (or reserved) above; a field is simply absent when its backing
-section is not present.
+**composes the sidecar sections into one per-column report**. It is
+documented here so independent implementations expose the same shape and so
+the section set below is understood as a coherent whole rather than isolated
+tags. Every field is answered from a section already specified above; a
+field is simply absent (null) when its backing section is not present.
 
-Per column, in sheet order:
+The report is `{data_rows, columns, correlations}`. Each entry in `columns`
+(keyed by 1-based column index, default set = the columns carrying a
+numeric/categorical section):
 
 | Field | Source section | Notes |
 |---|---|---|
-| `min` / `max` / `avg` / `count` / `other` | `STAT` | avg = sum ÷ count |
-| `p50` / `p95` / arbitrary `quantile` | `TDIG` (+ `STAT`) | digest estimate, each carrying a deterministic `rank_lo`/`rank_hi` **certificate** from the STAT+TDIG sandwich above (100% width = "no deterministic bound here", stated honestly) |
-| `histogram(bins)` | `TDIG` | `count · (rank(edge₊₁) − rank(edge))` per bin — no row read |
+| `column` / `name` | core / header | 1-based index; `name` is the header cell |
+| `min` / `max` / `avg` / `sorted` | `STAT` | avg = sum ÷ count; `sorted` ∈ {asc, desc, null} |
+| `numeric_count` | `STAT` | numeric data cells |
+| `empty_count` | `STAT` | data rows minus `numeric_count` (nulls + non-numeric), header-excluded — NOT the raw `other` tally (which folds the header into block 0) |
+| `percentiles` | `TDIG` (+ `STAT`) | map keyed losslessly (`p50`, `p99.9`), each `{value, rank_lo, rank_hi}`: the digest estimate and its deterministic rank certificate from the sandwich (§4.5) |
+| `histogram` | `TDIG` | `{lo, hi, count}` bins, `count · (rank(edge₊₁) − rank(edge))` per bin |
 | `distinct` | `CHLL` | HyperLogLog estimate |
-| `top_values` | `TOPK` | value → approximate count, error ≤ N/k |
-| `empty_count` | `STAT` | the block `other` counters (nulls + non-numeric), folded |
-| `correlations` | `CORR` | Pearson r for notable column pairs |
-| `string_min` / `string_max` | `STRZ` | truncated prefixes (a bound, not the exact value) |
+| `top_values` | `TOPK` | `{exact, values}` — value → count, error ≤ N/k when saturated |
 
-**Cost honesty.** `profile()` costs **one range request** (the sidecar) —
-that is an I/O statement, not a latency one. Computing the report still
-spends CPU proportional to the number of columns and the work each
-estimator does (quantile/rank inversions, HLL merges, TOPK folds); a
-conforming implementation SHOULD document that per-column CPU cost rather
-than let "one request" imply "instant". No field ever touches a data row.
+`correlations` is a top-level map, pair `"a,b"` → Pearson r (`CORR`).
+`data_rows` is the logical data-row count, or null when the file has no
+sidecar (a count is not worth a whole-file scan a sidecar-only report cannot
+otherwise fill). A column carrying only `STRZ` is not in the default set:
+its stored `[min, max]` fold the non-numeric header into block 0, so no
+clean data-only string range is exposed.
+
+**Certificate honesty (normative framing).** A percentile's `rank_lo` /
+`rank_hi` width is governed by the zone maps' **row-order locality**, not by
+value clustering: a column sorted by — or covarying with — the sheet's row
+order yields tight per-block ranges and a narrow certificate, while a column
+whose values are scattered across rows is honestly reported as `[0, N]` (no
+deterministic bound). Implementations MUST state this rather than imply that
+every percentile comes tightly certified.
+
+**Cost honesty.** `profile()` reads **no data rows** — every number comes
+from the sidecar cached at open — with one exception: to fill `name` it
+reads the header row once, as a single **bounded** range request (the first
+block), not an open-ended stream to EOF; this is skipped when the header is
+already cached. "One request" is an I/O statement, not a latency one:
+computing the report spends CPU proportional to the columns and the work
+each estimator does (quantile/rank inversions, HLL merges, TOPK folds), and
+a conforming implementation SHOULD document that per-column CPU rather than
+let "one request" imply "instant".
 
 ## 7. Security considerations
 
