@@ -139,6 +139,18 @@ function generateVector(string $name, callable $write): void
             $argPointers[(string) $col] = $index->argPointers($entry, $col);
         }
 
+        // Co-moment accumulators (CORR). The golden pins each pair's n and
+        // Pearson r reproduced from the committed 48-byte payload. Added only
+        // when present.
+        $correlations = [];
+        foreach ($index->correlationPairs($entry) as [$a, $b]) {
+            $co = $index->correlation($entry, $a, $b);
+            $correlations[$a.','.$b] = [
+                'n' => $co->n(),
+                'r' => $co->pearson(),
+            ];
+        }
+
         $sheet = [
             'entry' => $entry,
             'total_rows' => $index->totalRows($entry),
@@ -159,6 +171,9 @@ function generateVector(string $name, callable $write): void
         }
         if ($argPointers !== []) {
             $sheet['arg_pointers'] = $argPointers;
+        }
+        if ($correlations !== []) {
+            $sheet['correlations'] = $correlations;
         }
         $sheets[] = $sheet;
     }
@@ -337,6 +352,25 @@ generateVector('vector-09-arg-pointers', function (SinkableXlsxWriter $w): void 
             $amount = -5.0;
         }
         $w->writeRow([$i, $amount]);
+    }
+    $w->finishFile();
+});
+
+// Vector 10 — CORR co-moment accumulators on three columns: col 2 and col 3
+// are linearly related (r near ±1), col 4 is independent. Blanks and text
+// are interleaved so a pair only accumulates rows where BOTH cells are
+// numeric. The golden pins each pair's n and Pearson r; the hexdump pins the
+// 48-byte accumulator layout (uint64 n + five little-endian doubles).
+generateVector('vector-10-correlations', function (SinkableXlsxWriter $w): void {
+    $w->withRandomAccessIndex(every: 100);
+    $w->withCorrelations([2, 3, 4]);
+    $w->setBufferFlushInterval(100);
+    $w->startFile(['id', 'x', 'y', 'z']);
+    for ($i = 1; $i <= 300; $i++) {
+        $x = $i % 11 === 0 ? '' : $i + 0.5;                 // blank every 11th
+        $y = $i % 13 === 0 ? 'n/a' : ($i + 0.5) * 2 - 3;    // text every 13th; y = 2x - 3
+        $z = ($i * 7919) % 500;                             // independent
+        $w->writeRow([$i, $x, $y, $z]);
     }
     $w->finishFile();
 });

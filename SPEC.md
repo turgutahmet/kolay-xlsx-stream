@@ -20,7 +20,7 @@ OPTIONAL in this document are to be interpreted as described in
 
 | | |
 |---|---|
-| Document version | **1.7.0** |
+| Document version | **1.8.0** |
 | Format version described | KXSI binary version **2** (the `version` header byte) |
 | Reference implementation | `kolay/xlsx-stream` ≥ 3.2.0 (PHP) — writer + reader |
 | Conformance suite | `tests/SpecVectors/` in the reference repository (§8) |
@@ -692,7 +692,53 @@ then per block, in block order (aligned 1:1 with `STAT`):
 | 4 | `argmin_row` — uint32, the 1-based sheet row holding this block's minimum, or 0 when the block held no numeric value |
 | 4 | `argmax_row` — uint32, the 1-based sheet row holding this block's maximum, or 0 when the block held no numeric value |
 
-### 4.9 Reserved tags
+### 4.9 Registered: `CORR` — per-pair co-moment accumulators (Pearson correlation)
+
+For each tracked column pair, the six running co-moments — n, Σx, Σy, Σxy,
+Σx², Σy² — of the rows where **both** cells are numeric. They are everything
+Pearson's correlation coefficient needs, so a reader answers `correlation(a,
+b)` from the sidecar alone with no row scan:
+
+```
+r = (n·Σxy − Σx·Σy) / √((n·Σx² − (Σx)²)(n·Σy² − (Σy)²))
+```
+
+The pair population is the STAT one restricted to rows numeric in **both**
+columns (§4.1 numeric interpretation — DateTime as Excel serial, bool as
+0/1, numeric strings as their value); the header row is excluded, and a row
+where either cell is non-numeric feeds neither the pair's n nor any sum. The
+six sums are plainly ADDITIVE, so the accumulator is **mergeable by
+construction**: it composes across auto-split members, shards and future
+stitched files exactly like the sketch family (sum the corresponding sums).
+
+**Payload**, repeated per sheet in core-body order:
+
+| Size | Field |
+|---|---|
+| 2 | `pair_count` — uint16 (0 when the sheet tracks none) |
+
+then per pair, in ascending (`column_a`, `column_b`) order:
+
+| Size | Field |
+|---|---|
+| 2 | `column_a` — uint16, **1-based**; MUST be ≥ 1 |
+| 2 | `column_b` — uint16, **1-based**; MUST be > `column_a` |
+| 8 | `n` — uint64, the count of rows numeric in both columns |
+| 8 | `sum_x` — little-endian double, Σx over those rows |
+| 8 | `sum_y` — little-endian double, Σy |
+| 8 | `sum_xy` — little-endian double, Σxy |
+| 8 | `sum_x2` — little-endian double, Σx² |
+| 8 | `sum_y2` — little-endian double, Σy² |
+
+The 48-byte accumulator layout (uint64 n then five doubles) is fixed, so the
+section frames pairs by count, not by a length prefix. A reader computes r
+from the sums and clamps it to [-1, 1]; the coefficient is **undefined**
+(the reader reports no value) when n < 2 or either column has zero variance.
+The moment form is exact to a rounding whisker on real-world magnitudes but
+subtracts like-sized quantities, so extreme values with tiny variance can
+lose precision — the standard trade for O(1) mergeable state.
+
+### 4.10 Reserved tags
 
 The following tags are reserved; their payloads are deliberately
 unspecified in this document version. Writers MUST NOT emit them with
@@ -711,14 +757,13 @@ simply skip them, as with any unknown tag.
 | `TRGM` | Per-block trigram filters over opted-in text columns — substring-search pruning. |
 | `VHIS` | Version-history chain for appendable files (per-append tail snapshot enabling in-file time travel). |
 | `CSTR` | Columnar shadow stripes: raw numeric arrays for selected columns, block-aligned with `STAT`. |
-| `CORR` | Per-column-pair co-moment accumulators (five per pair: n, Σx, Σy, Σxy, Σx², Σy²) for exact Pearson correlation from the sidecar alone. |
 | `SMPL` | Seeded reservoir **row sample**: K real rows (reference K = 256) drawn by unbiased Vitter-R, with their row numbers — a zero-row-read preview grid and the sample-value column of `profile()`. Weighted-reservoir mergeable, so it composes across stitch / `kxsd` like the sketch family. (Distinct from the shipped `sampleRows()`, which *computes* a sample by reading blocks; `SMPL` *stores* one for zero-read access.) |
 
 **v3.4 design commitments (recorded before implementation; full byte
 layouts register per feature, each with a byte-pinned vector, exactly as
 `SCRC`/`TDIG`/`CHLL` did).** These fix the decisions so the format is
-committed ahead of code (`STRZ`, `TDGB`, `TOPK` and `ARGP` have since
-graduated to registered sections, §4.5, §4.6, §4.7 and §4.8):
+committed ahead of code (`STRZ`, `TDGB`, `TOPK`, `ARGP` and `CORR` have
+since graduated to registered sections, §4.5–§4.9):
 
 - One sketch family only: **t-digest, not KLL.** `TDIG` is shipped and
   its measured error suffices; a second family is spec/impl weight. KLL
@@ -811,9 +856,11 @@ Structural (on the payload alone):
     `counter_count` ≤ `k`, every `count` ≥ 1, and every `value_len` stays
     inside the payload. For `ARGP` (§4.8): per column, `column` ≥ 1,
     `block_count` equals the column's `STAT` block count, and the two row
-    numbers per block stay inside the section. The reference decoder
-    validates framing at decode time and payload internals lazily at first
-    access.
+    numbers per block stay inside the section. For `CORR` (§4.9): per pair,
+    `1 ≤ column_a < column_b`, the 48-byte accumulator stays inside the
+    section, and — before r is *computed* — its five sums are finite. The
+    reference decoder validates framing at decode time and payload internals
+    lazily at first access.
 
 Container cross-checks (against the live ZIP central directory —
 REQUIRED whenever the index will be used for seeking):
@@ -974,6 +1021,7 @@ The vectors:
 | `vector-07-range-quantiles` | `TDGB` on a mixed numeric column; a single superblock (sheet under the `S` row width), so the golden pins the superblock's `end_row`, its numeric population (`n/a` cells excluded), and the quantiles its committed t-digest reproduces |
 | `vector-08-top-values` | `TOPK` on two columns: a low-cardinality status column (≤ k → `saturated=false`, the golden pins the exact complete distribution) and a high-cardinality column with small `k` (→ `saturated=true`, top-k with the N/k bound). Both branches of the exactness switch in one file |
 | `vector-09-arg-pointers` | `ARGP` on a non-monotone numeric column with a unique global max and min at known rows; the golden pins each block's `{minRow, maxRow}` (block-aligned 1:1 with `STAT`) and the hexdump pins the two-uint32-per-block layout |
+| `vector-10-correlations` | `CORR` on three columns (two linearly related, one independent) with interleaved blanks/text so only both-numeric rows feed a pair; the golden pins each pair's `n` and Pearson `r`, and the hexdump pins the 48-byte accumulator layout |
 
 A conforming **reader** must, for each vector: decode
 `<name>.sidecar.hex` (or extract the part from the `.xlsx`) and

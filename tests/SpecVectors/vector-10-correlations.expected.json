@@ -1,0 +1,48 @@
+{
+    "sync_period": 100,
+    "sheets": [
+        {
+            "entry": "xl/worksheets/sheet1.xml",
+            "total_rows": 301,
+            "sheet_crc32": 2933554877,
+            "sync_points": [
+                {
+                    "row": 102,
+                    "comp_offset": 2214,
+                    "uncomp_offset": 14360
+                },
+                {
+                    "row": 202,
+                    "comp_offset": 4327,
+                    "uncomp_offset": 29185
+                },
+                {
+                    "row": 302,
+                    "comp_offset": 6440,
+                    "uncomp_offset": 44010
+                }
+            ],
+            "sync_point_crcs": [
+                1009050524,
+                1002519672,
+                3313163951
+            ],
+            "column_stats": {},
+            "column_sketches": {},
+            "correlations": {
+                "2,3": {
+                    "n": 252,
+                    "r": 1
+                },
+                "2,4": {
+                    "n": 273,
+                    "r": -0.001995425172184846
+                },
+                "3,4": {
+                    "n": 277,
+                    "r": 0.0004396916699656968
+                }
+            }
+        }
+    ]
+}
