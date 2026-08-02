@@ -967,15 +967,55 @@ class StreamingXlsxReader
             }
         }
 
-        // Bracket the t-th value between xLo (upper-rank < t ⇒ target above)
-        // and xHi (lower-rank ≥ t ⇒ target at or below), each side found
-        // independently by widening the digest probe until its certificate
-        // clears the target rank. -INF / +INF mean that side stays open.
+        // Bracket the t-th value and plan the pruned scan: which contiguous
+        // block runs to read, how many values sit fully below (base), and
+        // the block/byte cost — all from the sidecar, no rows read yet.
+        $plan = $this->planExactQuantileScan($index, $this->currentEntry, $blocks, $digest, $q, $t);
+        $runs = $plan['runs'];
+        $base = $plan['base'];
+
+        if ($maxScanBlocks !== null && $plan['blocksToScan'] > $maxScanBlocks) {
+            return ['value' => $digest->quantile($q), 'exact' => false, 'blocksScanned' => 0, 'exceeded' => true];
+        }
+
+        $ranges = $this->blockRanges($index, $this->currentEntry);
+        $vals = [];
+        foreach ($runs as [$k1, $k2]) {
+            foreach ($this->rowRange($ranges[$k1]['first_row'], $ranges[$k2]['last_row']) as $rn => $row) {
+                if ($rn === 1) {
+                    continue; // header
+                }
+                $cell = $row[$column - 1] ?? null;
+                if (is_numeric($cell)) {
+                    $vals[] = (float) $cell;
+                }
+            }
+        }
+        sort($vals);
+        // Every value ≤ xLo lives in a fully-below block (base) or in a
+        // scanned straddle block, and the t-th value exceeds xLo, so it is
+        // the (t − base)-th smallest of the scanned values.
+        $value = $vals[$t - $base - 1] ?? $digest->quantile($q);
+
+        return ['value' => $value, 'exact' => true, 'blocksScanned' => $plan['blocksToScan'], 'exceeded' => false];
+    }
+
+    /**
+     * Zero-I/O plan for exactQuantile's rank-$t value: bracket the value
+     * (bracketExactValue), then partition the blocks — those proven fully
+     * below xLo are counted into `base` (never read), those fully above xHi
+     * are skipped, and the rest (block 0 always among them, being uncertain)
+     * form the contiguous `runs` to scan. Also totals the blocks and the
+     * compressed bytes those runs would fetch, so explainQuantile can quote
+     * the exact-scan cost without touching a row.
+     *
+     * @param  list<array{min: float, max: float, count: int, other: int}>  $blocks
+     * @return array{runs: list<array{0: int, 1: int}>, base: int, blocksToScan: int, bytes: int, xLo: float, xHi: float}
+     */
+    private function planExactQuantileScan(RandomAccessIndex $index, string $entry, array $blocks, TDigest $digest, float $q, int $t): array
+    {
         [$xLo, $xHi] = $this->bracketExactValue($digest, $blocks, $q, $t);
 
-        // Blocks fully below xLo are counted (base) not read; blocks fully
-        // above xHi are skipped; the rest (incl. block 0, always uncertain)
-        // are scanned. Runs are contiguous survivors so each is one seek.
         $base = 0;
         $runs = [];
         $run = null;
@@ -1005,35 +1045,126 @@ class StreamingXlsxReader
             $runs[] = $run;
         }
 
+        $ranges = $this->blockRanges($index, $entry);
+        $entrySize = $this->cd->entry($entry)['compressed_size'] ?? 0;
         $blocksToScan = 0;
+        $bytes = 0;
         foreach ($runs as [$k1, $k2]) {
             $blocksToScan += $k2 - $k1 + 1;
+            $startComp = $ranges[$k1]['comp_offset'] ?? 0;
+            $end = $ranges[$k2 + 1]['comp_offset'] ?? $entrySize;
+            $bytes += max(0, $end - $startComp);
         }
 
-        if ($maxScanBlocks !== null && $blocksToScan > $maxScanBlocks) {
-            return ['value' => $digest->quantile($q), 'exact' => false, 'blocksScanned' => 0, 'exceeded' => true];
+        return ['runs' => $runs, 'base' => $base, 'blocksToScan' => $blocksToScan, 'bytes' => $bytes, 'xLo' => $xLo, 'xHi' => $xHi];
+    }
+
+    /**
+     * Zero-I/O quantile plan: the estimate, its deterministic rank
+     * certificate, and what an exact answer would cost — the quantile
+     * analogue of explain(). Shape
+     * `{estimate, rank_lo, rank_hi, exact_would_scan_blocks, exact_est_bytes}`:
+     *   - estimate: the t-digest value at $q;
+     *   - rank_lo / rank_hi: the STAT certificate bounding the estimate's
+     *     true rank among the numeric data cells (rank_hi − rank_lo is the
+     *     residual uncertainty the zone maps could not resolve);
+     *   - exact_would_scan_blocks / exact_est_bytes: the blocks and
+     *     compressed bytes exactQuantile($column, $q) would read — 0 blocks
+     *     for a sorted, fully-numeric column (a single indexed row), a
+     *     handful for clustered data, most for uniform.
+     *
+     * All from the sidecar, zero rows read. On an auto-split chain the
+     * certificate and exact-cost fields are null (the exact scan is
+     * single-sheet); estimate still spans the chain. Null when the column
+     * carries no t-digest.
+     *
+     * @return array{estimate: float, rank_lo: int|null, rank_hi: int|null, exact_would_scan_blocks: int|null, exact_est_bytes: int|null}|null
+     */
+    public function explainQuantile(int|string $column, float $q): ?array
+    {
+        if (\is_string($column)) {
+            $column = $this->resolveColumnName($column) + 1;
+        }
+        if ($q < 0.0 || $q > 1.0) {
+            throw new \InvalidArgumentException("quantile must be within [0, 1]; got {$q}");
         }
 
-        $ranges = $this->blockRanges($index, $this->currentEntry);
-        $vals = [];
-        foreach ($runs as [$k1, $k2]) {
-            foreach ($this->rowRange($ranges[$k1]['first_row'], $ranges[$k2]['last_row']) as $rn => $row) {
-                if ($rn === 1) {
-                    continue; // header
-                }
-                $cell = $row[$column - 1] ?? null;
-                if (is_numeric($cell)) {
-                    $vals[] = (float) $cell;
-                }
+        $chain = $this->chain();
+        if ($chain !== null) {
+            $est = $this->chainDigest($chain, $column)?->quantile($q);
+
+            return $est === null ? null : [
+                'estimate' => $est,
+                'rank_lo' => null,
+                'rank_hi' => null,
+                'exact_would_scan_blocks' => null,
+                'exact_est_bytes' => null,
+            ];
+        }
+
+        $index = $this->loadRandomAccessIndex();
+        $stats = $index?->columnStats($this->currentEntry, $column);
+        $digest = $index?->columnDigest($this->currentEntry, $column);
+        if ($stats === null || $digest === null) {
+            return null;
+        }
+
+        $blocks = $stats['blocks'];
+        $total = 0;
+        foreach ($blocks as $b) {
+            $total += $b['count'];
+        }
+        if ($total === 0) {
+            return null;
+        }
+
+        $estimate = $digest->quantile($q);
+        [$rankLo, $rankHi] = $this->rankBounds($blocks, $estimate);
+        $t = max(1, min($total, (int) ceil($q * $total)));
+
+        // Sorted, fully-numeric ⇒ exact is a single indexed row: report zero
+        // blocks scanned and the compressed size of the one block that holds
+        // the target row (what that rowAt would inflate).
+        if (($stats['sorted_asc'] ?? false) && $total === ($this->rowCount() - 1)) {
+            return [
+                'estimate' => $estimate,
+                'rank_lo' => $rankLo,
+                'rank_hi' => $rankHi,
+                'exact_would_scan_blocks' => 0,
+                'exact_est_bytes' => $this->blockBytesForRow($index, $this->currentEntry, $t + 1),
+            ];
+        }
+
+        $plan = $this->planExactQuantileScan($index, $this->currentEntry, $blocks, $digest, $q, $t);
+
+        return [
+            'estimate' => $estimate,
+            'rank_lo' => $rankLo,
+            'rank_hi' => $rankHi,
+            'exact_would_scan_blocks' => $plan['blocksToScan'],
+            'exact_est_bytes' => $plan['bytes'],
+        ];
+    }
+
+    /**
+     * Compressed byte size of the index block whose row span contains
+     * $sheetRow — the single-block read a sorted-fast-path rowAt would cost.
+     * Falls back to 0 when no block covers the row (out of range).
+     */
+    private function blockBytesForRow(RandomAccessIndex $index, string $entry, int $sheetRow): int
+    {
+        $ranges = $this->blockRanges($index, $entry);
+        $entrySize = $this->cd->entry($entry)['compressed_size'] ?? 0;
+        foreach ($ranges as $k => $r) {
+            if ($sheetRow >= $r['first_row'] && $sheetRow <= $r['last_row']) {
+                $startComp = $r['comp_offset'] ?? 0;
+                $end = $ranges[$k + 1]['comp_offset'] ?? $entrySize;
+
+                return max(0, $end - $startComp);
             }
         }
-        sort($vals);
-        // Every value ≤ xLo lives in a fully-below block (base) or in a
-        // scanned straddle block, and the t-th value exceeds xLo, so it is
-        // the (t − base)-th smallest of the scanned values.
-        $value = $vals[$t - $base - 1] ?? $digest->quantile($q);
 
-        return ['value' => $value, 'exact' => true, 'blocksScanned' => $blocksToScan, 'exceeded' => false];
+        return 0;
     }
 
     /**
