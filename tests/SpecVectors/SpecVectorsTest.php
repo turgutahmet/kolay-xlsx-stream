@@ -34,6 +34,7 @@ class SpecVectorsTest extends TestCase
             'string zone maps (STRZ)' => ['vector-06-string-zones'],
             'range quantiles (TDGB)' => ['vector-07-range-quantiles'],
             'top values (TOPK)' => ['vector-08-top-values'],
+            'arg pointers (ARGP)' => ['vector-09-arg-pointers'],
         ];
     }
 
@@ -130,6 +131,15 @@ class SpecVectorsTest extends TestCase
                 ];
             }
             $this->assertEquals($sheet['top_values'] ?? [], $actualTopValues, $entry);
+
+            // ARGP goldens pin each tracked column's per-block
+            // {minRow, maxRow}, block-aligned 1:1 with STAT. Pre-ARGP
+            // vectors carry no key.
+            $actualArgPointers = [];
+            foreach ($index->argPointerColumns($entry) as $col) {
+                $actualArgPointers[(string) $col] = $index->argPointers($entry, $col);
+            }
+            $this->assertEquals($sheet['arg_pointers'] ?? [], $actualArgPointers, $entry);
         }
     }
 

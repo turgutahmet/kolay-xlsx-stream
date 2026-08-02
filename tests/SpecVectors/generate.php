@@ -131,6 +131,14 @@ function generateVector(string $name, callable $write): void
             ];
         }
 
+        // Argmin/argmax row pointers (ARGP), block-aligned 1:1 with STAT.
+        // The golden pins each block's {minRow, maxRow} (0 = no numeric
+        // value). Added only when present so pre-ARGP goldens stay unchanged.
+        $argPointers = [];
+        foreach ($index->argPointerColumns($entry) as $col) {
+            $argPointers[(string) $col] = $index->argPointers($entry, $col);
+        }
+
         $sheet = [
             'entry' => $entry,
             'total_rows' => $index->totalRows($entry),
@@ -148,6 +156,9 @@ function generateVector(string $name, callable $write): void
         }
         if ($topValues !== []) {
             $sheet['top_values'] = $topValues;
+        }
+        if ($argPointers !== []) {
+            $sheet['arg_pointers'] = $argPointers;
         }
         $sheets[] = $sheet;
     }
@@ -303,6 +314,29 @@ generateVector('vector-08-top-values', function (SinkableXlsxWriter $w): void {
         // sketch saturates while the heavy hitters survive with real counts.
         $region = $i % 100 < 55 ? 'r'.($i % 2) : 'r'.(2 + $i % 18);
         $w->writeRow([$i, $status, $region]);
+    }
+    $w->finishFile();
+});
+
+// Vector 9 — ARGP argmin/argmax row pointers, block-aligned 1:1 with STAT.
+// A non-monotone amount column with a unique global max at data row 137
+// (sheet row 138) and a unique global min at data row 200 (sheet row 201),
+// so the golden pins the per-block {minRow, maxRow} and the two blocks that
+// carry the global extremes. The hexdump pins the two-uint32-per-block layout.
+generateVector('vector-09-arg-pointers', function (SinkableXlsxWriter $w): void {
+    $w->withRandomAccessIndex(every: 50);
+    $w->withArgPointers([2]);
+    $w->setBufferFlushInterval(50);
+    $w->startFile(['id', 'amount']);
+    for ($i = 1; $i <= 250; $i++) {
+        $amount = 100.0 + (($i * 31) % 50);
+        if ($i === 137) {
+            $amount = 9999.0;
+        }
+        if ($i === 200) {
+            $amount = -5.0;
+        }
+        $w->writeRow([$i, $amount]);
     }
     $w->finishFile();
 });

@@ -20,7 +20,7 @@ OPTIONAL in this document are to be interpreted as described in
 
 | | |
 |---|---|
-| Document version | **1.6.0** |
+| Document version | **1.7.0** |
 | Format version described | KXSI binary version **2** (the `version` header byte) |
 | Reference implementation | `kolay/xlsx-stream` ≥ 3.2.0 (PHP) — writer + reader |
 | Conformance suite | `tests/SpecVectors/` in the reference repository (§8) |
@@ -644,7 +644,55 @@ union exceeds k, subtract the (k+1)-th largest count and drop the
 non-positive ones. Merge rule for the bit:
 `saturated_out = saturated_a OR saturated_b OR (the merge pruned)`.
 
-### 4.8 Reserved tags
+### 4.8 Registered: `ARGP` — per-block argmin / argmax row numbers
+
+For each `STAT` block (§4.1) of a tracked column, the sheet **row numbers**
+holding that block's minimum and maximum numeric value — so a reader can
+answer `argMin` / `argMax` (the row where an extreme occurs, not just its
+value) from the sidecar alone, with no row scan. Whole-column argmin/argmax
+is then the recorded row of the block whose stored min/max is globally
+extreme; scoping to a range restricts the block set the same way.
+
+`ARGP` is a **separate section, block-aligned 1:1 with `STAT`** — deliberately
+**not** a widening of a `STAT` block. Current `STAT` readers parse fixed
+32-byte blocks; adding fields to those blocks would strand them, whereas a
+new tag is skipped by construction (§forward-compat). A writer emits `ARGP`
+only for columns it also tracks in `STAT` (the min/max values live there);
+the two sections share block order exactly, so entry *i* of `ARGP` pairs
+with block *i* of `STAT`.
+
+The row numbers are **1-based sheet rows** (header = row 1), the same
+coordinate `STAT` blocks and sync points use. On ties within a block, the
+writer records the **first occurrence** — the earliest row achieving the
+extreme — so a whole-column extreme resolved by scanning blocks in order
+with a strict comparison is the earliest such row globally. A block that
+held no numeric value (`count == 0`) stores `{0, 0}`; a reader treats a
+column whose blocks are all `{0, 0}` as having no numeric extreme. Across an
+auto-split chain a reader lifts a member-local row to a global logical row
+via the member's `globalStart` / `dataStartLocal` bookkeeping, so `argMin` /
+`argMax` return a coordinate `rowAt` reads back to the extreme value.
+
+**Payload**, repeated per sheet in core-body order:
+
+| Size | Field |
+|---|---|
+| 2 | `tracked_column_count` — uint16 (0 when the sheet has none) |
+
+then per tracked column, in ascending column order:
+
+| Size | Field |
+|---|---|
+| 2 | `column` — uint16, **1-based**; MUST be ≥ 1 |
+| 4 | `block_count` — uint32; MUST equal the column's `STAT` block count |
+
+then per block, in block order (aligned 1:1 with `STAT`):
+
+| Size | Field |
+|---|---|
+| 4 | `argmin_row` — uint32, the 1-based sheet row holding this block's minimum, or 0 when the block held no numeric value |
+| 4 | `argmax_row` — uint32, the 1-based sheet row holding this block's maximum, or 0 when the block held no numeric value |
+
+### 4.9 Reserved tags
 
 The following tags are reserved; their payloads are deliberately
 unspecified in this document version. Writers MUST NOT emit them with
@@ -664,14 +712,13 @@ simply skip them, as with any unknown tag.
 | `VHIS` | Version-history chain for appendable files (per-append tail snapshot enabling in-file time travel). |
 | `CSTR` | Columnar shadow stripes: raw numeric arrays for selected columns, block-aligned with `STAT`. |
 | `CORR` | Per-column-pair co-moment accumulators (five per pair: n, Σx, Σy, Σxy, Σx², Σy²) for exact Pearson correlation from the sidecar alone. |
-| `ARGP` | Per-block argmin / argmax **row numbers**, block-aligned 1:1 with `STAT`. A *separate* section — deliberately **not** an extension of a `STAT` block — because current `STAT` readers parse fixed 32-byte blocks; widening those blocks would strand them, while a new tag is skipped by construction. |
 | `SMPL` | Seeded reservoir **row sample**: K real rows (reference K = 256) drawn by unbiased Vitter-R, with their row numbers — a zero-row-read preview grid and the sample-value column of `profile()`. Weighted-reservoir mergeable, so it composes across stitch / `kxsd` like the sketch family. (Distinct from the shipped `sampleRows()`, which *computes* a sample by reading blocks; `SMPL` *stores* one for zero-read access.) |
 
 **v3.4 design commitments (recorded before implementation; full byte
 layouts register per feature, each with a byte-pinned vector, exactly as
 `SCRC`/`TDIG`/`CHLL` did).** These fix the decisions so the format is
-committed ahead of code (`STRZ`, `TDGB` and `TOPK` have since graduated to
-registered sections, §4.5, §4.6 and §4.7):
+committed ahead of code (`STRZ`, `TDGB`, `TOPK` and `ARGP` have since
+graduated to registered sections, §4.5, §4.6, §4.7 and §4.8):
 
 - One sketch family only: **t-digest, not KLL.** `TDIG` is shipped and
   its measured error suffices; a second family is spec/impl weight. KLL
@@ -762,8 +809,11 @@ Structural (on the payload alone):
     column's `end_row` values strictly increase, and every superblock
     payload is a valid `TDIG` payload (§4.3). For `TOPK` (§4.7): `k` ≥ 1,
     `counter_count` ≤ `k`, every `count` ≥ 1, and every `value_len` stays
-    inside the payload. The reference decoder validates framing at decode
-    time and payload internals lazily at first access.
+    inside the payload. For `ARGP` (§4.8): per column, `column` ≥ 1,
+    `block_count` equals the column's `STAT` block count, and the two row
+    numbers per block stay inside the section. The reference decoder
+    validates framing at decode time and payload internals lazily at first
+    access.
 
 Container cross-checks (against the live ZIP central directory —
 REQUIRED whenever the index will be used for seeking):
@@ -923,6 +973,7 @@ The vectors:
 | `vector-06-string-zones` | `STRZ` on a sorted common-prefix column (exercises deferred separator truncation) and a shuffled tag column with empty cells (`other` class); golden pins the truncated per-block `[min, max]` |
 | `vector-07-range-quantiles` | `TDGB` on a mixed numeric column; a single superblock (sheet under the `S` row width), so the golden pins the superblock's `end_row`, its numeric population (`n/a` cells excluded), and the quantiles its committed t-digest reproduces |
 | `vector-08-top-values` | `TOPK` on two columns: a low-cardinality status column (≤ k → `saturated=false`, the golden pins the exact complete distribution) and a high-cardinality column with small `k` (→ `saturated=true`, top-k with the N/k bound). Both branches of the exactness switch in one file |
+| `vector-09-arg-pointers` | `ARGP` on a non-monotone numeric column with a unique global max and min at known rows; the golden pins each block's `{minRow, maxRow}` (block-aligned 1:1 with `STAT`) and the hexdump pins the two-uint32-per-block layout |
 
 A conforming **reader** must, for each vector: decode
 `<name>.sidecar.hex` (or extract the part from the `.xlsx`) and

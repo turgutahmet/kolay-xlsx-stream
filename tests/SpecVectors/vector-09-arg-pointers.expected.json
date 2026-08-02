@@ -1,0 +1,123 @@
+{
+    "sync_period": 50,
+    "sheets": [
+        {
+            "entry": "xl/worksheets/sheet1.xml",
+            "total_rows": 251,
+            "sheet_crc32": 3835014773,
+            "sync_points": [
+                {
+                    "row": 52,
+                    "comp_offset": 802,
+                    "uncomp_offset": 4173
+                },
+                {
+                    "row": 102,
+                    "comp_offset": 1435,
+                    "uncomp_offset": 8130
+                },
+                {
+                    "row": 152,
+                    "comp_offset": 2012,
+                    "uncomp_offset": 12281
+                },
+                {
+                    "row": 202,
+                    "comp_offset": 2603,
+                    "uncomp_offset": 16430
+                },
+                {
+                    "row": 252,
+                    "comp_offset": 3200,
+                    "uncomp_offset": 20580
+                }
+            ],
+            "sync_point_crcs": [
+                2375094409,
+                3538065949,
+                430574893,
+                1773305874,
+                1589370588
+            ],
+            "column_stats": {
+                "2": {
+                    "sorted_asc": false,
+                    "sorted_desc": false,
+                    "blocks": [
+                        {
+                            "min": 100,
+                            "max": 149,
+                            "sum": 6225,
+                            "count": 50,
+                            "other": 1
+                        },
+                        {
+                            "min": 100,
+                            "max": 149,
+                            "sum": 6225,
+                            "count": 50,
+                            "other": 0
+                        },
+                        {
+                            "min": 100,
+                            "max": 9999,
+                            "sum": 16077,
+                            "count": 50,
+                            "other": 0
+                        },
+                        {
+                            "min": -5,
+                            "max": 149,
+                            "sum": 6120,
+                            "count": 50,
+                            "other": 0
+                        },
+                        {
+                            "min": 100,
+                            "max": 149,
+                            "sum": 6225,
+                            "count": 50,
+                            "other": 0
+                        },
+                        {
+                            "min": 0,
+                            "max": 0,
+                            "sum": 0,
+                            "count": 0,
+                            "other": 0
+                        }
+                    ]
+                }
+            },
+            "column_sketches": {},
+            "arg_pointers": {
+                "2": [
+                    {
+                        "minRow": 51,
+                        "maxRow": 30
+                    },
+                    {
+                        "minRow": 101,
+                        "maxRow": 80
+                    },
+                    {
+                        "minRow": 151,
+                        "maxRow": 138
+                    },
+                    {
+                        "minRow": 201,
+                        "maxRow": 180
+                    },
+                    {
+                        "minRow": 251,
+                        "maxRow": 230
+                    },
+                    {
+                        "minRow": 0,
+                        "maxRow": 0
+                    }
+                ]
+            }
+        }
+    ]
+}

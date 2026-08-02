@@ -125,7 +125,7 @@ class ColumnStatsIndexTest extends TestCase
     }
 
     /**
-     * Forward-compat gate for the still-reserved v3.4 tags (SPEC §4.8):
+     * Forward-compat gate for the still-reserved v3.4 tags (SPEC §4.9):
      * CORR and SMPL are not yet registered, so today's reader MUST skip
      * every one of them and still parse STAT + the core body. (STRZ, TDGB,
      * TOPK and ARGP graduated to registered sections in v3.4.) This is the
