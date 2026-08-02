@@ -17,11 +17,11 @@ vectors.
 
 ### Added — profiling & exact quantiles
 
-- **`profile(columns?, histogram?, histogramBins?, percentiles?)`** — a
-  one-call per-column report assembled from the sidecar: numeric/empty
-  counts, min/max/avg, percentiles (each with a rank certificate), histogram,
-  distinct, top values, plus a top-level correlations map and the data-row
-  count. Reads **no data rows** — only the header once, as a single bounded
+- **`profile(columns?, histogram?, histogramBins?, percentiles?, histogramMode?)`**
+  — a one-call per-column report assembled from the sidecar: numeric/empty
+  counts, min/max/avg, percentiles (each with a rank certificate), histogram
+  (`histogramMode` 'width'/'depth'), distinct, top values, plus a top-level
+  correlations map and the data-row count. Reads **no data rows** — only the header once, as a single bounded
   range request, to name columns. `data_rows` is null when the file has no
   sidecar (no whole-file scan for a count it cannot otherwise fill).
 - **`exactQuantile(col, q, maxScanBlocks?)`** — the exact nearest-rank

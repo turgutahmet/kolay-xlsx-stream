@@ -933,8 +933,9 @@ class StreamingXlsxReader
      *
      * $columns selects the report (names or 1-based indexes; a non-positive
      * index is rejected); null profiles every column carrying a tracked
-     * section. $histogram toggles the one bulky field; $percentiles chooses
-     * the quantiles, keyed losslessly (0.5 → "p50", 0.999 → "p99.9").
+     * section. $histogram toggles the one bulky field and $histogramMode
+     * picks its shape ('width' or 'depth' — see histogram()); $percentiles
+     * chooses the quantiles, keyed losslessly (0.5 → "p50", 0.999 → "p99.9").
      *
      * Reads NO data rows — every number comes from the index cached at open —
      * except a single BOUNDED read of the header row to name columns (one
@@ -949,7 +950,7 @@ class StreamingXlsxReader
      * @param  list<float>  $percentiles
      * @return array{data_rows: int|null, columns: array<int, array<string, mixed>>, correlations: array<string, float|null>}
      */
-    public function profile(?array $columns = null, bool $histogram = true, int $histogramBins = 10, array $percentiles = [0.5, 0.95]): array
+    public function profile(?array $columns = null, bool $histogram = true, int $histogramBins = 10, array $percentiles = [0.5, 0.95], string $histogramMode = 'width'): array
     {
         $index = $this->loadRandomAccessIndex();
         if ($index === null) {
@@ -1024,7 +1025,7 @@ class StreamingXlsxReader
                 'avg' => $stats['avg'] ?? null,
                 'sorted' => $stats['sorted'] ?? null,
                 'percentiles' => $pcts,
-                'histogram' => $histogram ? $this->histogram($col, $histogramBins) : null,
+                'histogram' => $histogram ? $this->histogram($col, $histogramBins, $histogramMode) : null,
                 'distinct' => $this->countDistinct($col),
                 'top_values' => $this->topValues($col),
             ];

@@ -109,6 +109,18 @@ class ProfileTest extends TestCase
         $reader->close();
     }
 
+    public function test_histogram_mode_is_threaded(): void
+    {
+        $this->writeRich();
+        $reader = StreamingXlsxReader::fromFile($this->testFile);
+        // profile() must pass the mode through to histogram().
+        $this->assertEquals(
+            $reader->histogram(2, 10, 'depth'),
+            $reader->profile(['amount'], histogramMode: 'depth')['columns'][2]['histogram']
+        );
+        $reader->close();
+    }
+
     public function test_percentile_keys_are_lossless(): void
     {
         $this->writeRich();
