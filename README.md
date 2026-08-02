@@ -640,7 +640,13 @@ CPU — `profile()` runs each column's sketch math; "one range request" is a
 statement about I/O, not latency. A percentile's certificate width tracks
 **row-order locality**, not value clustering: a column sorted by (or
 covarying with) the sheet's order certifies tightly, a scattered one is
-honestly reported as `[0, N]`. See [SPEC.md](SPEC.md) §4–§6 for the format.
+honestly reported as `[0, N]`. The certificate resolution is bounded by the
+block size — on a sorted column its width is ≈ the sync interval (`every`),
+so it is a knob: a smaller `every` tightens the certificate and thins the
+exact-scan pruning, at the cost of a larger sidecar. `histogram()` also
+takes `mode: 'depth'` for equi-depth bins (each ≈ equal count), which reads
+a skewed column far better than the default equi-width. See
+[SPEC.md](SPEC.md) §4–§6 for the format.
 
 ### Integrity — verified reads & writes *(v3.3+)*
 

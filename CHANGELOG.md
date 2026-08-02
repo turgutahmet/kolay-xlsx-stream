@@ -33,16 +33,21 @@ vectors.
 - **`explainQuantile(col, q)`** — the zero-I/O quantile plan: the estimate,
   its deterministic `rank_lo`/`rank_hi` certificate, and what an exact answer
   would scan (`exact_would_scan_blocks`, `exact_est_bytes`).
-- **`histogram(col, bins)`** — an equi-width distribution over `[min, max]`
-  from the t-digest CDF, counts summing to the exact total (zero I/O).
+- **`histogram(col, bins, mode)`** — a distribution from the t-digest CDF,
+  counts summing to the exact total (zero I/O). `mode: 'width'` (default) is
+  equi-width over `[min, max]`; `mode: 'depth'` is equi-depth (quantile
+  edges, each bin ≈ equal count) — the readable choice for a skewed column.
 - **`countEmpty(col)`** — the missing side of `columnStats()['count']`
   (data rows minus numeric count, header-safe), from the STAT zone maps.
 
 ### Added — new sketches & registered TLV sections
 
 - **`withCorrelations([cols])` + `correlation(a, b)`** — exact pairwise
-  Pearson correlation from per-pair co-moment accumulators (§4.9 `CORR`).
-  Only rows numeric in both columns feed a pair; mergeable across chains.
+  Pearson correlation from per-pair co-moment accumulators (§4.9 `CORR`),
+  stored in centred (Welford) form and merged by Chan's algorithm so a
+  timestamp/date-serial column — huge values, tiny spread — stays accurate
+  where the textbook sum form loses precision. Only rows numeric in both
+  columns feed a pair; mergeable across chains.
 - **`withTopValues([cols], k?)` + `topValues(col)`** — Misra-Gries
   frequent-items sketch; exact when cardinality ≤ k, otherwise top-k with an
   N/k bound and a `saturated` flag (§4.7 `TOPK`).
@@ -71,9 +76,10 @@ vectors.
   EOF — on S3, one small ranged GET rather than one spanning the whole sheet
   to pull a single row. The bounded read falls back to a full read if the
   block table is unusable (a bad sidecar may slow a read, never change it).
-- SPEC document version 1.6.0 → 1.8.0: `STRZ`, `TDGB`, `TOPK`, `ARGP` and
+- SPEC document version 1.6.0 → 1.8.1: `STRZ`, `TDGB`, `TOPK`, `ARGP` and
   `CORR` graduate from reserved to registered sections (§4.5–§4.9), each with
-  a byte-pinned conformance vector; §6.2 documents the `profile()` surface.
+  a byte-pinned conformance vector; §6.2 documents the `profile()` surface;
+  §4.9 pins the `CORR` payload as centred moments.
 
 ## [3.3.0] — 2026-07-06
 
