@@ -897,6 +897,216 @@ class StreamingXlsxReader
     }
 
     /**
+     * EXACT nearest-rank quantile of a column — the Rank-Sandwich. The
+     * t-digest gives a fast estimate; the STAT zone maps give a deterministic
+     * rank certificate around it; together they bracket the target value
+     * between two thresholds so only the blocks that could hold it are read.
+     * On clustered data that is a handful of blocks; on uniform data it is
+     * honestly most of them (the estimate was already good — exactness costs
+     * a scan). q is the nearest-rank quantile: the value at rank
+     * t = max(1, ⌈q·N⌉) of the N numeric data cells (q=0 → min, q=1 → max).
+     *
+     * Returns `{value, exact, blocksScanned, exceeded}`:
+     *   - a sorted, fully-numeric column answers from a SINGLE rowAt (the
+     *     t-th value is the row at that rank) with blocksScanned 0;
+     *   - otherwise the pruned block scan returns the exact value;
+     *   - if `maxScanBlocks` is set and the plan would exceed it, the scan is
+     *     NOT run: the certified digest estimate is returned with
+     *     exact=false, exceeded=true (honest degradation, never an exception).
+     *
+     * Single-sheet: the block scan is over the current sheet. On an
+     * auto-split chain (a >1M-row table, where a scan is expensive anyway)
+     * it degrades to the merged-digest estimate (exact=false). Null when the
+     * column carries no t-digest — there is no basis to bracket or estimate.
+     *
+     * @return array{value: float, exact: bool, blocksScanned: int, exceeded: bool}|null
+     */
+    public function exactQuantile(int|string $column, float $q, ?int $maxScanBlocks = null): ?array
+    {
+        if (\is_string($column)) {
+            $column = $this->resolveColumnName($column) + 1;
+        }
+        if ($q < 0.0 || $q > 1.0) {
+            throw new \InvalidArgumentException("quantile must be within [0, 1]; got {$q}");
+        }
+
+        // Chain: block-scan exactness is single-sheet; degrade to the merged
+        // estimate honestly (these are the >1M-row tables).
+        $chain = $this->chain();
+        if ($chain !== null) {
+            $est = $this->chainDigest($chain, $column)?->quantile($q);
+
+            return $est === null ? null : ['value' => $est, 'exact' => false, 'blocksScanned' => 0, 'exceeded' => false];
+        }
+
+        $index = $this->loadRandomAccessIndex();
+        $stats = $index?->columnStats($this->currentEntry, $column);
+        $digest = $index?->columnDigest($this->currentEntry, $column);
+        if ($stats === null || $digest === null) {
+            return null;
+        }
+
+        $blocks = $stats['blocks'];
+        $total = 0;
+        foreach ($blocks as $b) {
+            $total += $b['count'];
+        }
+        if ($total === 0) {
+            return null;
+        }
+
+        $t = max(1, min($total, (int) ceil($q * $total)));
+
+        // Sorted fast-path: values ascending AND every data row numeric
+        // (count == data rows) ⇒ row order is sorted order, so the t-th
+        // value is the row at rank t (sheet row t+1). One row read.
+        if (($stats['sorted_asc'] ?? false) && $total === ($this->rowCount() - 1)) {
+            $cell = $this->rowAt($t + 1)[$column - 1] ?? null;
+            if (is_numeric($cell)) {
+                return ['value' => (float) $cell, 'exact' => true, 'blocksScanned' => 0, 'exceeded' => false];
+            }
+        }
+
+        // Bracket the t-th value between xLo (upper-rank < t ⇒ target above)
+        // and xHi (lower-rank ≥ t ⇒ target at or below), each side found
+        // independently by widening the digest probe until its certificate
+        // clears the target rank. -INF / +INF mean that side stays open.
+        [$xLo, $xHi] = $this->bracketExactValue($digest, $blocks, $q, $t);
+
+        // Blocks fully below xLo are counted (base) not read; blocks fully
+        // above xHi are skipped; the rest (incl. block 0, always uncertain)
+        // are scanned. Runs are contiguous survivors so each is one seek.
+        $base = 0;
+        $runs = [];
+        $run = null;
+        foreach ($blocks as $k => $b) {
+            $fullyBelow = $k !== 0 && $b['count'] > 0 && $b['max'] <= $xLo;
+            $skip = $b['count'] === 0
+                || $fullyBelow
+                || ($k !== 0 && $b['min'] > $xHi);
+            if ($fullyBelow) {
+                $base += $b['count'];
+            }
+            if ($skip) {
+                if ($run !== null) {
+                    $runs[] = $run;
+                    $run = null;
+                }
+
+                continue;
+            }
+            if ($run === null) {
+                $run = [$k, $k];
+            } else {
+                $run[1] = $k;
+            }
+        }
+        if ($run !== null) {
+            $runs[] = $run;
+        }
+
+        $blocksToScan = 0;
+        foreach ($runs as [$k1, $k2]) {
+            $blocksToScan += $k2 - $k1 + 1;
+        }
+
+        if ($maxScanBlocks !== null && $blocksToScan > $maxScanBlocks) {
+            return ['value' => $digest->quantile($q), 'exact' => false, 'blocksScanned' => 0, 'exceeded' => true];
+        }
+
+        $ranges = $this->blockRanges($index, $this->currentEntry);
+        $vals = [];
+        foreach ($runs as [$k1, $k2]) {
+            foreach ($this->rowRange($ranges[$k1]['first_row'], $ranges[$k2]['last_row']) as $rn => $row) {
+                if ($rn === 1) {
+                    continue; // header
+                }
+                $cell = $row[$column - 1] ?? null;
+                if (is_numeric($cell)) {
+                    $vals[] = (float) $cell;
+                }
+            }
+        }
+        sort($vals);
+        // Every value ≤ xLo lives in a fully-below block (base) or in a
+        // scanned straddle block, and the t-th value exceeds xLo, so it is
+        // the (t − base)-th smallest of the scanned values.
+        $value = $vals[$t - $base - 1] ?? $digest->quantile($q);
+
+        return ['value' => $value, 'exact' => true, 'blocksScanned' => $blocksToScan, 'exceeded' => false];
+    }
+
+    /**
+     * Deterministic rank certificate for a value $x from STAT zone maps:
+     * `[lower, upper]` bounds the true count of numeric data cells ≤ $x.
+     * `lower` sums blocks proven entirely below $x; `upper` sums blocks that
+     * might reach it. Block 0 is ALWAYS uncertain — the writer folds the
+     * (non-numeric) header into it, so its min/max cannot be trusted as a
+     * pure data-value range — and thus only ever contributes to `upper`.
+     * Zero I/O; the basis of exactQuantile's bracketing and explainQuantile.
+     *
+     * @param  list<array{min: float, max: float, count: int, other: int}>  $blocks
+     * @return array{0: int, 1: int}
+     */
+    private function rankBounds(array $blocks, float $x): array
+    {
+        $lower = 0;
+        $upper = 0;
+        foreach ($blocks as $k => $b) {
+            if ($b['count'] === 0) {
+                continue;
+            }
+            $uncertain = $k === 0;
+            if (! $uncertain && $b['max'] < $x) {
+                $lower += $b['count'];
+            }
+            if ($uncertain || $b['min'] <= $x) {
+                $upper += $b['count'];
+            }
+        }
+
+        return [$lower, $upper];
+    }
+
+    /**
+     * Find the bracket [xLo, xHi] enclosing the rank-$t value, each side
+     * independent (the PoC lesson: one side collapsing must not drag the
+     * other). Widen the digest probe geometrically until its rank
+     * certificate proves the side: xLo is the largest probe whose UPPER
+     * rank is still below $t (so the target is strictly above it); xHi the
+     * smallest probe whose LOWER rank already reaches $t (target at or
+     * below). A side that never clears stays open (-INF / +INF), which makes
+     * exactQuantile scan out to that end — the honest uniform-data cost.
+     *
+     * @param  list<array{min: float, max: float, count: int, other: int}>  $blocks
+     * @return array{0: float, 1: float}
+     */
+    private function bracketExactValue(TDigest $digest, array $blocks, float $q, int $t): array
+    {
+        $xLo = -INF;
+        for ($eps = 0.002; $eps <= 1.0; $eps *= 2) {
+            $c = $digest->quantile(max(0.0, $q - $eps));
+            [, $upper] = $this->rankBounds($blocks, $c);
+            if ($upper < $t) {
+                $xLo = $c;
+                break;
+            }
+        }
+
+        $xHi = INF;
+        for ($eps = 0.002; $eps <= 1.0; $eps *= 2) {
+            $c = $digest->quantile(min(1.0, $q + $eps));
+            [$lower] = $this->rankBounds($blocks, $c);
+            if ($lower >= $t) {
+                $xHi = $c;
+                break;
+            }
+        }
+
+        return [$xLo, $xHi];
+    }
+
+    /**
      * Build the t-digest for $column over the inclusive sheet-row span
      * [$from, $to] by merging every TDGB superblock whose span lies wholly
      * inside the range and scanning only the partial rows at the two
