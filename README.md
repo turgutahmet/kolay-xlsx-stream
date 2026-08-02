@@ -623,9 +623,12 @@ $reader->argMax('amount');                     // ['row' => 138, 'value' => 9999
 $reader->countEmpty('amount');                 // non-numeric/missing data cells
 $reader->correlation('amount', 'score');       // exact Pearson r
 
-// Quantile of a ROW RANGE or a GROUP — from per-superblock digests:
+// Quantile of a ROW RANGE or a GROUP — from per-superblock digests. GROUP
+// BY is numeric-keyed (a date column bucketed here); a string group key is
+// a v3.5 STRZ candidate, so group by a numeric id or a Bucket:: helper:
+use Kolay\XlsxStream\Readers\Bucket;
 $reader->quantile('amount', 0.5, from: 1000, to: 5000);
-$reader->groupQuantile('region', 'amount', 0.9);
+$reader->groupQuantile('order_date', 'amount', 0.9, Bucket::month());  // p90 per month
 
 // Scan tuning: late materialization is on by default when the planner
 // predicts a selective predicate; force it for A/B measurement.
