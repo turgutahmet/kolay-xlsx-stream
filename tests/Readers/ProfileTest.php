@@ -132,6 +132,30 @@ class ProfileTest extends TestCase
         }
     }
 
+    public function test_column_past_the_header_width_is_rejected(): void
+    {
+        // Symmetric with the name path (unknown name throws): an index past
+        // the header must not silently return an all-null row.
+        $this->writeRich();
+        $reader = StreamingXlsxReader::fromFile($this->testFile);
+        $this->expectException(\InvalidArgumentException::class);
+        try {
+            $reader->profile([99]); // header has 4 columns
+        } finally {
+            $reader->close();
+        }
+    }
+
+    public function test_exact_duplicate_percentiles_are_deduplicated_not_rejected(): void
+    {
+        $this->writeRich();
+        $reader = StreamingXlsxReader::fromFile($this->testFile);
+        // The same q twice is a no-op, not a collision.
+        $profile = $reader->profile(['amount'], histogram: false, percentiles: [0.5, 0.5, 0.95]);
+        $this->assertSame(['p50', 'p95'], array_keys($profile['columns'][2]['percentiles']));
+        $reader->close();
+    }
+
     public function test_no_sidecar_reports_null_data_rows(): void
     {
         $writer = new SinkableXlsxWriter(new FileSink($this->testFile));

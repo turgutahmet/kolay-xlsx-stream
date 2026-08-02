@@ -96,7 +96,6 @@ class StreamingXlsxReader
     private array $sheets;
 
     private string $currentEntry;
-    private ?array $cachedHeader = null;
     private ?SharedStrings $sst = null;
     private bool $sstResolved = false;
     private ?RandomAccessIndex $randomAccessIndex = null;
@@ -300,7 +299,6 @@ class StreamingXlsxReader
         foreach ($this->sheets as $sheet) {
             if ($sheet['name'] === $name) {
                 $this->currentEntry = $sheet['entry'];
-                $this->cachedHeader = null;
                 $this->columnCasts = [];
 
                 return $this;
@@ -316,48 +314,21 @@ class StreamingXlsxReader
             throw XlsxReadException::entryNotFound("sheet at index {$index}");
         }
         $this->currentEntry = $this->sheets[$index]['entry'];
-        $this->cachedHeader = null;
         $this->columnCasts = [];
 
         return $this;
     }
 
     /**
-     * Return the first row of the selected sheet. Cached after first call,
-     * so subsequent invocations do not re-open the underlying stream.
+     * Return the header (first row) of the selected sheet. Memoized per
+     * entry; read bounded (only the first block) when the file is indexed —
+     * see readHeaderRow().
      *
      * @return array<int, mixed>
      */
     public function header(): array
     {
-        if ($this->cachedHeader !== null) {
-            return $this->cachedHeader;
-        }
-
-        // Bounded read when indexed: the header is row 1, always in the
-        // first block, so fetch only that block's compressed bytes. Without
-        // this, rows() streams from the sheet start to EOF — on S3 a ranged
-        // GET spanning the whole sheet just to pull one row (the leak that
-        // made profile()'s "zero row I/O" a lie).
-        $index = $this->loadRandomAccessIndex();
-        if ($index !== null) {
-            $ranges = $this->blockRanges($index, $this->currentEntry);
-            if ($ranges !== []) {
-                $first = $ranges[0];
-                $compLength = $this->blockBytesForRow($index, $this->currentEntry, 1) ?: null;
-                foreach ($this->openSheetReader()->rowsFromOffset($first['comp_offset'] ?? 0, $first['start_row_at_offset'] ?? 1, 1, $compLength) as $row) {
-                    return $this->cachedHeader = $row;
-                }
-
-                return $this->cachedHeader = [];
-            }
-        }
-
-        foreach ($this->openSheetReader()->rows() as $row) {
-            return $this->cachedHeader = $row;
-        }
-
-        return $this->cachedHeader = [];
+        return $this->readHeaderRow($this->currentEntry);
     }
 
     /**
@@ -964,6 +935,8 @@ class StreamingXlsxReader
         $chain = $this->chain();
         $entry = $chain !== null ? $chain[0]['entry'] : $this->currentEntry;
         $dataRows = max(0, $this->rowCount() - 1);
+        $header = $this->header();
+        $width = \count($header);
 
         if ($columns === null) {
             $cols = $this->trackedColumns($index, $entry);
@@ -975,9 +948,11 @@ class StreamingXlsxReader
 
                     continue;
                 }
-                if (! \is_int($c) || $c < 1) {
+                // Reject a non-positive index AND (symmetric with the name
+                // path's unknown-column error) one past the header width.
+                if (! \is_int($c) || $c < 1 || ($width > 0 && $c > $width)) {
                     throw new \InvalidArgumentException(
-                        'profile() columns must be 1-based indexes or header names; got: '.var_export($c, true)
+                        'profile() columns must be 1-based indexes within the header, or header names; got: '.var_export($c, true)
                     );
                 }
                 $cols[] = $c;
@@ -986,7 +961,10 @@ class StreamingXlsxReader
             sort($cols);
         }
 
-        $header = $this->header();
+        // Distinct quantiles only — an exact-duplicate q is silently
+        // de-duplicated; a genuine key collision (two different q sharing a
+        // key) still throws below.
+        $percentiles = array_values(array_unique($percentiles, SORT_REGULAR));
         $report = [];
         foreach ($cols as $col) {
             $stats = $this->columnStats($col);
@@ -3928,7 +3906,6 @@ class StreamingXlsxReader
             foreach ($this->sheets as $sheet) {
                 if ($sheet['entry'] === $shard['sheet']) {
                     $this->currentEntry = $shard['sheet'];
-                    $this->cachedHeader = null;
                     $this->columnCasts = [];
                     break;
                 }
@@ -4514,22 +4491,61 @@ class StreamingXlsxReader
     /**
      * Raw tokenized header row of an arbitrary entry — casts and date
      * detection deliberately bypassed so equality means "same bytes on
-     * disk", the only sound continuation test.
+     * disk", the only sound continuation test and the basis for name
+     * resolution. Delegates to readHeaderRow so name lookup and header()
+     * share ONE bounded read and ONE cache.
      *
      * @return array<int, mixed>
      */
     private function rawHeaderOf(string $entry): array
     {
-        if (! array_key_exists($entry, $this->headerByEntry)) {
-            $this->headerByEntry[$entry] = [];
-            $reader = new StreamingSheetReader($this->source, $this->cd, $entry, 65536, $this->resolveSharedStrings(), null);
-            foreach ($reader->rows() as $row) {
-                $this->headerByEntry[$entry] = $row;
-                break;
+        return $this->readHeaderRow($entry);
+    }
+
+    /**
+     * Header (row 1) of an entry, read once and memoized. When the file is
+     * indexed the read is BOUNDED to the first block's compressed bytes —
+     * never a stream to EOF, which on S3 is a ranged GET spanning the whole
+     * sheet just to pull one row (the leak that hit both header() and every
+     * name-addressed query through resolveColumnName). Casts and date
+     * detection are bypassed so the cells are the raw bytes on disk.
+     *
+     * If the bounded read yields nothing — a corrupt or short block table —
+     * it FALLS BACK to the full read rather than trusting the sidecar to
+     * shape the answer: SPEC §7 requires a bad sidecar to at worst slow a
+     * read, never change it (and the empty result is not cached, so the
+     * fallback is not poisoned).
+     *
+     * @return array<int, mixed>
+     */
+    private function readHeaderRow(string $entry): array
+    {
+        if (array_key_exists($entry, $this->headerByEntry)) {
+            return $this->headerByEntry[$entry];
+        }
+
+        $sst = $this->resolveSharedStrings();
+        $index = $this->loadRandomAccessIndex();
+        if ($index !== null) {
+            $ranges = $this->blockRanges($index, $entry);
+            if ($ranges !== []) {
+                $first = $ranges[0];
+                $compLength = $this->blockBytesForRow($index, $entry, 1) ?: null;
+                $reader = new StreamingSheetReader($this->source, $this->cd, $entry, 65536, $sst, null);
+                foreach ($reader->rowsFromOffset($first['comp_offset'] ?? 0, $first['start_row_at_offset'] ?? 1, 1, $compLength) as $row) {
+                    return $this->headerByEntry[$entry] = $row;
+                }
+                // Bounded read produced no row (corrupt/short block table) —
+                // fall through to the full read; do NOT cache the empty.
             }
         }
 
-        return $this->headerByEntry[$entry];
+        $reader = new StreamingSheetReader($this->source, $this->cd, $entry, 65536, $sst, null);
+        foreach ($reader->rows() as $row) {
+            return $this->headerByEntry[$entry] = $row;
+        }
+
+        return $this->headerByEntry[$entry] = [];
     }
 
     /**

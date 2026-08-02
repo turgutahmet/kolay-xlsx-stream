@@ -49,8 +49,7 @@ class ProfileIoTest extends TestCase
     {
         $inner = new LocalFileSource($this->testFile);
 
-        return new class($inner) implements Source, SupportsBoundedStream
-        {
+        return new class ($inner) implements Source, SupportsBoundedStream {
             /** @var list<int> offsets of open-ended streamFrom() calls */
             public array $unbounded = [];
 
@@ -112,6 +111,78 @@ class ProfileIoTest extends TestCase
 
         $this->assertSame([], $spy->unbounded, 'sidecar queries must open no stream');
         $this->assertSame([], $spy->boundedLengths, 'and no bounded read either');
+        $reader->close();
+    }
+
+    public function test_name_addressed_query_bounds_its_header_read(): void
+    {
+        // Resolving a column NAME reads the header — it must be the same
+        // bounded read, not an open-ended stream to EOF (the DX headline
+        // $reader->quantile('amount', 0.5) must not pull a multi-GB sheet).
+        $spy = $this->countingSource();
+        $reader = StreamingXlsxReader::from($spy);
+        $reader->columnStats(2); // warm index
+        $spy->unbounded = [];
+        $spy->boundedLengths = [];
+
+        $reader->quantile('amount', 0.5);
+
+        $this->assertSame([], $spy->unbounded, 'name resolution must not open an unbounded stream');
+        $this->assertNotEmpty($spy->boundedLengths, 'the header is read once, bounded');
+        $this->assertLessThan($spy->size() / 2, max($spy->boundedLengths));
+
+        // The header now shared one cache: a following profile() re-reads
+        // nothing (name resolution and header() no longer double-read).
+        $spy->boundedLengths = [];
+        $reader->profile();
+        $this->assertSame([], $spy->boundedLengths, 'header cache is shared across name lookup and profile()');
+        $reader->close();
+    }
+
+    public function test_corrupt_bounded_read_falls_back_not_empties_the_header(): void
+    {
+        // A sidecar whose block table is wrong makes the BOUNDED header read
+        // yield nothing. header() must fall toward the full read and return
+        // the true header — never trust the sidecar to shape the answer, and
+        // never cache the empty (SPEC §7: a bad sidecar slows, not changes).
+        $inner = new LocalFileSource($this->testFile);
+        $sabotage = new class ($inner) implements Source, SupportsBoundedStream {
+            public function __construct(private Source $inner)
+            {
+            }
+
+            public function size(): int
+            {
+                return $this->inner->size();
+            }
+
+            public function range(int $offset, int $length): string
+            {
+                return $this->inner->range($offset, $length);
+            }
+
+            public function streamFrom(int $offset)
+            {
+                return $this->inner->streamFrom($offset);
+            }
+
+            public function streamFromRange(int $offset, int $length)
+            {
+                // Simulate a block table that points at nothing: the bounded
+                // read gets an empty stream.
+                return fopen('php://memory', 'r');
+            }
+
+            public function close(): void
+            {
+                $this->inner->close();
+            }
+        };
+
+        $reader = StreamingXlsxReader::from($sabotage);
+        $this->assertSame(['id', 'amount', 'score'], $reader->header(), 'fall back to the full read');
+        // Cached, but the fallback value, not the empty bounded result.
+        $this->assertSame(['id', 'amount', 'score'], $reader->header());
         $reader->close();
     }
 
