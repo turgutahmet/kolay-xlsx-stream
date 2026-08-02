@@ -144,12 +144,23 @@ class StreamingXlsxReader
     private ?array $chainByEntry = null;
 
     /**
-     * Raw (cast-free) header rows read for chain detection, memoized so
-     * each candidate sheet pays its one small read at most once.
+     * Raw (cast-free) header rows read for chain detection and name
+     * resolution, memoized so each candidate sheet pays its one small read
+     * at most once.
      *
      * @var array<string, array<int, mixed>>
      */
     private array $headerByEntry = [];
+
+    /**
+     * header() rows read WITH date detection, memoized separately from the
+     * raw cache: only populated (and only paid for) when autoDetectDates()
+     * is active, so a date-styled row-1 cell in an external file matches
+     * what rows() would yield.
+     *
+     * @var array<string, array<int, mixed>>
+     */
+    private array $headerDetectedByEntry = [];
 
     /**
      * Header-name resolution cache per sheet entry: 'map' (name =>
@@ -328,7 +339,20 @@ class StreamingXlsxReader
      */
     public function header(): array
     {
-        return $this->readHeaderRow($this->currentEntry);
+        // With date auto-detection OFF (the default) the header is text
+        // either way, so header() shares the raw per-entry cache that name
+        // resolution and chain detection fill. With detection ON, the header
+        // must carry the same casts rows() would apply (a date-styled row-1
+        // cell in an external file), which the raw read strips and — the
+        // style being gone after tokenization — cannot be re-applied later;
+        // so it takes its own detection-aware bounded read, memoized apart.
+        $dates = $this->buildDateDetection([]);
+        if ($dates === null) {
+            return $this->readHeaderRow($this->currentEntry);
+        }
+
+        return $this->headerDetectedByEntry[$this->currentEntry]
+            ??= $this->readFirstRow($this->currentEntry, $dates);
     }
 
     /**
@@ -4520,10 +4544,21 @@ class StreamingXlsxReader
      */
     private function readHeaderRow(string $entry): array
     {
-        if (array_key_exists($entry, $this->headerByEntry)) {
-            return $this->headerByEntry[$entry];
-        }
+        return $this->headerByEntry[$entry] ??= $this->readFirstRow($entry, null);
+    }
 
+    /**
+     * Read row 1 of an entry with the given tokenizer date bundle (null =
+     * raw). BOUNDED to the first block's bytes when the file is indexed —
+     * never a stream to EOF — and, if that bounded read yields nothing (a
+     * corrupt or short block table), FALLS BACK to the full read so a bad
+     * sidecar at worst slows the read, never changes it (SPEC §7). Returns
+     * [] only when the sheet is genuinely empty; callers do the memoizing.
+     *
+     * @return array<int, mixed>
+     */
+    private function readFirstRow(string $entry, ?DateDetection $dates): array
+    {
         $sst = $this->resolveSharedStrings();
         $index = $this->loadRandomAccessIndex();
         if ($index !== null) {
@@ -4531,21 +4566,20 @@ class StreamingXlsxReader
             if ($ranges !== []) {
                 $first = $ranges[0];
                 $compLength = $this->blockBytesForRow($index, $entry, 1) ?: null;
-                $reader = new StreamingSheetReader($this->source, $this->cd, $entry, 65536, $sst, null);
+                $reader = new StreamingSheetReader($this->source, $this->cd, $entry, 65536, $sst, $dates);
                 foreach ($reader->rowsFromOffset($first['comp_offset'] ?? 0, $first['start_row_at_offset'] ?? 1, 1, $compLength) as $row) {
-                    return $this->headerByEntry[$entry] = $row;
+                    return $row;
                 }
-                // Bounded read produced no row (corrupt/short block table) —
-                // fall through to the full read; do NOT cache the empty.
+                // Bounded read produced no row — fall through to the full read.
             }
         }
 
-        $reader = new StreamingSheetReader($this->source, $this->cd, $entry, 65536, $sst, null);
+        $reader = new StreamingSheetReader($this->source, $this->cd, $entry, 65536, $sst, $dates);
         foreach ($reader->rows() as $row) {
-            return $this->headerByEntry[$entry] = $row;
+            return $row;
         }
 
-        return $this->headerByEntry[$entry] = [];
+        return [];
     }
 
     /**
