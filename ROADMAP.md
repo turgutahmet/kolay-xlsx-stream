@@ -8,6 +8,7 @@ listed below `Backlog` is "considered, not committed".
 
 | Version | Date | Highlights |
 |---|---|---|
+| [3.4.0](CHANGELOG.md#340--2026-08-02) | 2026-08-02 | The spreadsheet that profiles itself. **`profile()`** — a full per-column report (numeric/empty counts, min/max/avg, certified percentiles, histogram, distinct, top values, correlations) from the sidecar, reading no data rows. **Exact + certified quantiles:** `exactQuantile()` (Rank-Sandwich — the STAT × TDIG certificate brackets the value, then only the blocks that can hold it are read; a sorted column answers from one row), `explainQuantile()` (zero-I/O plan + rank certificate). **New sketches (five additive registered TLV sections):** `correlation()` exact Pearson (`CORR`, centred Welford/Chan moments — accurate on timestamp columns), `topValues()` frequent items (`TOPK`), `argMin()`/`argMax()` extreme-row pointers (`ARGP`), `quantile(col,q,from,to)` + `groupQuantile()` range/group percentiles (`TDGB`), string `rowsWhere()`/`findRow()` (`STRZ`, normative unsigned-UTF-8 collation — Turkish İ/ı is byte order, not locale). **Scan:** `histogram()` (equi-width / equi-depth), `countEmpty()`, late-materialization (probe-then-tokenize, planner-gated, byte-identical). KXSI format byte stays `2`; classic writer output byte-identical; SPEC doc 1.8.1 |
 | [3.3.0](CHANGELOG.md#330--2026-07-06) | 2026-07-06 | The query engine grows up + integrity + O(1) S3 writes. **Query:** `rowsWhereAll()` (multi-predicate AND via zone-map intersection), `estimatedRows()`/`explain()` (zero-I/O plans), `topRows()` (indexed ORDER BY … LIMIT), `sampleRows()` (seeded uniform sample), column addressing by header name, `Bucket::month/day/year` for `groupStats`, bounded ranged reads + gap-bridging. **Writer/DX:** `queryable()` one-call preset, opt-in `compact()` (r-less cells, ~52–62% smaller sheets), `syncAtGroupBoundaries()` (zero-scan `groupStats`), `onFullScan()` hook. **Integrity:** `verify()` (block-granularity CRC report), opt-in per-part `Content-MD5` so S3 rejects a corrupted part. **Fixed:** S3 multipart writes are now O(1) memory (was O(file size)) — default `concurrency` 1, parallel opt-in. No breaking changes (base `Source` contract stable; classic output byte-identical) |
 | [3.2.2](CHANGELOG.md#322--2026-07-05) | 2026-07-05 | Correctness patch: on auto-split workbooks (>1,048,575 rows) the entire query surface — `rowCount`/`rows`/`rowAt`/`rowRange`/`rowsWhere`/`findRow`/`columnStats`/`groupStats`/`quantile`/`countDistinct`/`shards` — now spans the continuation chain as one logical table instead of silently answering from the active sheet alone; misleading never-read config keys removed |
 | [3.2.0](CHANGELOG.md#320--2026-07-04) | 2026-07-04 | KXSI becomes an **open specification** ([SPEC.md](SPEC.md)) with a byte-pinned conformance suite; `SCRC` per-sync-point integrity CRCs; approximate analytics — `withColumnSketches()` embeds t-digest + HyperLogLog, `quantile()`/`median()`/`countDistinct()` answer with zero row reads; `groupStats()` sorted-group pushdown; +30 % read throughput (tokenizer micro-pass); `rows(skip)` fast path (~1,580× indexed) + within-block fast-forward (~19×); parallel S3 multipart upload (flat memory, steady wall times); packed shared strings (ceiling 20 → 64 MB compressed at 3.5× less peak); `autoDetectDates()` for external files |
@@ -20,14 +21,12 @@ listed below `Backlog` is "considered, not committed".
 | [2.0.1](CHANGELOG.md#201--2026-05-03) | 2026-05-03 | CI / lint cleanup |
 | [2.0.0](CHANGELOG.md#200--2026-05-03) | 2026-05-03 | DateTime support, native boolean cells, big-int preservation, state machine guards, modernized dependency matrix |
 
-## Next: v3.4 — Resumable exports & tail-latency I/O
+## Next: v3.5 — Resumable exports, Azure Blob source & tail-latency I/O
 
-Additive, no breaking changes planned. v3.3 shipped the smarter-reads
-half of the original "durable + smart S3" theme (the query engine,
-`explain()`/`estimatedRows()`, `rowsWhereAll()`, range-coalescing via
-gap-bridging, and integrity `verify()`). v3.4 is the **durable** half:
-exports that survive a crash, plus the tail-latency I/O work deferred
-from v3.3.
+Additive, no breaking changes planned. v3.3 shipped the smarter-reads and
+v3.4 the analytics / profiling half of the theme; v3.5 is the **durable**
+half — exports that survive a crash — plus the first non-S3 remote source
+and the tail-latency I/O work deferred from v3.3.
 
 ### Resumable S3 exports (the headline)
 
@@ -36,6 +35,14 @@ in v3.2 exist precisely for this. `Writer::resume($snapshot)` after a
 crash re-enters at row N+1 instead of restarting a 25-minute queue job.
 The deflate mechanics (userland `crc32_combine`, full-flush segment
 concatenation) are already PoC-proven.
+
+### Azure Blob storage source ([Issue #1](https://github.com/turgutahmet/kolay-xlsx-stream/issues/1))
+
+A `Source` adapter for Azure Blob Storage, parallel to the S3 range source,
+so the same zero-download random-access reads (`rowAt`, `profile()`, string
+`findRow`, …) work against Azure. Kept an isolated adapter (not bundled into
+the core), mindful of streaming memory — a ranged read, never a whole-blob
+buffer.
 
 ### Reader I/O planning
 
@@ -73,7 +80,7 @@ short gap when it beats a round-trip), **`explain()`/`estimatedRows()`**
   the first `write()` so the sink is cheap to instantiate in DI
   contexts.
 
-### Queryable-XLSX follow-ups (PoC-verified, sequenced after v3.4)
+### Queryable-XLSX follow-ups (PoC-verified, sequenced after v3.5)
 
 - **Appendable XLSX** — end the last sheet at a full-flush boundary,
   reopen and continue with a fresh deflate context; on S3,

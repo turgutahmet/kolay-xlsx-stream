@@ -584,6 +584,88 @@ $reader->sampleRows(1000, seed: 42);
 $reader->onFullScan(fn (array $ctx) => logger()->warning('full scan', $ctx));
 ```
 
+### String lookups — find a record by code on S3 *(v3.4+)*
+
+`withStringStats([...])` adds per-block **lexicographic** zone maps (`STRZ`),
+so a string predicate prunes to the one block that can hold the value — a
+point lookup in a multi-GB S3 file in a couple of range requests:
+
+```php
+$writer->withStringStats([8]);                    // writer side, before startFile()
+
+$reader->findRow('kod', 'INV-2024-00871');        // one matching row, block-pruned
+$reader->rowsWhere('kod', 'prefix', 'INV-2024');  // =, <, <=, >, >=, between, prefix
+```
+
+Collation is **unsigned UTF-8 byte order** (= Unicode code-point order), the
+only sound basis for a streaming zone map — NOT locale. In Turkish, `İ`/`ı`
+sort by their bytes, not `tr_TR` rules; use this for exact / prefix / range
+lookups (codes, SKUs, IDs), not locale-correct sorting.
+
+### Data profiling & exact analytics *(v3.4+)*
+
+The sidecar grows a profiling layer — a full per-column report, exact
+quantiles with a deterministic certificate, histograms, frequent values,
+and correlation — answered from the index cached at open, reading **no data
+rows** (`profile()` reads only the header once, bounded, to name columns):
+
+```php
+// Writer side, before startFile() — opt in to the extra sketches:
+$writer->withColumnSketches([2, 3])   // t-digest + HyperLogLog (quantiles, distinct)
+       ->withTopValues([4])           // frequent-items sketch (heavy hitters)
+       ->withCorrelations([2, 3])     // pairwise Pearson co-moments
+       ->withArgPointers([2]);        // rows holding each block's min/max
+
+// One call: a data-profiling report of a multi-GB S3 file, no row scan.
+$profile = $reader->profile();
+//   ['data_rows' => .., 'columns' => [2 => ['name' => 'amount', 'min' => ..,
+//     'percentiles' => ['p50' => ['value' => .., 'rank_lo' => .., 'rank_hi' => ..],
+//     'p95' => [..]], 'histogram' => [..], 'distinct' => .., 'top_values' => ..]],
+//    'correlations' => ['2,3' => 0.87]]
+
+// A quantile that PROVES its number: the estimate fenced by a zone-map
+// rank certificate (rank_hi − rank_lo is the residual uncertainty).
+$reader->explainQuantile('amount', 0.95);
+//   ['estimate' => .., 'rank_lo' => .., 'rank_hi' => ..,
+//    'exact_would_scan_blocks' => .., 'exact_est_bytes' => ..]
+
+// The EXACT quantile — bracketed by the certificate, then only the blocks
+// that could hold it are read; a budget degrades to the estimate, never throws:
+$reader->exactQuantile('amount', 0.95, maxScanBlocks: 8);
+//   ['value' => .., 'exact' => true, 'blocksScanned' => 4, 'exceeded' => false]
+
+// Distribution shape, heavy hitters, the row of an extreme, missing values:
+$reader->histogram('amount', bins: 20);       // {lo, hi, count} bins from the CDF
+$reader->topValues('status');                 // ['exact' => bool, 'values' => [..]]
+$reader->argMax('amount');                     // ['row' => 138, 'value' => 9999.0]
+$reader->countEmpty('amount');                 // non-numeric/missing data cells
+$reader->correlation('amount', 'score');       // exact Pearson r
+
+// Quantile of a ROW RANGE or a GROUP — from per-superblock digests. GROUP
+// BY is numeric-keyed (a date column bucketed here); a string group key is
+// a v3.5 STRZ candidate, so group by a numeric id or a Bucket:: helper:
+use Kolay\XlsxStream\Readers\Bucket;
+$reader->quantile('amount', 0.5, from: 1000, to: 5000);
+$reader->groupQuantile('order_date', 'amount', 0.9, Bucket::month());  // p90 per month
+
+// Scan tuning: late materialization is on by default when the planner
+// predicts a selective predicate; force it for A/B measurement.
+$reader->useLateMaterialization(true);
+```
+
+Every number comes from the sidecar (zero row I/O), so it is not free of
+CPU — `profile()` runs each column's sketch math; "one range request" is a
+statement about I/O, not latency. A percentile's certificate width tracks
+**row-order locality**, not value clustering: a column sorted by (or
+covarying with) the sheet's order certifies tightly, a scattered one is
+honestly reported as `[0, N]`. The certificate resolution is bounded by the
+block size — on a sorted column its width is ≈ the sync interval (`every`),
+so it is a knob: a smaller `every` tightens the certificate and thins the
+exact-scan pruning, at the cost of a larger sidecar. `histogram()` also
+takes `mode: 'depth'` for equi-depth bins (each ≈ equal count), which reads
+a skewed column far better than the default equi-width. See
+[SPEC.md](SPEC.md) §4–§6 for the format.
+
 ### Integrity — verified reads & writes *(v3.3+)*
 
 For data that matters (payroll, HR, audit exports):

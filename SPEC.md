@@ -20,7 +20,7 @@ OPTIONAL in this document are to be interpreted as described in
 
 | | |
 |---|---|
-| Document version | **1.2.0** |
+| Document version | **1.8.1** |
 | Format version described | KXSI binary version **2** (the `version` header byte) |
 | Reference implementation | `kolay/xlsx-stream` ≥ 3.2.0 (PHP) — writer + reader |
 | Conformance suite | `tests/SpecVectors/` in the reference repository (§8) |
@@ -475,7 +475,278 @@ The reference writer emits both sections whenever
 optional for other writers (a quantile-only or distinct-only producer
 is conforming).
 
-### 4.5 Reserved tags
+### 4.5 Registered: `STRZ` — per-block lexicographic string zone maps
+
+The string analogue of `STAT` (§4.1): per-block `[min, max]` string
+prefixes for chosen columns, enabling block pruning for string range /
+prefix predicates and near-O(1) string point lookup. Same block model and
+the same `block_count == sync_count + 1` invariant as `STAT`.
+
+**Collation is NORMATIVE and locale-independent.** All comparison is
+unsigned byte-wise, which equals Unicode code-point order (UTF-8 preserves
+it). It is NOT a locale collation — e.g. Turkish İ/ı or ß-folding are out
+of scope (human-text range scans get a README caveat; the target case —
+invoice-no / SKU / e-mail equality — is exact).
+
+**Bounds are truncated prefixes, both sound.** `min` is truncated DOWN (a
+byte prefix is ≤ the value); `max` is truncated UP — the smallest string ≥
+every value sharing the stored prefix: increment the rightmost non-0xFF
+byte and drop the tail; an all-0xFF prefix keeps the value whole. Thus
+`min` ≤ every value ≤ `max`, so pruning never drops a match. A truncated
+`max` may be advanced past a byte boundary and be invalid UTF-8; that is
+fine — it is only a comparison bound and is never decoded.
+
+**Truncation length is chosen per column at `finishFile`, not per row**
+(deferred shortest-separator, cf. Bayer–Unterauer 1977). The writer keeps
+each block's full `min`/`max` capped to a bound (reference 64 B), then
+picks one length per column: one byte past the deepest divergence between
+sorted-adjacent block boundaries. This restores pruning on a common-prefix
+corpus (e.g. `INV-2024-…`) that a fixed truncation would collapse to one
+indistinguishable range, and is robust to a lone off-prefix boundary (e.g.
+a differently-cased header folded into block 0). When two boundaries are
+identical no length separates them — the cap bounds the cost and pruning
+honestly weakens at that one edge.
+
+**Payload**, repeated per sheet in core-body order:
+
+| Size | Field |
+|---|---|
+| 2 | `tracked_column_count` — uint16 |
+
+then per tracked column:
+
+| Size | Field |
+|---|---|
+| 2 | `column` — uint16, **1-based** |
+| 1 | `flags` — bit0 sorted ascending, bit1 sorted descending (lexicographic, data rows only); other bits reserved, MUST be 0 |
+| 4 | `block_count` — uint32, MUST be `sync_count + 1` |
+
+then per block:
+
+| Size | Field |
+|---|---|
+| 2 | `min_len` — uint16 |
+| `min_len` | `min` — truncated minimum prefix bytes |
+| 2 | `max_len` — uint16 |
+| `max_len` | `max` — truncated maximum prefix bytes |
+| 4 | `count` — uint32, string values folded into `[min, max]` |
+| 4 | `other` — uint32, nulls + empty strings in the block |
+
+A `count == 0` block carries empty `min`/`max` (length 0): the empty
+string is never a tracked value, so empty bounds unambiguously mean "no
+string value in this block", and readers MUST treat them as absent (the
+block matches no string predicate). The `STAT` laws (§4.1) apply
+identically — stats widen never narrow, and a lexicographically-matchable
+header string folds into block 0.
+
+### 4.6 Registered: `TDGB` — per-superblock t-digests (range / group quantiles)
+
+Where `TDIG` (§4.3) carries one whole-sheet digest per column, `TDGB`
+carries a sequence of digests, one per **superblock** — a contiguous span
+of data rows — so a reader can answer a quantile scoped to a row range
+(`quantile(col, q, from, to)`) or to a sorted group (`groupQuantile`) by
+merging only the superblocks the range fully covers and scanning the few
+rows at each edge. Each superblock's digest is exactly a `TDIG` sketch
+payload (§4.3), reused verbatim.
+
+**Superblocks are defined in ROW space, not block space.** A superblock
+spans a fixed row width `S` (reference `S = 16384`), snapping its end to
+the FIRST sync point after `S` rows have accumulated — the same
+cadence-snap the index itself uses, so a superblock boundary is always a
+sync boundary. When `sync_period > S` a superblock degrades to a single
+block. Because a worksheet is capped at 1,048,575 rows, this bounds a
+sheet to ≤ 64 superblocks per column regardless of block count `B`, so the
+writer holds ≤ 64 digests/column (≈ 77 KB) and builds each in a SINGLE
+pass from its own value stream with **zero write-time merges** — merging
+happens only at query time, over a range's fully-covered superblocks.
+(Block-space `s = ⌈√B⌉` was rejected: `B` is user-controlled via
+`sync_period`, so it would let live writer memory grow without bound. A
+hierarchical / segment-tree digest was rejected too — ≈1.33·B digests and
+a merge-depth accuracy gate the single-pass row-space build avoids.)
+
+Value population follows `TDIG` exactly: a cell feeds its superblock's
+digest iff numeric under the `STAT` interpretation (§4.1) **and** finite;
+the header row (row 1) is excluded. A superblock's digest thus covers the
+numeric values of the data rows `(previous end_row, end_row]`, with the
+first superblock's span opening just after the header.
+
+**Payload**, repeated per sheet in core-body order:
+
+| Size | Field |
+|---|---|
+| 2 | `tracked_column_count` — uint16 (0 when the sheet has none) |
+
+then per tracked column, in ascending column order:
+
+| Size | Field |
+|---|---|
+| 2 | `column` — uint16, **1-based**; MUST be ≥ 1 |
+| 4 | `superblock_count` — uint32 |
+
+then per superblock, in ascending row order:
+
+| Size | Field |
+|---|---|
+| 4 | `end_row` — uint32, the last sheet row (1-based, header = 1) the superblock covers. MUST be strictly increasing within the column; the final superblock's `end_row` equals the sheet's last data row. |
+| 4 | `payload_len` — uint32, byte length of the following sketch payload |
+| N | `payload` — a `TDIG` t-digest payload (§4.3), the digest of this superblock's numeric values |
+
+The `end_row` boundaries are stored, not derived: a reader reads them
+rather than recomputing the snap rule, so a future change to `S` cannot
+strand old files. A superblock whose rows were all non-numeric still
+appears, carrying a `count == 0` digest.
+
+### 4.7 Registered: `TOPK` — per-column frequent-items sketches (heavy hitters)
+
+One Misra-Gries frequent-items sketch (Misra-Gries 1982; the mergeable
+variant of Agarwal-Cormode, *Mergeable Summaries*, 2012) per tracked
+column per sheet — the top-K most frequent values with counts, so a reader
+can answer `topValues` / the categorical slice of `profile()` from the
+sidecar alone. Values are the canonical string form (§4.4), so text and
+numeric columns are both covered; the header row is excluded, as for the
+other sketches (§4.3).
+
+`TOPK` shares the generic **section frame** with `TDIG`/`CHLL` (§4.3):
+`tracked_column_count`, then per column `column` / `payload_len` /
+`payload`. The payload is one self-describing sketch:
+
+| Size | Field |
+|---|---|
+| 2 | `format_version` — uint16, `1`. Readers MUST reject other values. |
+| 2 | `k` — uint16, the counter budget (reference `k = 64`); MUST be ≥ 1 |
+| 1 | `flags` — bit0 `saturated`; other bits reserved, MUST be 0 |
+| 4 | `counter_count` — uint32; MUST be ≤ `k` |
+| — | `counter_count` counters follow |
+
+then per counter, in `count` descending then `value` ascending order (a
+total order, so the bytes are deterministic):
+
+| Size | Field |
+|---|---|
+| 4 | `count` — uint32; MUST be ≥ 1 |
+| 2 | `value_len` — uint16 |
+| `value_len` | `value` — canonical-string bytes |
+
+**Guarantee.** A stored count never OVER-estimates the true frequency and
+under-estimates it by at most N/k, and every value with true frequency
+above N/k is retained — the true heavy hitters always survive.
+
+**The `saturated` bit is the exactness switch.** Misra-Gries has a proven
+property: if no counter was ever evicted, the surviving counts are
+*exact*. The writer sets `saturated` on the first eviction (the
+decrement-all when a k-full sketch meets an unmonitored value). Reader
+semantics: `saturated == 0` ⇒ the sketch is the **complete, exact**
+categorical distribution (cardinality was ≤ k — "status: paid 84.2%,
+exact"); `saturated == 1` ⇒ top-k with error ≤ N/k. **Mergeability is by
+construction**, so `TOPK` composes across auto-split members, shards, and
+future stitched files like `TDIG`/`CHLL`: sum shared counters, and if the
+union exceeds k, subtract the (k+1)-th largest count and drop the
+non-positive ones. Merge rule for the bit:
+`saturated_out = saturated_a OR saturated_b OR (the merge pruned)`.
+
+### 4.8 Registered: `ARGP` — per-block argmin / argmax row numbers
+
+For each `STAT` block (§4.1) of a tracked column, the sheet **row numbers**
+holding that block's minimum and maximum numeric value — so a reader can
+answer `argMin` / `argMax` (the row where an extreme occurs, not just its
+value) from the sidecar alone, with no row scan. Whole-column argmin/argmax
+is then the recorded row of the block whose stored min/max is globally
+extreme; scoping to a range restricts the block set the same way.
+
+`ARGP` is a **separate section, block-aligned 1:1 with `STAT`** — deliberately
+**not** a widening of a `STAT` block. Current `STAT` readers parse fixed
+32-byte blocks; adding fields to those blocks would strand them, whereas a
+new tag is skipped by construction (§forward-compat). A writer emits `ARGP`
+only for columns it also tracks in `STAT` (the min/max values live there);
+the two sections share block order exactly, so entry *i* of `ARGP` pairs
+with block *i* of `STAT`.
+
+The row numbers are **1-based sheet rows** (header = row 1), the same
+coordinate `STAT` blocks and sync points use. On ties within a block, the
+writer records the **first occurrence** — the earliest row achieving the
+extreme — so a whole-column extreme resolved by scanning blocks in order
+with a strict comparison is the earliest such row globally. A block that
+held no numeric value (`count == 0`) stores `{0, 0}`; a reader treats a
+column whose blocks are all `{0, 0}` as having no numeric extreme. Across an
+auto-split chain a reader lifts a member-local row to a global logical row
+via the member's `globalStart` / `dataStartLocal` bookkeeping, so `argMin` /
+`argMax` return a coordinate `rowAt` reads back to the extreme value.
+
+**Payload**, repeated per sheet in core-body order:
+
+| Size | Field |
+|---|---|
+| 2 | `tracked_column_count` — uint16 (0 when the sheet has none) |
+
+then per tracked column, in ascending column order:
+
+| Size | Field |
+|---|---|
+| 2 | `column` — uint16, **1-based**; MUST be ≥ 1 |
+| 4 | `block_count` — uint32; MUST equal the column's `STAT` block count |
+
+then per block, in block order (aligned 1:1 with `STAT`):
+
+| Size | Field |
+|---|---|
+| 4 | `argmin_row` — uint32, the 1-based sheet row holding this block's minimum, or 0 when the block held no numeric value |
+| 4 | `argmax_row` — uint32, the 1-based sheet row holding this block's maximum, or 0 when the block held no numeric value |
+
+### 4.9 Registered: `CORR` — per-pair co-moment accumulators (Pearson correlation)
+
+For each tracked column pair, six values — n and the running **means and
+centred moments** (`mean_x`, `mean_y`, `M2_x = Σ(x−x̄)²`, `M2_y = Σ(y−ȳ)²`,
+`C_xy = Σ(x−x̄)(y−ȳ)`) — over the rows where **both** cells are numeric. They
+are everything Pearson's correlation coefficient needs, so a reader answers
+`correlation(a, b)` from the sidecar alone with no row scan:
+
+```
+r = C_xy / √(M2_x · M2_y)
+```
+
+The pair population is the STAT one restricted to rows numeric in **both**
+columns (§4.1 numeric interpretation — DateTime as Excel serial, bool as
+0/1, numeric strings as their value); the header row is excluded, and a row
+where either cell is non-numeric feeds neither the pair's n nor any moment.
+
+**Centred, not raw sums — a deliberate choice.** The moments are accumulated
+by the Welford update (each observation shifts the means by 1/n of its
+residual and updates the centred moments). This avoids the textbook
+`n·Σxy − Σx·Σy` form, which subtracts two large like-sized quantities and
+loses precision exactly on the most ordinary export column — a timestamp or
+date serial, whose values are huge relative to their spread. The centred
+form is **still mergeable by construction** via Chan's parallel algorithm:
+two states combine by exact algebra on (n, means, moments), with
+`na·nb / (na+nb)` weighting on the mean-difference terms, so `CORR` composes
+across auto-split members, shards and future stitched files like the sketch
+family.
+
+**Payload**, repeated per sheet in core-body order:
+
+| Size | Field |
+|---|---|
+| 2 | `pair_count` — uint16 (0 when the sheet tracks none) |
+
+then per pair, in ascending (`column_a`, `column_b`) order:
+
+| Size | Field |
+|---|---|
+| 2 | `column_a` — uint16, **1-based**; MUST be ≥ 1 |
+| 2 | `column_b` — uint16, **1-based**; MUST be > `column_a` |
+| 8 | `n` — uint64, the count of rows numeric in both columns |
+| 8 | `mean_x` — little-endian double, x̄ over those rows |
+| 8 | `mean_y` — little-endian double, ȳ |
+| 8 | `m2_x` — little-endian double, Σ(x−x̄)² |
+| 8 | `m2_y` — little-endian double, Σ(y−ȳ)² |
+| 8 | `c_xy` — little-endian double, Σ(x−x̄)(y−ȳ) |
+
+The 48-byte accumulator layout (uint64 n then five doubles) is fixed, so the
+section frames pairs by count, not by a length prefix. A reader computes
+`r = C_xy / √(M2_x · M2_y)` and clamps it to [-1, 1]; the coefficient is
+**undefined** (the reader reports no value) when n < 2 or either column has
+zero variance (`M2 ≤ 0`).
+
+### 4.10 Reserved tags
 
 The following tags are reserved; their payloads are deliberately
 unspecified in this document version. Writers MUST NOT emit them with
@@ -494,6 +765,41 @@ simply skip them, as with any unknown tag.
 | `TRGM` | Per-block trigram filters over opted-in text columns — substring-search pruning. |
 | `VHIS` | Version-history chain for appendable files (per-append tail snapshot enabling in-file time travel). |
 | `CSTR` | Columnar shadow stripes: raw numeric arrays for selected columns, block-aligned with `STAT`. |
+| `SMPL` | Seeded reservoir **row sample**: K real rows (reference K = 256) drawn by unbiased Vitter-R, with their row numbers — a zero-row-read preview grid and the sample-value column of `profile()`. Weighted-reservoir mergeable, so it composes across stitch / `kxsd` like the sketch family. (Distinct from the shipped `sampleRows()`, which *computes* a sample by reading blocks; `SMPL` *stores* one for zero-read access.) |
+
+**v3.4 design commitments (recorded before implementation; full byte
+layouts register per feature, each with a byte-pinned vector, exactly as
+`SCRC`/`TDIG`/`CHLL` did).** These fix the decisions so the format is
+committed ahead of code (`STRZ`, `TDGB`, `TOPK`, `ARGP` and `CORR` have
+since graduated to registered sections, §4.5–§4.9):
+
+- One sketch family only: **t-digest, not KLL.** `TDIG` is shipped and
+  its measured error suffices; a second family is spec/impl weight. KLL
+  stays available as a future reserved tag if adversarial accuracy ever
+  demands it.
+- **Rank certificates (informative, zero format change; ships in the
+  `profile()` release):** `STAT` block `[min, max, count]` and `TDIG` are
+  independent — one *deterministic*, one *statistical*. Combining them
+  bounds the true rank of any threshold `x` from the sidecar alone, with
+  **mathematical certainty**:
+  - `lowerRank(x)` = Σ `count` over blocks with `max < x` — a proven lower
+    bound on `#{v < x}` (rests on STAT Law 1: `max` is a true upper bound).
+  - `upperRank(x)` = Σ `count` over blocks with `min ≤ x` — a proven upper
+    bound on `#{v ≤ x}`.
+  - Sandwich: `lowerRank(x) ≤ rank(x) ≤ upperRank(x)` (tie-safe by the
+    strict/non-strict asymmetry). **Block 0 is always counted as uncertain**
+    (dropped from `lower`, forced into `upper`) because the header folds
+    into block 0's `STAT` (Law 2) while `TDIG` excludes it — costing the
+    certificate exactly one block of width. So a digest estimate `x̂` for
+    quantile `q` ships with a deterministic rank interval, and an *exact*
+    quantile is recoverable by scanning only the blocks the bounds cannot
+    prune. The two prune sides are **independent**: certifying the
+    below-side (`upperRank(xLo) < t`) and the above-side
+    (`lowerRank(xHi) ≥ t`) are separate; one failing MUST NOT collapse the
+    other (else a single unprovable side scans the whole file). Verified
+    on the reference library (200k rows / 21 blocks): 0 sandwich violations
+    over 400 probes; clustered data prunes to 4–5 of 21 blocks for exact
+    mode; uniform data honestly reports 100% width and scans nearly all.
 
 Regardless of any section's presence, the primary worksheet entry stream
 MUST remain decodable by a dictionary-unaware sequential inflater.
@@ -548,13 +854,21 @@ Structural (on the payload alone):
 12. `STAT`: per column, `column` ≥ 1 and
     `block_count` == `sync_count + 1`.
 13. `SCRC`: per sheet, `count` == `sync_count`.
-14. `TDIG`/`CHLL`: per column, `column` ≥ 1, every `payload_len` stays
-    inside the section, and — before a sketch is *used* — its payload
-    satisfies the internal invariants of §4.3/§4.4 (exact length,
+14. `TDIG`/`CHLL`/`TDGB`: per column, `column` ≥ 1, every `payload_len`
+    stays inside the section, and — before a sketch is *used* — its
+    payload satisfies the internal invariants of §4.3/§4.4 (exact length,
     positive finite weights, ascending means, weight/count agreement;
-    register values within the rank bound). The reference decoder
-    validates framing at decode time and payload internals lazily at
-    first access.
+    register values within the rank bound). For `TDGB` additionally: each
+    column's `end_row` values strictly increase, and every superblock
+    payload is a valid `TDIG` payload (§4.3). For `TOPK` (§4.7): `k` ≥ 1,
+    `counter_count` ≤ `k`, every `count` ≥ 1, and every `value_len` stays
+    inside the payload. For `ARGP` (§4.8): per column, `column` ≥ 1,
+    `block_count` equals the column's `STAT` block count, and the two row
+    numbers per block stay inside the section. For `CORR` (§4.9): per pair,
+    `1 ≤ column_a < column_b`, the 48-byte accumulator stays inside the
+    section, and — before r is *computed* — its five moments are finite. The
+    reference decoder validates framing at decode time and payload internals
+    lazily at first access.
 
 Container cross-checks (against the live ZIP central directory —
 REQUIRED whenever the index will be used for seeking):
@@ -616,6 +930,55 @@ Known false-positive: a hand-built workbook whose sheets are exactly
 indistinguishable from an auto-split chain — and is treated as one.
 Semantically such a file *is* a continuation chain, so the reference
 implementation accepts this deliberately.
+
+### 6.2 The `profile()` surface (informative)
+
+`profile()` is not a format feature — it is a reader convenience that
+**composes the sidecar sections into one per-column report**. It is
+documented here so independent implementations expose the same shape and so
+the section set below is understood as a coherent whole rather than isolated
+tags. Every field is answered from a section already specified above; a
+field is simply absent (null) when its backing section is not present.
+
+The report is `{data_rows, columns, correlations}`. Each entry in `columns`
+(keyed by 1-based column index, default set = the columns carrying a
+numeric/categorical section):
+
+| Field | Source section | Notes |
+|---|---|---|
+| `column` / `name` | core / header | 1-based index; `name` is the header cell |
+| `min` / `max` / `avg` / `sorted` | `STAT` | avg = sum ÷ count; `sorted` ∈ {asc, desc, null} |
+| `numeric_count` | `STAT` | numeric data cells |
+| `empty_count` | `STAT` | data rows minus `numeric_count` (nulls + non-numeric), header-excluded — NOT the raw `other` tally (which folds the header into block 0) |
+| `percentiles` | `TDIG` (+ `STAT`) | map keyed losslessly (`p50`, `p99.9`), each `{value, rank_lo, rank_hi}`: the digest estimate and its deterministic rank certificate from the sandwich (§4.5) |
+| `histogram` | `TDIG` | `{lo, hi, count}` bins, `count · (rank(edge₊₁) − rank(edge))` per bin |
+| `distinct` | `CHLL` | HyperLogLog estimate |
+| `top_values` | `TOPK` | `{exact, values}` — value → count, error ≤ N/k when saturated |
+
+`correlations` is a top-level map, pair `"a,b"` → Pearson r (`CORR`).
+`data_rows` is the logical data-row count, or null when the file has no
+sidecar (a count is not worth a whole-file scan a sidecar-only report cannot
+otherwise fill). A column carrying only `STRZ` is not in the default set:
+its stored `[min, max]` fold the non-numeric header into block 0, so no
+clean data-only string range is exposed.
+
+**Certificate honesty (normative framing).** A percentile's `rank_lo` /
+`rank_hi` width is governed by the zone maps' **row-order locality**, not by
+value clustering: a column sorted by — or covarying with — the sheet's row
+order yields tight per-block ranges and a narrow certificate, while a column
+whose values are scattered across rows is honestly reported as `[0, N]` (no
+deterministic bound). Implementations MUST state this rather than imply that
+every percentile comes tightly certified.
+
+**Cost honesty.** `profile()` reads **no data rows** — every number comes
+from the sidecar cached at open — with one exception: to fill `name` it
+reads the header row once, as a single **bounded** range request (the first
+block), not an open-ended stream to EOF; this is skipped when the header is
+already cached. "One request" is an I/O statement, not a latency one:
+computing the report spends CPU proportional to the columns and the work
+each estimator does (quantile/rank inversions, HLL merges, TOPK folds), and
+a conforming implementation SHOULD document that per-column CPU rather than
+let "one request" imply "instant".
 
 ## 7. Security considerations
 
@@ -681,6 +1044,11 @@ The vectors:
 | `vector-03-multisheet` | 2 sheets with different sync cadences — per-sheet record alignment in `STAT` and `SCRC` |
 | `vector-04-sorted` | Sortedness flags: one ascending, one descending, one unsorted numeric column |
 | `vector-05-sketches` | `TDIG` + `CHLL` on one mixed numeric column and one text column, no `STAT` (sections are orthogonal); golden pins quantile and distinct estimates computed from the committed sketch bytes |
+| `vector-06-string-zones` | `STRZ` on a sorted common-prefix column (exercises deferred separator truncation) and a shuffled tag column with empty cells (`other` class); golden pins the truncated per-block `[min, max]` |
+| `vector-07-range-quantiles` | `TDGB` on a mixed numeric column; a single superblock (sheet under the `S` row width), so the golden pins the superblock's `end_row`, its numeric population (`n/a` cells excluded), and the quantiles its committed t-digest reproduces |
+| `vector-08-top-values` | `TOPK` on two columns: a low-cardinality status column (≤ k → `saturated=false`, the golden pins the exact complete distribution) and a high-cardinality column with small `k` (→ `saturated=true`, top-k with the N/k bound). Both branches of the exactness switch in one file |
+| `vector-09-arg-pointers` | `ARGP` on a non-monotone numeric column with a unique global max and min at known rows; the golden pins each block's `{minRow, maxRow}` (block-aligned 1:1 with `STAT`) and the hexdump pins the two-uint32-per-block layout |
+| `vector-10-correlations` | `CORR` on three columns (two linearly related, one independent) with interleaved blanks/text so only both-numeric rows feed a pair; the golden pins each pair's `n` and Pearson `r`, and the hexdump pins the 48-byte accumulator layout |
 
 A conforming **reader** must, for each vector: decode
 `<name>.sidecar.hex` (or extract the part from the `.xlsx`) and

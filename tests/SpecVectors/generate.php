@@ -91,7 +91,67 @@ function generateVector(string $name, callable $write): void
                 'distinct' => $index->columnHll($entry, $col)?->count(),
             ];
         }
-        $sheets[] = [
+        // String zone maps (STRZ). Added only when present so the pre-STRZ
+        // vectors' goldens stay byte-for-byte unchanged.
+        $stringZones = [];
+        foreach ($index->stringStatsColumns($entry) as $col) {
+            $stringZones[(string) $col] = $index->columnStringStats($entry, $col);
+        }
+
+        // Range-quantile superblocks (TDGB). Like the whole-column sketch
+        // above, the golden pins each superblock's end_row plus the
+        // quantiles its committed t-digest reproduces. Added only when
+        // present so pre-TDGB goldens stay byte-for-byte unchanged.
+        $rangeQuantiles = [];
+        foreach ($index->rangeQuantileColumns($entry) as $col) {
+            $superblocks = [];
+            foreach ($index->rangeQuantileSuperblocks($entry, $col) as $sb) {
+                $quantiles = [];
+                foreach (['0', '0.5', '1'] as $q) {
+                    $quantiles[$q] = $sb['digest']->quantile((float) $q);
+                }
+                $superblocks[] = [
+                    'end_row' => $sb['end_row'],
+                    'numeric_count' => $sb['digest']->count(),
+                    'quantiles' => $quantiles,
+                ];
+            }
+            $rangeQuantiles[(string) $col] = $superblocks;
+        }
+
+        // Frequent-items sketches (TOPK). The golden pins each column's
+        // saturated bit and its (value, count) list in the sketch's own
+        // deterministic order. Added only when present.
+        $topValues = [];
+        foreach ($index->topValueColumns($entry) as $col) {
+            $sketch = $index->columnTopValues($entry, $col);
+            $topValues[(string) $col] = [
+                'saturated' => $sketch->saturated(),
+                'values' => $sketch->topValues(),
+            ];
+        }
+
+        // Argmin/argmax row pointers (ARGP), block-aligned 1:1 with STAT.
+        // The golden pins each block's {minRow, maxRow} (0 = no numeric
+        // value). Added only when present so pre-ARGP goldens stay unchanged.
+        $argPointers = [];
+        foreach ($index->argPointerColumns($entry) as $col) {
+            $argPointers[(string) $col] = $index->argPointers($entry, $col);
+        }
+
+        // Co-moment accumulators (CORR). The golden pins each pair's n and
+        // Pearson r reproduced from the committed 48-byte payload. Added only
+        // when present.
+        $correlations = [];
+        foreach ($index->correlationPairs($entry) as [$a, $b]) {
+            $co = $index->correlation($entry, $a, $b);
+            $correlations[$a.','.$b] = [
+                'n' => $co->n(),
+                'r' => $co->pearson(),
+            ];
+        }
+
+        $sheet = [
             'entry' => $entry,
             'total_rows' => $index->totalRows($entry),
             'sheet_crc32' => $index->sheetCrc32($entry),
@@ -100,6 +160,22 @@ function generateVector(string $name, callable $write): void
             'column_stats' => $columnStats === [] ? new stdClass() : $columnStats,
             'column_sketches' => $columnSketches === [] ? new stdClass() : $columnSketches,
         ];
+        if ($stringZones !== []) {
+            $sheet['string_zones'] = $stringZones;
+        }
+        if ($rangeQuantiles !== []) {
+            $sheet['range_quantiles'] = $rangeQuantiles;
+        }
+        if ($topValues !== []) {
+            $sheet['top_values'] = $topValues;
+        }
+        if ($argPointers !== []) {
+            $sheet['arg_pointers'] = $argPointers;
+        }
+        if ($correlations !== []) {
+            $sheet['correlations'] = $correlations;
+        }
+        $sheets[] = $sheet;
     }
 
     $golden = [
@@ -192,6 +268,109 @@ generateVector('vector-05-sketches', function (SinkableXlsxWriter $w): void {
     for ($i = 1; $i <= 300; $i++) {
         $score = $i % 25 === 0 ? 'n/a' : (($i * 7) % 100) + 0.25;
         $w->writeRow([$i, $score, $cities[$i % 10].'-'.($i % 30)]);
+    }
+    $w->finishFile();
+});
+
+// Vector 6 — STRZ string zone maps. col 2 is a sorted invoice number with
+// a long shared prefix (exercises deferred separator truncation); col 3 is
+// a shuffled tag (unsorted string, weaker pruning); an empty cell every
+// 40th row exercises the null/other class. sync every 50 -> multiple blocks.
+generateVector('vector-06-string-zones', function (SinkableXlsxWriter $w): void {
+    $w->withRandomAccessIndex(every: 50);
+    $w->withStringStats([2, 3]);
+    $w->setBufferFlushInterval(50);
+    $w->startFile(['id', 'invoice', 'tag']);
+    $tags = ['alpha', 'bravo', 'charlie', 'delta', 'echo'];
+    for ($i = 1; $i <= 200; $i++) {
+        $invoice = sprintf('INV-2024-%08d', $i);
+        $tag = $i % 40 === 0 ? '' : $tags[$i % 5].'-'.($i % 7);
+        $w->writeRow([$i, $invoice, $tag]);
+    }
+    $w->finishFile();
+});
+
+// Vector 7 — TDGB range-quantile superblocks. The sheet is far under the
+// 16384-row superblock width, so col 2 yields a SINGLE superblock whose
+// end_row is the last data sheet row; the golden pins that boundary and
+// the quantiles its committed t-digest reproduces. Non-numeric cells
+// ('n/a' every 10th row) are excluded from the digest, so numeric_count
+// pins the STAT-interpretation population rule. Multi-superblock spans
+// (>16384 rows) are exercised by RangeQuantileTest rather than committed
+// as a heavyweight fixture; the per-superblock frame repeats exactly like
+// STAT's per-block frame, which the other vectors already pin.
+generateVector('vector-07-range-quantiles', function (SinkableXlsxWriter $w): void {
+    $w->withRandomAccessIndex(every: 100);
+    $w->withRangeQuantiles([2]);
+    $w->setBufferFlushInterval(100);
+    $w->startFile(['id', 'amount']);
+    for ($i = 1; $i <= 300; $i++) {
+        $amount = $i % 10 === 0 ? 'n/a' : (($i * 7) % 100) + 0.5;
+        $w->writeRow([$i, $amount]);
+    }
+    $w->finishFile();
+});
+
+// Vector 8 — TOPK frequent-items sketches, both branches of the exactness
+// switch in one file at k=8: col 2 'status' has 4 distinct values (≤ k →
+// saturated=false, the golden pins the exact complete distribution), col 3
+// 'region' has 20 distinct (> k → saturated=true, top-k with the N/k
+// bound). The golden pins each column's saturated bit and (value, count)
+// list; the hexdump pins the payload byte layout.
+generateVector('vector-08-top-values', function (SinkableXlsxWriter $w): void {
+    $w->withRandomAccessIndex(every: 100);
+    $w->withTopValues([2, 3], 8);
+    $w->setBufferFlushInterval(100);
+    $w->startFile(['id', 'status', 'region']);
+    $statuses = ['paid', 'pending', 'refunded', 'failed'];
+    for ($i = 1; $i <= 300; $i++) {
+        $status = $i % 100 < 70 ? 'paid' : $statuses[$i % 4];
+        // Two hot regions + an 18-way cold tail → 20 distinct > k, so the
+        // sketch saturates while the heavy hitters survive with real counts.
+        $region = $i % 100 < 55 ? 'r'.($i % 2) : 'r'.(2 + $i % 18);
+        $w->writeRow([$i, $status, $region]);
+    }
+    $w->finishFile();
+});
+
+// Vector 9 — ARGP argmin/argmax row pointers, block-aligned 1:1 with STAT.
+// A non-monotone amount column with a unique global max at data row 137
+// (sheet row 138) and a unique global min at data row 200 (sheet row 201),
+// so the golden pins the per-block {minRow, maxRow} and the two blocks that
+// carry the global extremes. The hexdump pins the two-uint32-per-block layout.
+generateVector('vector-09-arg-pointers', function (SinkableXlsxWriter $w): void {
+    $w->withRandomAccessIndex(every: 50);
+    $w->withArgPointers([2]);
+    $w->setBufferFlushInterval(50);
+    $w->startFile(['id', 'amount']);
+    for ($i = 1; $i <= 250; $i++) {
+        $amount = 100.0 + (($i * 31) % 50);
+        if ($i === 137) {
+            $amount = 9999.0;
+        }
+        if ($i === 200) {
+            $amount = -5.0;
+        }
+        $w->writeRow([$i, $amount]);
+    }
+    $w->finishFile();
+});
+
+// Vector 10 — CORR co-moment accumulators on three columns: col 2 and col 3
+// are linearly related (r near ±1), col 4 is independent. Blanks and text
+// are interleaved so a pair only accumulates rows where BOTH cells are
+// numeric. The golden pins each pair's n and Pearson r; the hexdump pins the
+// 48-byte accumulator layout (uint64 n + five little-endian doubles).
+generateVector('vector-10-correlations', function (SinkableXlsxWriter $w): void {
+    $w->withRandomAccessIndex(every: 100);
+    $w->withCorrelations([2, 3, 4]);
+    $w->setBufferFlushInterval(100);
+    $w->startFile(['id', 'x', 'y', 'z']);
+    for ($i = 1; $i <= 300; $i++) {
+        $x = $i % 11 === 0 ? '' : $i + 0.5;                 // blank every 11th
+        $y = $i % 13 === 0 ? 'n/a' : ($i + 0.5) * 2 - 3;    // text every 13th; y = 2x - 3
+        $z = ($i * 7919) % 500;                             // independent
+        $w->writeRow([$i, $x, $y, $z]);
     }
     $w->finishFile();
 });

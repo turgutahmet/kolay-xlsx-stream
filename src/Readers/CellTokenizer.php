@@ -173,6 +173,91 @@ class CellTokenizer
     }
 
     /**
+     * Late-materialization extractor: return ONLY the value tokenizeRow()
+     * would place at $targetIdx, parsing at most that one cell's body. Used
+     * by the query scan path to test a predicate cheaply and fully tokenize
+     * a row only when it matches — on a wide row a rejected row then skips
+     * every other cell's body parse (the dominant cost), and a row whose
+     * target sits near the front stops the walk there.
+     *
+     * The returned value is byte-identical to `tokenizeRow(...)[$targetIdx]`
+     * for a present cell (same helpers, same parse rules), and '' when the
+     * target is a sparse gap, a self-closing cell, or beyond the row — the
+     * three cases where tokenizeRow yields '' or the caller reads null, both
+     * of which `cellMatches`/`cellMatchesString` treat as a non-match, so a
+     * uniform '' is sound. Returning the moment a cell's index equals the
+     * target makes this order-independent: it never assumes cells arrive
+     * densely or in order (only an ABSENT target walks the whole row, the
+     * price of correctness on external out-of-order sheets).
+     *
+     * Date detection is deliberately NOT applied: the scan path always
+     * places a predicate column in the tokenizer's date-skip set (it
+     * compares raw values), so the raw parse here matches what the full
+     * tokenize would have produced for that same column.
+     */
+    public static function tokenizeColumn(string $rowXml, int $targetIdx, ?SharedStrings $sst = null): mixed
+    {
+        $maxIdx = -1;
+        $cursor = 0;
+        $len = strlen($rowXml);
+
+        while (true) {
+            $cellStart = strpos($rowXml, '<c', $cursor);
+            if ($cellStart === false) {
+                break;
+            }
+
+            $next = $rowXml[$cellStart + 2] ?? '';
+            if ($next !== ' ' && $next !== '/' && $next !== '>' && $next !== "\t" && $next !== "\n") {
+                $cursor = $cellStart + 2;
+                continue;
+            }
+
+            $tagEnd = self::findTagEnd($rowXml, $cellStart + 2, $len);
+            if ($tagEnd === false) {
+                break;
+            }
+
+            $isSelfClosing = $rowXml[$tagEnd - 1] === '/';
+            $attrs = substr(
+                $rowXml,
+                $cellStart + 2,
+                $tagEnd - ($cellStart + 2) - ($isSelfClosing ? 1 : 0)
+            );
+
+            [$colLetters, $type] = self::extractCellAttrs($attrs);
+
+            $idx = $colLetters !== null ? self::columnLettersToIndex($colLetters) : ($maxIdx + 1);
+            if ($idx > $maxIdx) {
+                $maxIdx = $idx;
+            }
+
+            if ($isSelfClosing) {
+                if ($idx === $targetIdx) {
+                    return '';
+                }
+                $cursor = $tagEnd + 1;
+
+                continue;
+            }
+
+            $bodyStart = $tagEnd + 1;
+            $bodyEnd = strpos($rowXml, '</c>', $bodyStart);
+            if ($bodyEnd === false) {
+                break;
+            }
+
+            if ($idx === $targetIdx) {
+                return self::parseCellBody(substr($rowXml, $bodyStart, $bodyEnd - $bodyStart), $type, $sst);
+            }
+
+            $cursor = $bodyEnd + 4;
+        }
+
+        return '';
+    }
+
+    /**
      * tokenizeRow's date-detecting twin — same scan, plus per-cell
      * style capture and conversion. Structural duplication is the
      * point, not an accident: any shared-loop formulation puts at

@@ -131,6 +131,16 @@ class RandomAccessIndex
 
     public const TAG_HLL = 'CHLL';
 
+    public const TAG_STRING_ZONE = 'STRZ';
+
+    public const TAG_RANGE_QUANTILE = 'TDGB';
+
+    public const TAG_TOP_VALUES = 'TOPK';
+
+    public const TAG_ARG_POINTER = 'ARGP';
+
+    public const TAG_CORRELATION = 'CORR';
+
     public const SORTED_ASC = 0x01;
     public const SORTED_DESC = 0x02;
 
@@ -159,7 +169,7 @@ class RandomAccessIndex
      *     1-based column => serialized HyperLogLog payload. Pass [] to omit
      *     the CHLL section entirely.
      */
-    public static function encode(int $syncPeriod, array $sheets, array $columnStats = [], array $syncPointCrcs = [], array $columnDigests = [], array $columnHlls = []): string
+    public static function encode(int $syncPeriod, array $sheets, array $columnStats = [], array $syncPointCrcs = [], array $columnDigests = [], array $columnHlls = [], array $columnStringStats = [], array $columnRangeQuantiles = [], array $columnTopValues = [], array $columnArgPointers = [], array $columnCorrelations = []): string
     {
         $body = '';
         foreach ($sheets as $sheet) {
@@ -230,6 +240,102 @@ class RandomAccessIndex
         if ($columnHlls !== []) {
             $chll = self::encodeSketchSection($sheets, $columnHlls);
             $body .= self::TAG_HLL.pack('V', strlen($chll)).$chll;
+        }
+
+        // STRZ — string zone maps. STAT's per-sheet/per-column/per-block
+        // skeleton, but each block's min/max are length-prefixed strings
+        // (variable) instead of the fixed 32-byte numeric record. A block
+        // with no string value (count == 0) stores empty min/max — since
+        // '' is never a tracked value, empty unambiguously means "absent".
+        if ($columnStringStats !== []) {
+            $strz = '';
+            foreach ($sheets as $sheet) {
+                $cols = $columnStringStats[$sheet['entry']] ?? [];
+                $strz .= pack('v', count($cols));
+                foreach ($cols as $colStat) {
+                    $flags = ($colStat['sorted_asc'] ? self::SORTED_ASC : 0)
+                        | ($colStat['sorted_desc'] ? self::SORTED_DESC : 0);
+                    $strz .= pack('vCV', $colStat['col'], $flags, count($colStat['blocks']));
+                    foreach ($colStat['blocks'] as $block) {
+                        $min = $block['min'] ?? '';
+                        $max = $block['max'] ?? '';
+                        $strz .= pack('v', strlen($min)).$min;
+                        $strz .= pack('v', strlen($max)).$max;
+                        $strz .= pack('VV', $block['count'], $block['other']);
+                    }
+                }
+            }
+            $body .= self::TAG_STRING_ZONE.pack('V', strlen($strz)).$strz;
+        }
+
+        // TDGB — per-superblock t-digests (row-space). Per sheet in
+        // core-body order: tracked column count, then per column its
+        // superblock count and, per superblock, the last row it covers plus
+        // a length-prefixed TDIG payload. Row spans are read (end_row), not
+        // recomputed.
+        if ($columnRangeQuantiles !== []) {
+            $tdgb = '';
+            foreach ($sheets as $sheet) {
+                $cols = $columnRangeQuantiles[$sheet['entry']] ?? [];
+                ksort($cols);
+                $tdgb .= pack('v', count($cols));
+                foreach ($cols as $col => $superblocks) {
+                    $tdgb .= pack('vV', $col, count($superblocks));
+                    foreach ($superblocks as $sb) {
+                        $tdgb .= pack('VV', $sb['end_row'], strlen($sb['payload'])).$sb['payload'];
+                    }
+                }
+            }
+            $body .= self::TAG_RANGE_QUANTILE.pack('V', strlen($tdgb)).$tdgb;
+        }
+
+        // TOPK — per-column Misra-Gries frequent-items sketches. Shares the
+        // generic sketch frame with TDIG/CHLL (§4.3): the payload is a
+        // serialized MisraGries, self-describing (carries its own k and the
+        // saturated bit).
+        if ($columnTopValues !== []) {
+            $topk = self::encodeSketchSection($sheets, $columnTopValues);
+            $body .= self::TAG_TOP_VALUES.pack('V', strlen($topk)).$topk;
+        }
+
+        // ARGP — per-block argmin/argmax row numbers, 1:1 with STAT. Per
+        // sheet in core-body order: tracked column count, then per column
+        // its 1-based index and block count, then two uint32 row numbers
+        // per block (0 = the block held no numeric value).
+        if ($columnArgPointers !== []) {
+            $argp = '';
+            foreach ($sheets as $sheet) {
+                $cols = $columnArgPointers[$sheet['entry']] ?? [];
+                ksort($cols);
+                $argp .= pack('v', count($cols));
+                foreach ($cols as $col => $blocks) {
+                    $argp .= pack('vV', $col, count($blocks));
+                    foreach ($blocks as $block) {
+                        $argp .= pack('VV', $block['minRow'], $block['maxRow']);
+                    }
+                }
+            }
+            $body .= self::TAG_ARG_POINTER.pack('V', strlen($argp)).$argp;
+        }
+
+        // CORR — per-pair co-moment accumulators for exact Pearson
+        // correlation. Per sheet in core-body order: pair count, then per
+        // pair its two 1-based column indexes (ascending) and the fixed
+        // 48-byte CoMoments payload.
+        if ($columnCorrelations !== []) {
+            $corr = '';
+            foreach ($sheets as $sheet) {
+                // Insertion order is canonical: pairs were built (a, b) with
+                // a < b, outer a ascending — a numeric order a string ksort
+                // would break ("10,2" before "2,3").
+                $pairs = $columnCorrelations[$sheet['entry']] ?? [];
+                $corr .= pack('v', count($pairs));
+                foreach ($pairs as $key => $payload) {
+                    [$a, $b] = explode(',', $key);
+                    $corr .= pack('vv', (int) $a, (int) $b).$payload;
+                }
+            }
+            $body .= self::TAG_CORRELATION.pack('V', strlen($corr)).$corr;
         }
 
         $header = self::MAGIC;

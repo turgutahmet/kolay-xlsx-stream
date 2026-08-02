@@ -240,6 +240,85 @@ class AutoDetectDatesTest extends TestCase
         $writer->finishFile();
     }
 
+    public function test_header_matches_rows_when_row_one_has_a_date_cell(): void
+    {
+        // External file whose ROW 1 carries a date-styled numeric cell.
+        // header() must apply the same detection rows() does, so the two
+        // agree — header() may not silently return the raw serial.
+        $this->buildRowOneDateXlsx();
+
+        $reader = StreamingXlsxReader::fromFile($this->testFile)->autoDetectDates();
+        $header = $reader->header();
+        $firstRow = iterator_to_array($reader->rows(), false)[0];
+
+        $this->assertEquals($firstRow, $header, 'header() must equal rows()[0] under detection');
+        $this->assertInstanceOf(\DateTimeImmutable::class, $header[0], 'the date-styled header cell converts');
+        $this->assertSame('2024-01-01', $header[0]->format('Y-m-d'));
+
+        // Without detection the two also agree — on the raw serial.
+        $raw = StreamingXlsxReader::fromFile($this->testFile);
+        $this->assertSame('45292', $raw->header()[0]);
+        $this->assertSame($raw->header(), iterator_to_array($raw->rows(), false)[0]);
+    }
+
+    /**
+     * Minimal external archive whose first row has a date-styled numeric
+     * cell (s="1" → builtin numFmt 14) alongside a shared-string cell — the
+     * shape that exposes a header/rows date-detection divergence.
+     */
+    private function buildRowOneDateXlsx(): void
+    {
+        $styles = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'.
+            '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'.
+            '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'.
+            '<cellXfs count="2">'.
+            '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'.
+            '<xf numFmtId="14" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'.
+            '</cellXfs></styleSheet>';
+        $sheet = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'.
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>'.
+            '<row r="1"><c r="A1" s="1"><v>45292</v></c><c r="B1" t="s"><v>0</v></c></row>'.
+            '<row r="2"><c r="A2" s="1"><v>45293</v></c><c r="B2" t="s"><v>1</v></c></row>'.
+            '</sheetData></worksheet>';
+        $sst = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'.
+            '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="2" uniqueCount="2">'.
+            '<si><t>label</t></si><si><t>row2</t></si></sst>';
+        $workbook = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'.
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'.
+            ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'.
+            '<sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>';
+        $types = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'.
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'.
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'.
+            '<Default Extension="xml" ContentType="application/xml"/>'.
+            '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'.
+            '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'.
+            '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'.
+            '<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>'.
+            '</Types>';
+        $pkgRels = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'.
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'.
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'.
+            '</Relationships>';
+        $wbRels = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'.
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'.
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'.
+            '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'.
+            '<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>'.
+            '</Relationships>';
+
+        $zip = new \ZipArchive();
+        $this->assertTrue($zip->open($this->testFile, \ZipArchive::CREATE | \ZipArchive::OVERWRITE) === true);
+        $zip->addFromString('[Content_Types].xml', $types);
+        $zip->addFromString('_rels/.rels', $pkgRels);
+        $zip->addFromString('xl/workbook.xml', $workbook);
+        $zip->addFromString('xl/_rels/workbook.xml.rels', $wbRels);
+        $zip->addFromString('xl/styles.xml', $styles);
+        $zip->addFromString('xl/sharedStrings.xml', $sst);
+        $zip->addFromString('xl/worksheets/sheet1.xml', $sheet);
+        $zip->close();
+    }
+
     /**
      * Minimal external-shaped archive: numeric cells WITHOUT t=, s="1"
      * pointing at builtin date format 14, a PhpSpreadsheet-style

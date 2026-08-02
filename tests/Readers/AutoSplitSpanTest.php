@@ -55,6 +55,9 @@ class AutoSplitSpanTest extends TestCase
         $writer->withRandomAccessIndex(every: 10_000);
         $writer->withColumnStats([1, 2]);
         $writer->withColumnSketches([1, 2]);
+        $writer->withTopValues([3]); // city: 5 distinct ≤ k → exact across the chain
+        $writer->withArgPointers([1]); // id is monotone: argmin in member 1, argmax in the last
+        $writer->withCorrelations([1, 2]); // amount = 2*id → perfectly correlated across the chain
         $writer->startFile(['id', 'amount', 'city', 'flag']);
 
         for ($i = 1; $i <= self::DATA_ROWS; $i++) {
@@ -107,6 +110,38 @@ class AutoSplitSpanTest extends TestCase
         // 'other' carries one text header cell per physical sheet.
         $this->assertSame(3, $stats['other']);
         $this->assertSame('asc', $stats['sorted']);
+    }
+
+    public function test_count_empty_folds_across_the_chain(): void
+    {
+        // id is numeric on every data row, so its empty count is exactly 0
+        // across the chain — proving countEmpty folds all members and
+        // excludes the (text) header the raw 'other' tally would include.
+        $this->assertSame(0, $this->reader()->countEmpty(1));
+    }
+
+    public function test_correlation_folds_across_the_chain(): void
+    {
+        // amount = 2*id is a perfect positive linear relationship, so the
+        // chain-merged co-moments must report r == 1 across all members.
+        $this->assertEqualsWithDelta(1.0, $this->reader()->correlation(1, 2), 1e-9);
+    }
+
+    public function test_profile_spans_the_chain(): void
+    {
+        $profile = $this->reader()->profile();
+
+        // data_rows and correlations fold across every member.
+        $this->assertSame(self::DATA_ROWS, $profile['data_rows']);
+        $this->assertEqualsWithDelta(1.0, $profile['correlations']['1,2'], 1e-9);
+
+        // Numeric column 1 carries its chain-wide summary; the rank
+        // certificate is undefined on a chain (single-sheet only), so the
+        // percentile value is present but its bounds are null.
+        $c1 = $profile['columns'][1];
+        $this->assertSame(self::DATA_ROWS, $c1['numeric_count']);
+        $this->assertNotNull($c1['percentiles']['p50']['value']);
+        $this->assertNull($c1['percentiles']['p50']['rank_lo'], 'no single-sheet certificate over a chain');
     }
 
     public function test_find_row_reaches_past_the_first_sheet(): void
@@ -226,6 +261,58 @@ class AutoSplitSpanTest extends TestCase
         $distinct = $reader->countDistinct(1);
         $this->assertNotNull($distinct);
         $this->assertEqualsWithDelta(self::DATA_ROWS, $distinct, self::DATA_ROWS * 0.05);
+    }
+
+    public function test_top_values_span_the_chain(): void
+    {
+        $reader = $this->reader();
+
+        // city = 'c'.(id % 5): 5 distinct values ≤ k, so the merged sketch
+        // is EXACT and every count is the whole-chain total, not sheet 1's.
+        $result = $reader->topValues(3);
+        $this->assertNotNull($result);
+        $this->assertTrue($result['exact'], 'cardinality ≤ k over the chain must stay exact');
+
+        // Exact per-value oracle over 1..DATA_ROWS: value 'c'.(i%5).
+        $oracle = [];
+        for ($r = 0; $r < 5; $r++) {
+            $oracle['c'.$r] = 0;
+        }
+        for ($i = 1; $i <= self::DATA_ROWS; $i++) {
+            $oracle['c'.($i % 5)]++;
+        }
+        arsort($oracle);
+
+        $got = [];
+        foreach ($result['values'] as $p) {
+            $got[$p['value']] = $p['count'];
+        }
+        $this->assertEquals($oracle, $got, 'chain-merged top values must equal the exact whole-table counts');
+        // Sanity: the totals actually span both full sheets, not just one.
+        $this->assertSame(self::DATA_ROWS, array_sum($got));
+    }
+
+    public function test_arg_pointers_span_the_chain(): void
+    {
+        $reader = $this->reader();
+
+        // id is 1..DATA_ROWS ascending, so the global minimum sits in
+        // member 1 and the global maximum in the last member — argMin/argMax
+        // must return GLOBAL rows that rowAt reads back to the extreme value.
+        $lo = $reader->argMin(1);
+        $hi = $reader->argMax(1);
+        $this->assertNotNull($lo);
+        $this->assertNotNull($hi);
+
+        $this->assertSame(1.0, $lo['value']);
+        $this->assertSame((float) self::DATA_ROWS, $hi['value']);
+
+        // The rows are logical (global) coordinates: min at the first data
+        // row, max at the very last — both crossing the sheet boundary.
+        $this->assertSame(2, $lo['row']);
+        $this->assertSame(self::GLOBAL_ROWS, $hi['row']);
+        $this->assertSame(1, (int) $reader->rowAt($lo['row'])[0]);
+        $this->assertSame(self::DATA_ROWS, (int) $reader->rowAt($hi['row'])[0]);
     }
 
     public function test_shards_cover_every_chain_sheet(): void

@@ -3,7 +3,9 @@
 namespace Kolay\XlsxStream\Readers;
 
 use Kolay\XlsxStream\Exceptions\XlsxReadException;
+use Kolay\XlsxStream\Sketches\CoMoments;
 use Kolay\XlsxStream\Sketches\HyperLogLog;
+use Kolay\XlsxStream\Sketches\MisraGries;
 use Kolay\XlsxStream\Sketches\TDigest;
 
 /**
@@ -39,6 +41,16 @@ class RandomAccessIndex
     public const TAG_TDIGEST = 'TDIG';
 
     public const TAG_HLL = 'CHLL';
+
+    public const TAG_STRING_ZONE = 'STRZ';
+
+    public const TAG_RANGE_QUANTILE = 'TDGB';
+
+    public const TAG_TOP_VALUES = 'TOPK';
+
+    public const TAG_ARG_POINTER = 'ARGP';
+
+    public const TAG_CORRELATION = 'CORR';
 
     public const SORTED_ASC = 0x01;
     public const SORTED_DESC = 0x02;
@@ -108,7 +120,46 @@ class RandomAccessIndex
     /** @var array<string, array<int, HyperLogLog>> memoized deserialized HLLs */
     private array $columnHlls = [];
 
-    private function __construct(int $syncPeriod, array $totals, array $crcs, array $syncs, array $columnStats = [], array $syncPointCrcs = [], array $columnDigestPayloads = [], array $columnHllPayloads = [])
+    /**
+     * Per-block lexicographic string zone maps from the "STRZ" TLV
+     * section (the string analogue of columnStatsByEntry).
+     *
+     * @var array<string, array<int, array{
+     *     sorted_asc: bool,
+     *     sorted_desc: bool,
+     *     blocks: list<array{min: ?string, max: ?string, count: int, other: int}>
+     * }>> entry path => 1-based column => string stats
+     */
+    private array $columnStringStatsByEntry = [];
+
+    /**
+     * Per-superblock t-digest payloads from the "TDGB" TLV — one list per
+     * (entry, column), each entry `{end_row, payload}`. Deserialized lazily
+     * by rangeQuantileSuperblocks().
+     *
+     * @var array<string, array<int, list<array{end_row: int, payload: string}>>>
+     */
+    private array $columnRangeQuantilesByEntry = [];
+
+    /** @var array<string, array<int, list<array{end_row: int, digest: TDigest}>>> memoized deserialized TDGB superblocks */
+    private array $columnRangeQuantileDigests = [];
+
+    /** @var array<string, array<int, string>> entry path => 1-based column => serialized MisraGries (TOPK) */
+    private array $columnTopValuePayloads = [];
+
+    /** @var array<string, array<int, MisraGries>> memoized deserialized Misra-Gries sketches */
+    private array $columnTopValues = [];
+
+    /** @var array<string, array<int, list<array{minRow: int, maxRow: int}>>> per-block argmin/argmax rows (ARGP) */
+    private array $columnArgPointersByEntry = [];
+
+    /** @var array<string, array<string, string>> entry => "a,b" => serialized CoMoments (CORR) */
+    private array $columnCorrelationPayloadsByEntry = [];
+
+    /** @var array<string, array<string, CoMoments>> memoized deserialized co-moment accumulators */
+    private array $columnCorrelations = [];
+
+    private function __construct(int $syncPeriod, array $totals, array $crcs, array $syncs, array $columnStats = [], array $syncPointCrcs = [], array $columnDigestPayloads = [], array $columnHllPayloads = [], array $columnStringStats = [], array $columnRangeQuantiles = [], array $columnTopValues = [], array $columnArgPointers = [], array $columnCorrelations = [])
     {
         $this->syncPeriod = $syncPeriod;
         $this->totalRowsByEntry = $totals;
@@ -118,6 +169,11 @@ class RandomAccessIndex
         $this->syncPointCrcsByEntry = $syncPointCrcs;
         $this->columnDigestPayloads = $columnDigestPayloads;
         $this->columnHllPayloads = $columnHllPayloads;
+        $this->columnStringStatsByEntry = $columnStringStats;
+        $this->columnRangeQuantilesByEntry = $columnRangeQuantiles;
+        $this->columnTopValuePayloads = $columnTopValues;
+        $this->columnArgPointersByEntry = $columnArgPointers;
+        $this->columnCorrelationPayloadsByEntry = $columnCorrelations;
     }
 
     public static function decode(string $payload): self
@@ -302,6 +358,11 @@ class RandomAccessIndex
         $syncPointCrcs = [];
         $columnDigestPayloads = [];
         $columnHllPayloads = [];
+        $columnStringStats = [];
+        $columnRangeQuantiles = [];
+        $columnTopValues = [];
+        $columnArgPointers = [];
+        $columnCorrelations = [];
         $entryOrder = array_keys($totals);
         while ($cursor + 8 <= $bodyLen) {
             $tag = substr($body, $cursor, 4);
@@ -338,12 +399,39 @@ class RandomAccessIndex
                     $entryOrder,
                     self::TAG_HLL
                 );
+            } elseif ($tag === self::TAG_STRING_ZONE) {
+                $columnStringStats = self::decodeStringZoneSection(
+                    substr($body, $cursor, $length),
+                    $entryOrder,
+                    $syncs
+                );
+            } elseif ($tag === self::TAG_RANGE_QUANTILE) {
+                $columnRangeQuantiles = self::decodeTdgbSection(
+                    substr($body, $cursor, $length),
+                    $entryOrder
+                );
+            } elseif ($tag === self::TAG_TOP_VALUES) {
+                $columnTopValues = self::decodeSketchSection(
+                    substr($body, $cursor, $length),
+                    $entryOrder,
+                    self::TAG_TOP_VALUES
+                );
+            } elseif ($tag === self::TAG_ARG_POINTER) {
+                $columnArgPointers = self::decodeArgpSection(
+                    substr($body, $cursor, $length),
+                    $entryOrder
+                );
+            } elseif ($tag === self::TAG_CORRELATION) {
+                $columnCorrelations = self::decodeCorrSection(
+                    substr($body, $cursor, $length),
+                    $entryOrder
+                );
             }
 
             $cursor += $length;
         }
 
-        return new self($syncPeriod, $totals, $crcs, $syncs, $columnStats, $syncPointCrcs, $columnDigestPayloads, $columnHllPayloads);
+        return new self($syncPeriod, $totals, $crcs, $syncs, $columnStats, $syncPointCrcs, $columnDigestPayloads, $columnHllPayloads, $columnStringStats, $columnRangeQuantiles, $columnTopValues, $columnArgPointers, $columnCorrelations);
     }
 
     /**
@@ -421,6 +509,91 @@ class RandomAccessIndex
     }
 
     /**
+     * Parse the "STRZ" TLV payload — per-block lexicographic string zone
+     * maps. Same per-sheet/per-column/per-block skeleton as STAT (and the
+     * same block_count == sync_count + 1 invariant), but each block's
+     * min/max are length-prefixed strings; an empty min/max pairs with a
+     * count-0 block (absent value).
+     *
+     * @param  list<string>  $entryOrder  sheet entries in core-body order
+     * @param  array<string, list<array{row: int, comp_offset: int, uncomp_offset: int}>>  $syncs
+     * @return array<string, array<int, array{sorted_asc: bool, sorted_desc: bool, blocks: list<array{min: ?string, max: ?string, count: int, other: int}>}>>
+     */
+    private static function decodeStringZoneSection(string $strz, array $entryOrder, array $syncs): array
+    {
+        $result = [];
+        $cursor = 0;
+        $len = strlen($strz);
+
+        foreach ($entryOrder as $entry) {
+            if ($cursor + 2 > $len) {
+                throw XlsxReadException::corruptCentralDirectory('truncated STRZ section sheet header');
+            }
+            $colCount = unpack('v', substr($strz, $cursor, 2))[1];
+            $cursor += 2;
+
+            $expectedBlocks = count($syncs[$entry] ?? []) + 1;
+
+            for ($c = 0; $c < $colCount; $c++) {
+                if ($cursor + 7 > $len) {
+                    throw XlsxReadException::corruptCentralDirectory('truncated STRZ column header');
+                }
+                $col = unpack('v', substr($strz, $cursor, 2))[1];
+                $flags = ord($strz[$cursor + 2]);
+                $blockCount = unpack('V', substr($strz, $cursor + 3, 4))[1];
+                $cursor += 7;
+
+                if ($col < 1) {
+                    throw XlsxReadException::corruptCentralDirectory('STRZ section column index must be 1-based');
+                }
+                if ($blockCount !== $expectedBlocks) {
+                    throw XlsxReadException::corruptCentralDirectory(
+                        "STRZ section block count {$blockCount} does not match sync points + 1 ({$expectedBlocks}) for sheet '{$entry}'"
+                    );
+                }
+
+                $blocks = [];
+                for ($b = 0; $b < $blockCount; $b++) {
+                    if ($cursor + 2 > $len) {
+                        throw XlsxReadException::corruptCentralDirectory("truncated STRZ block (min length) for sheet '{$entry}' column {$col}");
+                    }
+                    $minLen = unpack('v', substr($strz, $cursor, 2))[1];
+                    $cursor += 2;
+                    if ($cursor + $minLen + 2 > $len) {
+                        throw XlsxReadException::corruptCentralDirectory("truncated STRZ block (min/max) for sheet '{$entry}' column {$col}");
+                    }
+                    $min = substr($strz, $cursor, $minLen);
+                    $cursor += $minLen;
+                    $maxLen = unpack('v', substr($strz, $cursor, 2))[1];
+                    $cursor += 2;
+                    if ($cursor + $maxLen + 8 > $len) {
+                        throw XlsxReadException::corruptCentralDirectory("truncated STRZ block (max/counts) for sheet '{$entry}' column {$col}");
+                    }
+                    $max = substr($strz, $cursor, $maxLen);
+                    $cursor += $maxLen;
+                    $counts = unpack('Vcount/Vother', substr($strz, $cursor, 8));
+                    $cursor += 8;
+
+                    $blocks[] = [
+                        'min' => $counts['count'] === 0 ? null : $min,
+                        'max' => $counts['count'] === 0 ? null : $max,
+                        'count' => $counts['count'],
+                        'other' => $counts['other'],
+                    ];
+                }
+
+                $result[$entry][$col] = [
+                    'sorted_asc' => (bool) ($flags & self::SORTED_ASC),
+                    'sorted_desc' => (bool) ($flags & self::SORTED_DESC),
+                    'blocks' => $blocks,
+                ];
+            }
+        }
+
+        return $result;
+    }
+
+    /**
      * Parse the "SCRC" TLV payload — per-sheet running CRC32 values in
      * core-body sheet order, one uint32 per sync point. Enforces the
      * structural invariant count == sync_count so a misaligned sidecar
@@ -462,6 +635,152 @@ class RandomAccessIndex
             }
 
             $result[$entry] = $values;
+        }
+
+        return $result;
+    }
+
+    /**
+     * Parse the "TDGB" TLV payload — per-superblock t-digests. Per sheet
+     * in core-body order: tracked column count; per column: its superblock
+     * count and, per superblock, `end_row` (uint32) + a length-prefixed
+     * TDIG payload (kept opaque, deserialized lazily by the accessor).
+     *
+     * @param  list<string>  $entryOrder  sheet entries in core-body order
+     * @return array<string, array<int, list<array{end_row: int, payload: string}>>>
+     */
+    private static function decodeTdgbSection(string $data, array $entryOrder): array
+    {
+        $result = [];
+        $cursor = 0;
+        $len = strlen($data);
+
+        foreach ($entryOrder as $entry) {
+            if ($cursor + 2 > $len) {
+                throw XlsxReadException::corruptCentralDirectory('truncated TDGB section sheet header');
+            }
+            $colCount = unpack('v', substr($data, $cursor, 2))[1];
+            $cursor += 2;
+
+            for ($c = 0; $c < $colCount; $c++) {
+                if ($cursor + 6 > $len) {
+                    throw XlsxReadException::corruptCentralDirectory('truncated TDGB column header');
+                }
+                $col = unpack('v', substr($data, $cursor, 2))[1];
+                $sbCount = unpack('V', substr($data, $cursor + 2, 4))[1];
+                $cursor += 6;
+
+                if ($col < 1) {
+                    throw XlsxReadException::corruptCentralDirectory('TDGB section column index must be 1-based');
+                }
+
+                $superblocks = [];
+                for ($s = 0; $s < $sbCount; $s++) {
+                    if ($cursor + 8 > $len) {
+                        throw XlsxReadException::corruptCentralDirectory("truncated TDGB superblock header for sheet '{$entry}' column {$col}");
+                    }
+                    $head = unpack('Vend/Vplen', substr($data, $cursor, 8));
+                    $cursor += 8;
+                    if ($cursor + $head['plen'] > $len) {
+                        throw XlsxReadException::corruptCentralDirectory("truncated TDGB superblock payload for sheet '{$entry}' column {$col}");
+                    }
+                    $superblocks[] = ['end_row' => $head['end'], 'payload' => substr($data, $cursor, $head['plen'])];
+                    $cursor += $head['plen'];
+                }
+
+                $result[$entry][$col] = $superblocks;
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * Decode the ARGP section: per sheet, a tracked column count, then per
+     * column its 1-based index, block count, and two uint32 row numbers per
+     * block (argmin, argmax; 0 = the block held no numeric value).
+     *
+     * @param  list<string>  $entryOrder
+     * @return array<string, array<int, list<array{minRow: int, maxRow: int}>>>
+     */
+    private static function decodeArgpSection(string $data, array $entryOrder): array
+    {
+        $result = [];
+        $cursor = 0;
+        $len = strlen($data);
+
+        foreach ($entryOrder as $entry) {
+            if ($cursor + 2 > $len) {
+                throw XlsxReadException::corruptCentralDirectory('truncated ARGP section sheet header');
+            }
+            $colCount = unpack('v', substr($data, $cursor, 2))[1];
+            $cursor += 2;
+
+            for ($c = 0; $c < $colCount; $c++) {
+                if ($cursor + 6 > $len) {
+                    throw XlsxReadException::corruptCentralDirectory('truncated ARGP column header');
+                }
+                $col = unpack('v', substr($data, $cursor, 2))[1];
+                $blockCount = unpack('V', substr($data, $cursor + 2, 4))[1];
+                $cursor += 6;
+
+                if ($col < 1) {
+                    throw XlsxReadException::corruptCentralDirectory('ARGP section column index must be 1-based');
+                }
+
+                $blocks = [];
+                for ($b = 0; $b < $blockCount; $b++) {
+                    if ($cursor + 8 > $len) {
+                        throw XlsxReadException::corruptCentralDirectory("truncated ARGP block for sheet '{$entry}' column {$col}");
+                    }
+                    $rows = unpack('Vmin/Vmax', substr($data, $cursor, 8));
+                    $cursor += 8;
+                    $blocks[] = ['minRow' => $rows['min'], 'maxRow' => $rows['max']];
+                }
+
+                $result[$entry][$col] = $blocks;
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * Decode the CORR section: per sheet, a pair count, then per pair its
+     * two 1-based column indexes and the fixed 48-byte CoMoments payload.
+     * Only the framing is validated here (pair count, column ids, payload
+     * length); the accumulator's finiteness is checked lazily on access.
+     *
+     * @param  list<string>  $entryOrder
+     * @return array<string, array<string, string>>  entry => "a,b" => payload
+     */
+    private static function decodeCorrSection(string $data, array $entryOrder): array
+    {
+        $result = [];
+        $cursor = 0;
+        $len = strlen($data);
+        $payloadBytes = CoMoments::PAYLOAD_BYTES;
+
+        foreach ($entryOrder as $entry) {
+            if ($cursor + 2 > $len) {
+                throw XlsxReadException::corruptCentralDirectory('truncated CORR section sheet header');
+            }
+            $pairCount = unpack('v', substr($data, $cursor, 2))[1];
+            $cursor += 2;
+
+            for ($p = 0; $p < $pairCount; $p++) {
+                if ($cursor + 4 + $payloadBytes > $len) {
+                    throw XlsxReadException::corruptCentralDirectory("truncated CORR pair for sheet '{$entry}'");
+                }
+                $cols = unpack('va/vb', substr($data, $cursor, 4));
+                $cursor += 4;
+                if ($cols['a'] < 1 || $cols['b'] < 1 || $cols['a'] >= $cols['b']) {
+                    throw XlsxReadException::corruptCentralDirectory('CORR pair columns must be 1-based with a < b');
+                }
+                $payload = substr($data, $cursor, $payloadBytes);
+                $cursor += $payloadBytes;
+                $result[$entry][$cols['a'].','.$cols['b']] = $payload;
+            }
         }
 
         return $result;
@@ -565,6 +884,59 @@ class RandomAccessIndex
     }
 
     /**
+     * String zone maps for one sheet (KXSI "STRZ" section), or null when
+     * the sidecar carries none for that entry/column.
+     *
+     * @return array{sorted_asc: bool, sorted_desc: bool, blocks: list<array{min: ?string, max: ?string, count: int, other: int}>}|null
+     */
+    public function columnStringStats(string $sheetEntry, int $column): ?array
+    {
+        return $this->columnStringStatsByEntry[$sheetEntry][$column] ?? null;
+    }
+
+    /** @return list<int> 1-based columns that carry string zone maps for the sheet */
+    public function stringStatsColumns(string $sheetEntry): array
+    {
+        return array_keys($this->columnStringStatsByEntry[$sheetEntry] ?? []);
+    }
+
+    /**
+     * Per-superblock t-digests for one column (KXSI "TDGB" section), or
+     * null when the sidecar carries none for that entry/column. Each entry
+     * pairs the superblock's last row (`end_row`) with its deserialized
+     * digest; a range query merges the digests whose spans fall inside the
+     * requested row range and scans the edges.
+     *
+     * @return list<array{end_row: int, digest: TDigest}>|null
+     */
+    public function rangeQuantileSuperblocks(string $sheetEntry, int $column): ?array
+    {
+        $raw = $this->columnRangeQuantilesByEntry[$sheetEntry][$column] ?? null;
+        if ($raw === null) {
+            return null;
+        }
+        // Memoize the deserialized digests — a range/group quantile revisits
+        // the same superblocks every call, and re-parsing every payload each
+        // time (unlike columnDigest/columnHll, which cache) was pure waste.
+        // Callers clone before merging, so the cached digests stay pristine.
+        if (! isset($this->columnRangeQuantileDigests[$sheetEntry][$column])) {
+            $out = [];
+            foreach ($raw as $sb) {
+                $out[] = ['end_row' => $sb['end_row'], 'digest' => TDigest::deserialize($sb['payload'])];
+            }
+            $this->columnRangeQuantileDigests[$sheetEntry][$column] = $out;
+        }
+
+        return $this->columnRangeQuantileDigests[$sheetEntry][$column];
+    }
+
+    /** @return list<int> 1-based columns that carry range-quantile digests for the sheet */
+    public function rangeQuantileColumns(string $sheetEntry): array
+    {
+        return array_keys($this->columnRangeQuantilesByEntry[$sheetEntry] ?? []);
+    }
+
+    /**
      * T-digest sketch for one column (KXSI "TDIG" section), or null
      * when the sidecar carries none for that entry/column. A payload
      * whose internal structure fails the sketch's own invariants
@@ -625,6 +997,98 @@ class RandomAccessIndex
     public function hllColumns(string $sheetEntry): array
     {
         return array_keys($this->columnHllPayloads[$sheetEntry] ?? []);
+    }
+
+    /**
+     * Misra-Gries frequent-items sketch for one column (KXSI "TOPK"
+     * section), or null when the sidecar carries none for that
+     * entry/column. Deserialized lazily and memoized, like columnHll().
+     */
+    public function columnTopValues(string $sheetEntry, int $column): ?MisraGries
+    {
+        $payload = $this->columnTopValuePayloads[$sheetEntry][$column] ?? null;
+        if ($payload === null) {
+            return null;
+        }
+
+        if (! isset($this->columnTopValues[$sheetEntry][$column])) {
+            try {
+                $this->columnTopValues[$sheetEntry][$column] = MisraGries::deserialize($payload);
+            } catch (\InvalidArgumentException $e) {
+                throw XlsxReadException::corruptCentralDirectory(
+                    "TOPK sketch for sheet '{$sheetEntry}' column {$column} is invalid: ".$e->getMessage()
+                );
+            }
+        }
+
+        return $this->columnTopValues[$sheetEntry][$column];
+    }
+
+    /** @return list<int> 1-based columns that carry a TOPK sketch for the sheet */
+    public function topValueColumns(string $sheetEntry): array
+    {
+        return array_keys($this->columnTopValuePayloads[$sheetEntry] ?? []);
+    }
+
+    /**
+     * Per-block argmin/argmax row numbers for one column (KXSI "ARGP"
+     * section), aligned 1:1 with the STAT blocks, or null when the sidecar
+     * carries none. A block that held no numeric value has {minRow: 0,
+     * maxRow: 0}.
+     *
+     * @return list<array{minRow: int, maxRow: int}>|null
+     */
+    public function argPointers(string $sheetEntry, int $column): ?array
+    {
+        return $this->columnArgPointersByEntry[$sheetEntry][$column] ?? null;
+    }
+
+    /** @return list<int> 1-based columns that carry ARGP row pointers for the sheet */
+    public function argPointerColumns(string $sheetEntry): array
+    {
+        return array_keys($this->columnArgPointersByEntry[$sheetEntry] ?? []);
+    }
+
+    /**
+     * Co-moment accumulator for a column pair (KXSI "CORR" section), or null
+     * when the sidecar carries no correlation for it. Column order does not
+     * matter — (a, b) and (b, a) resolve to the same pair. The deserialized
+     * accumulator is memoized; callers that merge across a chain must clone
+     * before mutating (the sums are all scalars, so clone is a safe copy).
+     */
+    public function correlation(string $sheetEntry, int $columnA, int $columnB): ?CoMoments
+    {
+        if ($columnA === $columnB) {
+            return null;
+        }
+        $key = $columnA < $columnB ? $columnA.','.$columnB : $columnB.','.$columnA;
+
+        if (isset($this->columnCorrelations[$sheetEntry][$key])) {
+            return $this->columnCorrelations[$sheetEntry][$key];
+        }
+        $payload = $this->columnCorrelationPayloadsByEntry[$sheetEntry][$key] ?? null;
+        if ($payload === null) {
+            return null;
+        }
+
+        return $this->columnCorrelations[$sheetEntry][$key] = CoMoments::deserialize($payload);
+    }
+
+    /**
+     * Column pairs that carry a CORR accumulator for the sheet, each as
+     * [a, b] with a < b.
+     *
+     * @return list<array{0: int, 1: int}>
+     */
+    public function correlationPairs(string $sheetEntry): array
+    {
+        $pairs = [];
+        foreach (array_keys($this->columnCorrelationPayloadsByEntry[$sheetEntry] ?? []) as $key) {
+            [$a, $b] = explode(',', (string) $key);
+            $pairs[] = [(int) $a, (int) $b];
+        }
+
+        return $pairs;
     }
 
     /**

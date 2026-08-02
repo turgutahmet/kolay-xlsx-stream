@@ -31,6 +31,11 @@ class SpecVectorsTest extends TestCase
             'multi-sheet + stats' => ['vector-03-multisheet'],
             'sorted + unsorted stats' => ['vector-04-sorted'],
             'sketches (TDIG + CHLL)' => ['vector-05-sketches'],
+            'string zone maps (STRZ)' => ['vector-06-string-zones'],
+            'range quantiles (TDGB)' => ['vector-07-range-quantiles'],
+            'top values (TOPK)' => ['vector-08-top-values'],
+            'arg pointers (ARGP)' => ['vector-09-arg-pointers'],
+            'correlations (CORR)' => ['vector-10-correlations'],
         ];
     }
 
@@ -92,6 +97,59 @@ class SpecVectorsTest extends TestCase
                 ];
             }
             $this->assertEquals($sheet['column_sketches'] ?? [], $actualSketches, $entry);
+
+            // TDGB goldens pin each superblock's end_row and the quantiles
+            // its committed t-digest reproduces — the range-scoped analogue
+            // of the whole-column sketch check. Pre-TDGB vectors carry no
+            // key, so the default [] keeps them unaffected.
+            $actualRangeQuantiles = [];
+            foreach ($index->rangeQuantileColumns($entry) as $col) {
+                $superblocks = [];
+                foreach ($index->rangeQuantileSuperblocks($entry, $col) as $sb) {
+                    $quantiles = [];
+                    foreach (['0', '0.5', '1'] as $q) {
+                        $quantiles[$q] = $sb['digest']->quantile((float) $q);
+                    }
+                    $superblocks[] = [
+                        'end_row' => $sb['end_row'],
+                        'numeric_count' => $sb['digest']->count(),
+                        'quantiles' => $quantiles,
+                    ];
+                }
+                $actualRangeQuantiles[(string) $col] = $superblocks;
+            }
+            $this->assertEquals($sheet['range_quantiles'] ?? [], $actualRangeQuantiles, $entry);
+
+            // TOPK goldens pin each column's saturated bit and its
+            // (value, count) list, reproduced from the committed sketch
+            // bytes. Pre-TOPK vectors carry no key.
+            $actualTopValues = [];
+            foreach ($index->topValueColumns($entry) as $col) {
+                $sketch = $index->columnTopValues($entry, $col);
+                $actualTopValues[(string) $col] = [
+                    'saturated' => $sketch->saturated(),
+                    'values' => $sketch->topValues(),
+                ];
+            }
+            $this->assertEquals($sheet['top_values'] ?? [], $actualTopValues, $entry);
+
+            // ARGP goldens pin each tracked column's per-block
+            // {minRow, maxRow}, block-aligned 1:1 with STAT. Pre-ARGP
+            // vectors carry no key.
+            $actualArgPointers = [];
+            foreach ($index->argPointerColumns($entry) as $col) {
+                $actualArgPointers[(string) $col] = $index->argPointers($entry, $col);
+            }
+            $this->assertEquals($sheet['arg_pointers'] ?? [], $actualArgPointers, $entry);
+
+            // CORR goldens pin each pair's n and Pearson r, recomputed from
+            // the committed co-moment payload. Pre-CORR vectors carry no key.
+            $actualCorrelations = [];
+            foreach ($index->correlationPairs($entry) as [$a, $b]) {
+                $co = $index->correlation($entry, $a, $b);
+                $actualCorrelations[$a.','.$b] = ['n' => $co->n(), 'r' => $co->pearson()];
+            }
+            $this->assertEquals($sheet['correlations'] ?? [], $actualCorrelations, $entry);
         }
     }
 

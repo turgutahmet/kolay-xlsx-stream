@@ -7,6 +7,7 @@ use Kolay\XlsxStream\Contracts\ProvidesCostHints;
 use Kolay\XlsxStream\Contracts\Source;
 use Kolay\XlsxStream\Exceptions\XlsxReadException;
 use Kolay\XlsxStream\Sketches\HyperLogLog;
+use Kolay\XlsxStream\Sketches\MisraGries;
 use Kolay\XlsxStream\Sketches\TDigest;
 use Kolay\XlsxStream\Sources\LocalFileSource;
 use Kolay\XlsxStream\Sources\S3RangeSource;
@@ -95,7 +96,6 @@ class StreamingXlsxReader
     private array $sheets;
 
     private string $currentEntry;
-    private ?array $cachedHeader = null;
     private ?SharedStrings $sst = null;
     private bool $sstResolved = false;
     private ?RandomAccessIndex $randomAccessIndex = null;
@@ -144,12 +144,23 @@ class StreamingXlsxReader
     private ?array $chainByEntry = null;
 
     /**
-     * Raw (cast-free) header rows read for chain detection, memoized so
-     * each candidate sheet pays its one small read at most once.
+     * Raw (cast-free) header rows read for chain detection and name
+     * resolution, memoized so each candidate sheet pays its one small read
+     * at most once.
      *
      * @var array<string, array<int, mixed>>
      */
     private array $headerByEntry = [];
+
+    /**
+     * header() rows read WITH date detection, memoized separately from the
+     * raw cache: only populated (and only paid for) when autoDetectDates()
+     * is active, so a date-styled row-1 cell in an external file matches
+     * what rows() would yield.
+     *
+     * @var array<string, array<int, mixed>>
+     */
+    private array $headerDetectedByEntry = [];
 
     /**
      * Header-name resolution cache per sheet entry: 'map' (name =>
@@ -169,6 +180,9 @@ class StreamingXlsxReader
     /** @var array<string, HyperLogLog|null> merged chain HLLs, keyed chain-head|column */
     private array $chainHllCache = [];
 
+    /** @var array<string, MisraGries|null> merged chain TOPK sketches, keyed chain-head|column */
+    private array $chainTopValuesCache = [];
+
     /** @var array<int, callable> */
     private array $columnCasts = [];
 
@@ -177,6 +191,49 @@ class StreamingXlsxReader
     private bool $autoDetectDates = false;
 
     private bool $autoDetectWithTime = true;
+
+    /**
+     * Late-materialization mode for rowsWhere / rowsWhereAll scans:
+     * null = auto (the planner decides per query from row width and the
+     * sidecar's selectivity estimate), true = force on, false = force off.
+     * The default (auto) is the shipping behaviour; the forced modes exist
+     * for A/B measurement and callers who know their shape.
+     */
+    private ?bool $lateMaterialization = null;
+
+    /**
+     * Auto planner's selectivity ceiling: when the sidecar estimates that
+     * more than this fraction of the scanned (candidate-block) rows match,
+     * nearly every row is materialized anyway, so probing first is pure
+     * overhead and late materialization is left off. Below the ceiling the
+     * rejected rows skip their body parse and the scan wins. The named
+     * "≈100% selectivity → late-mat OFF" regression rides on this bound.
+     */
+    private const LATEMAT_MAX_SELECTIVITY = 0.85;
+
+    /**
+     * Auto planner's string-predicate gate: without a lexicographic
+     * distribution sketch there is no numeric selectivity estimate, so a
+     * STRZ scan uses block pruning as the proxy — late materialization is
+     * enabled only when the surviving blocks are at most this fraction of
+     * the column's blocks (a predicate that pruned little is likely
+     * unselective, where probing would not pay). Force-on bypasses it.
+     */
+    private const LATEMAT_MAX_STRING_SURVIVOR_RATIO = 0.5;
+
+    /**
+     * groupQuantile() pushdown gate. The pushdown answers each group from
+     * the TDGB superblocks, but a group narrower than a superblock covers
+     * none and is edge-scanned whole, so MANY small groups (calendar /
+     * category — the common case) become many independent seeks, slower than
+     * one coordinated pass. Below MIN_GROUPS the per-group seeks are
+     * negligible and the pushdown always wins; at or above it, the pushdown
+     * is kept only when whole-superblock merges cover at least MIN_MERGE of
+     * the data rows (otherwise it degenerates and the single pass is used).
+     */
+    private const GROUP_PUSHDOWN_MIN_GROUPS = 16;
+
+    private const GROUP_PUSHDOWN_MIN_MERGE = 0.5;
 
     /**
      * cellXfs index → is-date bitmap from xl/styles.xml, resolved
@@ -267,7 +324,6 @@ class StreamingXlsxReader
         foreach ($this->sheets as $sheet) {
             if ($sheet['name'] === $name) {
                 $this->currentEntry = $sheet['entry'];
-                $this->cachedHeader = null;
                 $this->columnCasts = [];
 
                 return $this;
@@ -283,29 +339,34 @@ class StreamingXlsxReader
             throw XlsxReadException::entryNotFound("sheet at index {$index}");
         }
         $this->currentEntry = $this->sheets[$index]['entry'];
-        $this->cachedHeader = null;
         $this->columnCasts = [];
 
         return $this;
     }
 
     /**
-     * Return the first row of the selected sheet. Cached after first call,
-     * so subsequent invocations do not re-open the underlying stream.
+     * Return the header (first row) of the selected sheet. Memoized per
+     * entry; read bounded (only the first block) when the file is indexed —
+     * see readHeaderRow().
      *
      * @return array<int, mixed>
      */
     public function header(): array
     {
-        if ($this->cachedHeader !== null) {
-            return $this->cachedHeader;
+        // With date auto-detection OFF (the default) the header is text
+        // either way, so header() shares the raw per-entry cache that name
+        // resolution and chain detection fill. With detection ON, the header
+        // must carry the same casts rows() would apply (a date-styled row-1
+        // cell in an external file), which the raw read strips and — the
+        // style being gone after tokenization — cannot be re-applied later;
+        // so it takes its own detection-aware bounded read, memoized apart.
+        $dates = $this->buildDateDetection([]);
+        if ($dates === null) {
+            return $this->readHeaderRow($this->currentEntry);
         }
 
-        foreach ($this->openSheetReader()->rows() as $row) {
-            return $this->cachedHeader = $row;
-        }
-
-        return $this->cachedHeader = [];
+        return $this->headerDetectedByEntry[$this->currentEntry]
+            ??= $this->readFirstRow($this->currentEntry, $dates);
     }
 
     /**
@@ -786,6 +847,252 @@ class StreamingXlsxReader
     }
 
     /**
+     * How many DATA rows hold no numeric value in $column — the missing
+     * side of columnStats()['count'], answered from the STAT zone maps
+     * alone (zero row I/O). A cell counts as empty when it is blank or
+     * non-numeric (the STAT `other` class, SPEC §4.1); the header row is
+     * excluded, so countEmpty(col) + columnStats(col)['count'] always
+     * equals the table's data-row count. This is the empty_count field of
+     * profile() and the honest denominator for a completeness ratio.
+     *
+     * Derived as data-rows − numeric-count rather than by reading the raw
+     * `other` tally: `other` folds in the text header, and this framing is
+     * header-safe by construction. Chain-aware (rowCount and columnStats
+     * both span an auto-split table). Returns null when the column carries
+     * no STAT — there is no basis to count from.
+     */
+    public function countEmpty(int|string $column): ?int
+    {
+        $stats = $this->columnStats($column);
+        if ($stats === null) {
+            return null;
+        }
+
+        return max(0, ($this->rowCount() - 1) - $stats['count']);
+    }
+
+    /**
+     * Exact Pearson correlation between two columns, answered from the CORR
+     * co-moment accumulators alone (zero row I/O). The population is the rows
+     * where BOTH cells are numeric under the STAT interpretation; the header
+     * is excluded. Column order does not matter. Returns null when the pair
+     * was not tracked (withCorrelations), when the two columns are the same,
+     * or when the correlation is undefined (fewer than two shared
+     * observations, or a constant column).
+     *
+     * Chain-aware: the accumulators are mergeable, so a correlation over an
+     * auto-split table folds every member exactly (all-or-nothing — a member
+     * missing the pair answers null rather than covering only part).
+     */
+    public function correlation(int|string $columnA, int|string $columnB): ?float
+    {
+        if (\is_string($columnA)) {
+            $columnA = $this->resolveColumnName($columnA) + 1;
+        }
+        if (\is_string($columnB)) {
+            $columnB = $this->resolveColumnName($columnB) + 1;
+        }
+        if ($columnA === $columnB) {
+            return null;
+        }
+
+        $index = $this->loadRandomAccessIndex();
+        if ($index === null) {
+            return null;
+        }
+
+        $chain = $this->chain();
+        if ($chain !== null) {
+            $merged = null;
+            foreach ($chain as $m) {
+                $co = $index->correlation($m['entry'], $columnA, $columnB);
+                if ($co === null) {
+                    return null;
+                }
+                if ($merged === null) {
+                    $merged = clone $co;
+                } else {
+                    $merged->merge($co);
+                }
+            }
+
+            return $merged?->pearson();
+        }
+
+        return $index->correlation($this->currentEntry, $columnA, $columnB)?->pearson();
+    }
+
+    /**
+     * One-call data-profiling report for the workbook, assembled from the
+     * sidecar. For each profiled column it packages what the tracked sections
+     * know — numeric_count/empty_count and min/max/avg/sorted (STAT), the
+     * percentiles (TDIG) each with a deterministic rank certificate, the
+     * histogram (TDIG), distinct (CHLL), and top_values (TOPK) — plus a
+     * top-level correlations map (CORR) and the data-row count. Fields whose
+     * backing section is absent are null, so a text column shows its
+     * top_values while its numeric fields stay empty.
+     *
+     * A column carrying ONLY string zone maps (STRZ) is not auto-profiled:
+     * its stored [min, max] fold the (non-numeric) header cell into block 0,
+     * so a clean data-only string range cannot be recovered here. Such a
+     * column still appears if it also carries a numeric/categorical section.
+     *
+     * Each percentile is `{value, rank_lo, rank_hi}`: the estimate and the
+     * zone-map certificate bounding its true rank (rank_hi − rank_lo is the
+     * residual uncertainty — see explainQuantile). The certificate is
+     * single-sheet; on an auto-split chain rank_lo/rank_hi are null. NOTE the
+     * width tracks ROW-ORDER LOCALITY, not value clustering: a column sorted
+     * or covarying with the sheet's order gets a tight bound, an unordered
+     * one is honestly reported as [0, N].
+     *
+     * $columns selects the report (names or 1-based indexes; a non-positive
+     * index is rejected); null profiles every column carrying a tracked
+     * section. $histogram toggles the one bulky field and $histogramMode
+     * picks its shape ('width' or 'depth' — see histogram()); $percentiles
+     * chooses the quantiles, keyed losslessly (0.5 → "p50", 0.999 → "p99.9").
+     *
+     * Reads NO data rows — every number comes from the index cached at open —
+     * except a single BOUNDED read of the header row to name columns (one
+     * small range request, not a scan; skipped when the header is already
+     * cached). It is not free of CPU: each column runs its sketch math and
+     * each pair its correlation, O(columns · sketch-work + pairs). "One range
+     * request" is a statement about I/O, not latency. Without a sidecar the
+     * report is empty and data_rows is null (no whole-file scan is done for a
+     * count profile() cannot otherwise fill).
+     *
+     * @param  list<int|string>|null  $columns
+     * @param  list<float>  $percentiles
+     * @return array{data_rows: int|null, columns: array<int, array<string, mixed>>, correlations: array<string, float|null>}
+     */
+    public function profile(?array $columns = null, bool $histogram = true, int $histogramBins = 10, array $percentiles = [0.5, 0.95], string $histogramMode = 'width'): array
+    {
+        $index = $this->loadRandomAccessIndex();
+        if ($index === null) {
+            return ['data_rows' => null, 'columns' => [], 'correlations' => []];
+        }
+
+        $chain = $this->chain();
+        $entry = $chain !== null ? $chain[0]['entry'] : $this->currentEntry;
+        $dataRows = max(0, $this->rowCount() - 1);
+        $header = $this->header();
+        $width = \count($header);
+
+        if ($columns === null) {
+            $cols = $this->trackedColumns($index, $entry);
+        } else {
+            $cols = [];
+            foreach ($columns as $c) {
+                if (\is_string($c)) {
+                    $cols[] = $this->resolveColumnName($c) + 1;
+
+                    continue;
+                }
+                // Reject a non-positive index AND (symmetric with the name
+                // path's unknown-column error) one past the header width.
+                if (! \is_int($c) || $c < 1 || ($width > 0 && $c > $width)) {
+                    throw new \InvalidArgumentException(
+                        'profile() columns must be 1-based indexes within the header, or header names; got: '.var_export($c, true)
+                    );
+                }
+                $cols[] = $c;
+            }
+            $cols = array_values(array_unique($cols));
+            sort($cols);
+        }
+
+        // Distinct quantiles only — an exact-duplicate q is silently
+        // de-duplicated; a genuine key collision (two different q sharing a
+        // key) still throws below.
+        $percentiles = array_values(array_unique($percentiles, SORT_REGULAR));
+        $report = [];
+        foreach ($cols as $col) {
+            $stats = $this->columnStats($col);
+            $numericCount = $stats['count'] ?? null;
+            // Raw single-sheet blocks back the rank certificate (undefined
+            // across a chain — like explainQuantile).
+            $rawBlocks = $chain === null ? ($index->columnStats($entry, $col)['blocks'] ?? null) : null;
+
+            $pcts = [];
+            foreach ($percentiles as $q) {
+                $value = $this->quantile($col, $q);
+                $rankLo = null;
+                $rankHi = null;
+                if ($value !== null && $rawBlocks !== null) {
+                    [$rankLo, $rankHi] = $this->rankBounds($rawBlocks, $value);
+                }
+                $key = $this->percentileKey($q);
+                if (isset($pcts[$key])) {
+                    throw new \InvalidArgumentException("profile() percentiles collide on key '{$key}'");
+                }
+                $pcts[$key] = ['value' => $value, 'rank_lo' => $rankLo, 'rank_hi' => $rankHi];
+            }
+
+            $report[$col] = [
+                'column' => $col,
+                'name' => $header[$col - 1] ?? null,
+                'numeric_count' => $numericCount,
+                // Inlined (data_rows − numeric_count) so STAT folds once per
+                // column here, not again inside countEmpty().
+                'empty_count' => $stats === null ? null : max(0, $dataRows - $numericCount),
+                'min' => $stats['min'] ?? null,
+                'max' => $stats['max'] ?? null,
+                'avg' => $stats['avg'] ?? null,
+                'sorted' => $stats['sorted'] ?? null,
+                'percentiles' => $pcts,
+                'histogram' => $histogram ? $this->histogram($col, $histogramBins, $histogramMode) : null,
+                'distinct' => $this->countDistinct($col),
+                'top_values' => $this->topValues($col),
+            ];
+        }
+
+        $correlations = [];
+        foreach ($index->correlationPairs($entry) as [$a, $b]) {
+            $correlations[$a.','.$b] = $this->correlation($a, $b);
+        }
+
+        return [
+            'data_rows' => $dataRows,
+            'columns' => $report,
+            'correlations' => $correlations,
+        ];
+    }
+
+    /**
+     * Lossless percentile key: 0.5 → "p50", 0.95 → "p95", 0.999 → "p99.9".
+     * Trailing zeros are trimmed so no two distinct quantiles collapse onto
+     * one key (the old ⌊100q⌋ merged p99 and p99.9).
+     */
+    private function percentileKey(float $q): string
+    {
+        $pct = rtrim(rtrim(sprintf('%.6f', $q * 100), '0'), '.');
+
+        return 'p'.$pct;
+    }
+
+    /**
+     * The 1-based columns profile() reports by default: those carrying a
+     * numeric or categorical section (STAT, TDIG, CHLL, TOPK), ascending and
+     * de-duplicated. STRZ-only columns are excluded — profile() has no clean
+     * data-only field for them (see profile()). Read from a representative
+     * entry (chain members share one schema).
+     *
+     * @return list<int>
+     */
+    private function trackedColumns(RandomAccessIndex $index, string $entry): array
+    {
+        $cols = array_merge(
+            $index->statsColumns($entry),
+            $index->digestColumns($entry),
+            $index->hllColumns($entry),
+            $index->topValueColumns($entry),
+        );
+        $cols = array_values(array_unique($cols));
+        sort($cols);
+
+        return $cols;
+    }
+
+    /**
      * Approximate value at quantile $q (0 = min .. 1 = max) of a
      * column's numeric values, answered from the sidecar's t-digest
      * sketch (KXSI "TDIG") alone — ZERO row data is read and, the index
@@ -804,13 +1111,28 @@ class StreamingXlsxReader
      * decide whether an exact scan is worth it. Also null for a sketch
      * that saw no numeric values (e.g. a text column).
      */
-    public function quantile(int|string $column, float $q): ?float
+    public function quantile(int|string $column, float $q, ?int $from = null, ?int $to = null): ?float
     {
         if (\is_string($column)) {
             $column = $this->resolveColumnName($column) + 1;
         }
         if ($q < 0.0 || $q > 1.0) {
             throw new \InvalidArgumentException("quantile must be within [0, 1]; got {$q}");
+        }
+
+        // Range form: quantile of a sheet-row span, answered from the
+        // TDGB per-superblock digests. Single-sheet — the span is a
+        // current-sheet row range, not a logical-table one (chains index
+        // superblocks per member, and sheet-row coordinates would be
+        // ambiguous across members).
+        if ($from !== null || $to !== null) {
+            $from ??= 1;
+            $to ??= PHP_INT_MAX;
+            if ($from < 1 || $from > $to) {
+                throw new \InvalidArgumentException("quantile range must satisfy 1 <= from <= to; got from={$from}, to={$to}");
+            }
+
+            return $this->rangeQuantileDigest($this->currentEntry, $column, $from, $to)?->quantile($q);
         }
 
         $chain = $this->chain();
@@ -821,6 +1143,572 @@ class StreamingXlsxReader
         $digest = $this->loadRandomAccessIndex()?->columnDigest($this->currentEntry, $column);
 
         return $digest?->quantile($q);
+    }
+
+    /**
+     * EXACT nearest-rank quantile of a column — the Rank-Sandwich. The
+     * t-digest gives a fast estimate; the STAT zone maps give a deterministic
+     * rank certificate around it; together they bracket the target value
+     * between two thresholds so only the blocks that could hold it are read.
+     * On clustered data that is a handful of blocks; on uniform data it is
+     * honestly most of them (the estimate was already good — exactness costs
+     * a scan). q is the nearest-rank quantile: the value at rank
+     * t = max(1, ⌈q·N⌉) of the N numeric data cells (q=0 → min, q=1 → max).
+     *
+     * Returns `{value, exact, blocksScanned, exceeded}`:
+     *   - a sorted, fully-numeric column answers from a SINGLE rowAt (the
+     *     t-th value is the row at that rank) with blocksScanned 0;
+     *   - otherwise the pruned block scan returns the exact value;
+     *   - if `maxScanBlocks` is set and the plan would exceed it, the scan is
+     *     NOT run: the certified digest estimate is returned with
+     *     exact=false, exceeded=true (honest degradation, never an exception).
+     *
+     * Single-sheet: the block scan is over the current sheet. On an
+     * auto-split chain (a >1M-row table, where a scan is expensive anyway)
+     * it degrades to the merged-digest estimate (exact=false). Null when the
+     * column carries no t-digest — there is no basis to bracket or estimate.
+     *
+     * @return array{value: float, exact: bool, blocksScanned: int, exceeded: bool}|null
+     */
+    public function exactQuantile(int|string $column, float $q, ?int $maxScanBlocks = null): ?array
+    {
+        if (\is_string($column)) {
+            $column = $this->resolveColumnName($column) + 1;
+        }
+        if ($q < 0.0 || $q > 1.0) {
+            throw new \InvalidArgumentException("quantile must be within [0, 1]; got {$q}");
+        }
+
+        // Chain: block-scan exactness is single-sheet; degrade to the merged
+        // estimate honestly (these are the >1M-row tables).
+        $chain = $this->chain();
+        if ($chain !== null) {
+            $est = $this->chainDigest($chain, $column)?->quantile($q);
+
+            return $est === null ? null : ['value' => $est, 'exact' => false, 'blocksScanned' => 0, 'exceeded' => false];
+        }
+
+        $index = $this->loadRandomAccessIndex();
+        $stats = $index?->columnStats($this->currentEntry, $column);
+        $digest = $index?->columnDigest($this->currentEntry, $column);
+        if ($stats === null || $digest === null) {
+            return null;
+        }
+
+        $blocks = $stats['blocks'];
+        $total = 0;
+        foreach ($blocks as $b) {
+            $total += $b['count'];
+        }
+        if ($total === 0) {
+            return null;
+        }
+
+        $t = max(1, min($total, (int) ceil($q * $total)));
+
+        // Sorted fast-path: values ascending AND every data row numeric
+        // (count == data rows) ⇒ row order is sorted order, so the t-th
+        // value is the row at rank t (sheet row t+1). One row read.
+        if (($stats['sorted_asc'] ?? false) && $total === ($this->rowCount() - 1)) {
+            $cell = $this->rowAt($t + 1)[$column - 1] ?? null;
+            if (is_numeric($cell)) {
+                return ['value' => (float) $cell, 'exact' => true, 'blocksScanned' => 0, 'exceeded' => false];
+            }
+        }
+
+        // Bracket the t-th value and plan the pruned scan: which contiguous
+        // block runs to read, how many values sit fully below (base), and
+        // the block/byte cost — all from the sidecar, no rows read yet.
+        $plan = $this->planExactQuantileScan($index, $this->currentEntry, $blocks, $digest, $q, $t);
+        $runs = $plan['runs'];
+        $base = $plan['base'];
+
+        if ($maxScanBlocks !== null && $plan['blocksToScan'] > $maxScanBlocks) {
+            return ['value' => $digest->quantile($q), 'exact' => false, 'blocksScanned' => 0, 'exceeded' => true];
+        }
+
+        $ranges = $this->blockRanges($index, $this->currentEntry);
+        $vals = [];
+        foreach ($runs as [$k1, $k2]) {
+            foreach ($this->rowRange($ranges[$k1]['first_row'], $ranges[$k2]['last_row']) as $rn => $row) {
+                if ($rn === 1) {
+                    continue; // header
+                }
+                $cell = $row[$column - 1] ?? null;
+                if (is_numeric($cell)) {
+                    $vals[] = (float) $cell;
+                }
+            }
+        }
+        sort($vals);
+        // Every value ≤ xLo lives in a fully-below block (base) or in a
+        // scanned straddle block, and the t-th value exceeds xLo, so it is
+        // the (t − base)-th smallest of the scanned values.
+        $value = $vals[$t - $base - 1] ?? $digest->quantile($q);
+
+        return ['value' => $value, 'exact' => true, 'blocksScanned' => $plan['blocksToScan'], 'exceeded' => false];
+    }
+
+    /**
+     * Zero-I/O plan for exactQuantile's rank-$t value: bracket the value
+     * (bracketExactValue), then partition the blocks — those proven fully
+     * below xLo are counted into `base` (never read), those fully above xHi
+     * are skipped, and the rest (block 0 always among them, being uncertain)
+     * form the contiguous `runs` to scan. Also totals the blocks and the
+     * compressed bytes those runs would fetch, so explainQuantile can quote
+     * the exact-scan cost without touching a row.
+     *
+     * @param  list<array{min: float, max: float, count: int, other: int}>  $blocks
+     * @return array{runs: list<array{0: int, 1: int}>, base: int, blocksToScan: int, bytes: int, xLo: float, xHi: float}
+     */
+    private function planExactQuantileScan(RandomAccessIndex $index, string $entry, array $blocks, TDigest $digest, float $q, int $t): array
+    {
+        [$xLo, $xHi] = $this->bracketExactValue($digest, $blocks, $q, $t);
+
+        $base = 0;
+        $runs = [];
+        $run = null;
+        foreach ($blocks as $k => $b) {
+            $fullyBelow = $k !== 0 && $b['count'] > 0 && $b['max'] <= $xLo;
+            $skip = $b['count'] === 0
+                || $fullyBelow
+                || ($k !== 0 && $b['min'] > $xHi);
+            if ($fullyBelow) {
+                $base += $b['count'];
+            }
+            if ($skip) {
+                if ($run !== null) {
+                    $runs[] = $run;
+                    $run = null;
+                }
+
+                continue;
+            }
+            if ($run === null) {
+                $run = [$k, $k];
+            } else {
+                $run[1] = $k;
+            }
+        }
+        if ($run !== null) {
+            $runs[] = $run;
+        }
+
+        $ranges = $this->blockRanges($index, $entry);
+        $entrySize = $this->cd->entry($entry)['compressed_size'] ?? 0;
+        $blocksToScan = 0;
+        $bytes = 0;
+        foreach ($runs as [$k1, $k2]) {
+            $blocksToScan += $k2 - $k1 + 1;
+            $startComp = $ranges[$k1]['comp_offset'] ?? 0;
+            $end = $ranges[$k2 + 1]['comp_offset'] ?? $entrySize;
+            $bytes += max(0, $end - $startComp);
+        }
+
+        return ['runs' => $runs, 'base' => $base, 'blocksToScan' => $blocksToScan, 'bytes' => $bytes, 'xLo' => $xLo, 'xHi' => $xHi];
+    }
+
+    /**
+     * Zero-I/O quantile plan: the estimate, its deterministic rank
+     * certificate, and what an exact answer would cost — the quantile
+     * analogue of explain(). Shape
+     * `{estimate, rank_lo, rank_hi, exact_would_scan_blocks, exact_est_bytes}`:
+     *   - estimate: the t-digest value at $q;
+     *   - rank_lo / rank_hi: the STAT certificate bounding the estimate's
+     *     true rank among the numeric data cells (rank_hi − rank_lo is the
+     *     residual uncertainty the zone maps could not resolve). Its width
+     *     tracks ROW-ORDER LOCALITY, not value clustering: a column sorted by
+     *     or covarying with the sheet's row order certifies tightly, a
+     *     scattered one is honestly [0, N];
+     *   - exact_would_scan_blocks / exact_est_bytes: the blocks and
+     *     compressed bytes exactQuantile($column, $q) would read — 0 blocks
+     *     for a sorted, fully-numeric column (a single indexed row), a
+     *     handful for clustered data, most for uniform.
+     *
+     * All from the sidecar, zero rows read. On an auto-split chain the
+     * certificate and exact-cost fields are null (the exact scan is
+     * single-sheet); estimate still spans the chain. Null when the column
+     * carries no t-digest.
+     *
+     * @return array{estimate: float, rank_lo: int|null, rank_hi: int|null, exact_would_scan_blocks: int|null, exact_est_bytes: int|null}|null
+     */
+    public function explainQuantile(int|string $column, float $q): ?array
+    {
+        if (\is_string($column)) {
+            $column = $this->resolveColumnName($column) + 1;
+        }
+        if ($q < 0.0 || $q > 1.0) {
+            throw new \InvalidArgumentException("quantile must be within [0, 1]; got {$q}");
+        }
+
+        $chain = $this->chain();
+        if ($chain !== null) {
+            $est = $this->chainDigest($chain, $column)?->quantile($q);
+
+            return $est === null ? null : [
+                'estimate' => $est,
+                'rank_lo' => null,
+                'rank_hi' => null,
+                'exact_would_scan_blocks' => null,
+                'exact_est_bytes' => null,
+            ];
+        }
+
+        $index = $this->loadRandomAccessIndex();
+        $stats = $index?->columnStats($this->currentEntry, $column);
+        $digest = $index?->columnDigest($this->currentEntry, $column);
+        if ($stats === null || $digest === null) {
+            return null;
+        }
+
+        $blocks = $stats['blocks'];
+        $total = 0;
+        foreach ($blocks as $b) {
+            $total += $b['count'];
+        }
+        if ($total === 0) {
+            return null;
+        }
+
+        $estimate = $digest->quantile($q);
+        [$rankLo, $rankHi] = $this->rankBounds($blocks, $estimate);
+        $t = max(1, min($total, (int) ceil($q * $total)));
+
+        // Sorted, fully-numeric ⇒ exact is a single indexed row: report zero
+        // blocks scanned and the compressed size of the one block that holds
+        // the target row (what that rowAt would inflate).
+        if (($stats['sorted_asc'] ?? false) && $total === ($this->rowCount() - 1)) {
+            return [
+                'estimate' => $estimate,
+                'rank_lo' => $rankLo,
+                'rank_hi' => $rankHi,
+                'exact_would_scan_blocks' => 0,
+                'exact_est_bytes' => $this->blockBytesForRow($index, $this->currentEntry, $t + 1),
+            ];
+        }
+
+        $plan = $this->planExactQuantileScan($index, $this->currentEntry, $blocks, $digest, $q, $t);
+
+        return [
+            'estimate' => $estimate,
+            'rank_lo' => $rankLo,
+            'rank_hi' => $rankHi,
+            'exact_would_scan_blocks' => $plan['blocksToScan'],
+            'exact_est_bytes' => $plan['bytes'],
+        ];
+    }
+
+    /**
+     * Compressed byte size of the index block whose row span contains
+     * $sheetRow — the single-block read a sorted-fast-path rowAt would cost.
+     * Falls back to 0 when no block covers the row (out of range).
+     */
+    private function blockBytesForRow(RandomAccessIndex $index, string $entry, int $sheetRow): int
+    {
+        $ranges = $this->blockRanges($index, $entry);
+        $entrySize = $this->cd->entry($entry)['compressed_size'] ?? 0;
+        foreach ($ranges as $k => $r) {
+            if ($sheetRow >= $r['first_row'] && $sheetRow <= $r['last_row']) {
+                $startComp = $r['comp_offset'] ?? 0;
+                $end = $ranges[$k + 1]['comp_offset'] ?? $entrySize;
+
+                return max(0, $end - $startComp);
+            }
+        }
+
+        return 0;
+    }
+
+    /**
+     * Histogram of a column's distribution, answered from the t-digest CDF
+     * alone (zero row I/O). Returns $bins bins as `{lo, hi, count}` in
+     * ascending order: bin 0 is [min, edge₁] and each later bin (edgeᵢ,
+     * edgeᵢ₊₁], tiling the range with no gap. Counts come from the digest
+     * rank (CDF) at each edge, accumulated with cumulative rounding so they
+     * sum to the exact numeric total (columnStats count).
+     *
+     * Two edge strategies via $mode:
+     *   - 'width' (default): equi-WIDTH bins over [min, max]. On a skewed
+     *     column (money, counts) most mass piles into one bin and the
+     *     interesting tail is invisible.
+     *   - 'depth': equi-DEPTH bins whose edges are the quantiles q = i/bins,
+     *     so every bin holds ≈ count/bins values — the shape of a skewed
+     *     column is spread out rather than crushed. Same digest math, no
+     *     extra I/O. Tied data can collapse adjacent edges (a zero-width bin
+     *     over a heavy value), reported honestly.
+     *
+     * Counts are estimates (digest rank error, typically well under 1% of
+     * the column); the edges are exact for 'width', digest estimates for
+     * 'depth'. A constant column (max == min) collapses to one [min, max]
+     * bin. Chain-aware. Null when the column has no t-digest or no numeric
+     * value.
+     *
+     * @return list<array{lo: float, hi: float, count: int}>|null
+     */
+    public function histogram(int|string $column, int $bins = 10, string $mode = 'width'): ?array
+    {
+        if (\is_string($column)) {
+            $column = $this->resolveColumnName($column) + 1;
+        }
+        if ($bins < 1) {
+            throw new \InvalidArgumentException("histogram bins must be >= 1; got {$bins}");
+        }
+        if ($mode !== 'width' && $mode !== 'depth') {
+            throw new \InvalidArgumentException("histogram mode must be 'width' or 'depth'; got '{$mode}'");
+        }
+
+        $stats = $this->columnStats($column);
+        if ($stats === null || $stats['count'] === 0 || $stats['min'] === null || $stats['max'] === null) {
+            return null;
+        }
+
+        $chain = $this->chain();
+        $digest = $chain !== null
+            ? $this->chainDigest($chain, $column)
+            : $this->loadRandomAccessIndex()?->columnDigest($this->currentEntry, $column);
+        if ($digest === null) {
+            return null;
+        }
+
+        $min = (float) $stats['min'];
+        $max = (float) $stats['max'];
+        $count = $stats['count'];
+
+        if ($max <= $min) {
+            return [['lo' => $min, 'hi' => $max, 'count' => $count]];
+        }
+
+        // Edges: linear for equi-width, digest quantiles for equi-depth
+        // (clamped monotone — a tie can make two quantiles coincide).
+        $span = $max - $min;
+        $edges = [$min];
+        for ($i = 1; $i < $bins; $i++) {
+            $e = $mode === 'depth'
+                ? ($digest->quantile($i / $bins) ?? $min)
+                : $min + $i * $span / $bins;
+            $edges[$i] = max($e, $edges[$i - 1]);
+        }
+        $edges[$bins] = $max;
+
+        $result = [];
+        $cumPrev = 0;
+        for ($i = 0; $i < $bins; $i++) {
+            // Last bin closes at max, where rank == 1, so the counts total
+            // exactly $count; earlier edges take the digest's CDF fraction.
+            $cumHi = $i === $bins - 1 ? $count : (int) round($count * ($digest->rank($edges[$i + 1]) ?? 1.0));
+            $result[] = ['lo' => $edges[$i], 'hi' => $edges[$i + 1], 'count' => max(0, $cumHi - $cumPrev)];
+            $cumPrev = $cumHi;
+        }
+
+        return $result;
+    }
+
+    /**
+     * Deterministic rank certificate for a value $x from STAT zone maps:
+     * `[lower, upper]` bounds the true count of numeric data cells ≤ $x.
+     * `lower` sums blocks proven entirely below $x; `upper` sums blocks that
+     * might reach it. Block 0 is ALWAYS uncertain — the writer folds the
+     * (non-numeric) header into it, so its min/max cannot be trusted as a
+     * pure data-value range — and thus only ever contributes to `upper`.
+     * Zero I/O; the basis of exactQuantile's bracketing and explainQuantile.
+     *
+     * @param  list<array{min: float, max: float, count: int, other: int}>  $blocks
+     * @return array{0: int, 1: int}
+     */
+    private function rankBounds(array $blocks, float $x): array
+    {
+        $lower = 0;
+        $upper = 0;
+        foreach ($blocks as $k => $b) {
+            if ($b['count'] === 0) {
+                continue;
+            }
+            $uncertain = $k === 0;
+            if (! $uncertain && $b['max'] < $x) {
+                $lower += $b['count'];
+            }
+            if ($uncertain || $b['min'] <= $x) {
+                $upper += $b['count'];
+            }
+        }
+
+        return [$lower, $upper];
+    }
+
+    /**
+     * Find the bracket [xLo, xHi] enclosing the rank-$t value, each side
+     * independent (the PoC lesson: one side collapsing must not drag the
+     * other). Widen the digest probe geometrically until its rank
+     * certificate proves the side: xLo is the largest probe whose UPPER
+     * rank is still below $t (so the target is strictly above it); xHi the
+     * smallest probe whose LOWER rank already reaches $t (target at or
+     * below). A side that never clears stays open (-INF / +INF), which makes
+     * exactQuantile scan out to that end — the honest uniform-data cost.
+     *
+     * @param  list<array{min: float, max: float, count: int, other: int}>  $blocks
+     * @return array{0: float, 1: float}
+     */
+    private function bracketExactValue(TDigest $digest, array $blocks, float $q, int $t): array
+    {
+        $xLo = -INF;
+        for ($eps = 0.002; $eps <= 1.0; $eps *= 2) {
+            $c = $digest->quantile(max(0.0, $q - $eps));
+            [, $upper] = $this->rankBounds($blocks, $c);
+            if ($upper < $t) {
+                $xLo = $c;
+                break;
+            }
+        }
+
+        $xHi = INF;
+        for ($eps = 0.002; $eps <= 1.0; $eps *= 2) {
+            $c = $digest->quantile(min(1.0, $q + $eps));
+            [$lower] = $this->rankBounds($blocks, $c);
+            if ($lower >= $t) {
+                $xHi = $c;
+                break;
+            }
+        }
+
+        return [$xLo, $xHi];
+    }
+
+    /**
+     * Build the t-digest for $column over the inclusive sheet-row span
+     * [$from, $to] by merging every TDGB superblock whose span lies wholly
+     * inside the range and scanning only the partial rows at the two
+     * edges. Fully-covered superblocks form one contiguous run (spans
+     * partition the sheet in order), so the uncovered remainder is at most
+     * two bounded row ranges — the √B edge cost the row-space layout was
+     * chosen for. A column without a TDGB section degrades to an honest
+     * scan of the whole span (announced via onFullScan). Returns null when
+     * the span holds no numeric values.
+     */
+    private function rangeQuantileDigest(string $entry, int $column, int $from, int $to): ?TDigest
+    {
+        $superblocks = $this->loadRandomAccessIndex()?->rangeQuantileSuperblocks($entry, $column);
+
+        if ($superblocks === null) {
+            $this->fireFullScan('quantile', $column, 'column-not-range-indexed', $entry);
+
+            return $this->scanRangeDigest($entry, $column, $from, $to, null);
+        }
+
+        // A superblock's digest holds the numeric values of the data rows
+        // (prevEnd, end_row]; the header (sheet row 1) carries no numeric
+        // value, so superblock 0's data starts at row 2. Clamp the query's
+        // lower bound to the first data row accordingly — this keeps a
+        // whole-column range (from = 1) from spuriously "edge-scanning"
+        // the header row.
+        $from = max($from, 2);
+
+        // Merge the superblocks whose data span (spanStart, end_row] sits
+        // entirely within [from, to]; track the covered region's row
+        // bounds so only the uncovered edges are scanned. The spans
+        // partition the data rows in order, so the covered set is one
+        // contiguous run and the remainder is at most two edge ranges.
+        $merged = null;
+        $coveredFirst = null;
+        $coveredLast = null;
+        $prevEnd = 1; // header boundary — data rows begin at 2
+        foreach ($superblocks as $sb) {
+            $spanStart = $prevEnd + 1;
+            $spanEnd = $sb['end_row'];
+            if ($from <= $spanStart && $to >= $spanEnd) {
+                if ($merged === null) {
+                    $merged = clone $sb['digest'];
+                    $coveredFirst = $spanStart;
+                } else {
+                    $merged->merge($sb['digest']);
+                }
+                $coveredLast = $spanEnd;
+            }
+            $prevEnd = $spanEnd;
+        }
+
+        if ($coveredFirst === null) {
+            // The span is narrower than any single superblock — scan it
+            // whole. Still bounded (< one superblock of rows).
+            return $this->scanRangeDigest($entry, $column, $from, $to, null);
+        }
+
+        // Left edge [from, coveredFirst - 1] and right edge
+        // [coveredLast + 1, to] — the rows the covered run does not span.
+        if ($from <= $coveredFirst - 1) {
+            $merged = $this->scanRangeDigest($entry, $column, $from, $coveredFirst - 1, $merged);
+        }
+        if ($to >= $coveredLast + 1) {
+            $merged = $this->scanRangeDigest($entry, $column, $coveredLast + 1, $to, $merged);
+        }
+
+        return $merged;
+    }
+
+    /**
+     * Scan the inclusive sheet-row span [$from, $to] of $entry, folding
+     * each numeric cell of $column (statNumericCell interpretation — the
+     * same the writer's digests were built from) into $into, allocating a
+     * fresh digest on first value. Only the blocks that overlap the span
+     * are read, as one merged run. Returns $into unchanged (possibly null)
+     * when the span holds no numeric values.
+     */
+    private function scanRangeDigest(string $entry, int $column, int $from, int $to, ?TDigest $into): ?TDigest
+    {
+        $index = $this->loadRandomAccessIndex();
+        $ranges = $index !== null ? $this->blockRanges($index, $entry) : null;
+
+        if ($ranges === null || $ranges === []) {
+            foreach ($this->openSheetReader([$column - 1], $entry)->rowsFromOffset(null, 1) as $rn => $row) {
+                if ($rn < $from) {
+                    continue;
+                }
+                if ($rn > $to) {
+                    break;
+                }
+                $v = $this->statNumericCell($row[$column - 1] ?? null);
+                if ($v !== null) {
+                    ($into ??= new TDigest())->add($v);
+                }
+            }
+
+            return $into;
+        }
+
+        // First block whose rows reach $from; last block that starts at
+        // or before $to. The span is contiguous, so this is one run.
+        $firstBlock = 0;
+        foreach ($ranges as $i => $r) {
+            if ($r['last_row'] >= $from) {
+                $firstBlock = $i;
+                break;
+            }
+        }
+        $lastBlock = $firstBlock;
+        for ($i = count($ranges) - 1; $i >= $firstBlock; $i--) {
+            if ($ranges[$i]['first_row'] <= $to) {
+                $lastBlock = $i;
+                break;
+            }
+        }
+
+        $start = $ranges[$firstBlock];
+        $stopRow = min($to, $ranges[$lastBlock]['last_row']);
+        $compLength = $this->runCompLength($ranges, $firstBlock, $lastBlock);
+
+        foreach ($this->openSheetReader([$column - 1], $entry)->rowsFromOffset($start['comp_offset'], $start['start_row_at_offset'] ?? 1, $start['first_row'], $compLength) as $rn => $row) {
+            if ($rn < $from) {
+                continue;
+            }
+            if ($rn > $stopRow) {
+                break;
+            }
+            $v = $this->statNumericCell($row[$column - 1] ?? null);
+            if ($v !== null) {
+                ($into ??= new TDigest())->add($v);
+            }
+        }
+
+        return $into;
     }
 
     /**
@@ -934,6 +1822,174 @@ class StreamingXlsxReader
     }
 
     /**
+     * The most frequent values of a column, answered from the sidecar's
+     * Misra-Gries sketch (KXSI "TOPK") alone — zero row reads. Returns
+     * `['exact' => bool, 'values' => list<{value, count}>]`, values ordered
+     * by count descending then value ascending, or null when the file
+     * carries no TOPK sketch for the column.
+     *
+     * `exact` is true exactly when the column's cardinality stayed within
+     * the sketch's k: then `values` is the COMPLETE categorical
+     * distribution and every count is exact. When false the sketch spilled
+     * — `values` are the top heavy hitters with counts underestimated by at
+     * most N/k (never overestimated), and low-frequency values may be
+     * absent. Values are canonical string forms (the CHLL rule, SPEC §4.4),
+     * so text and numeric columns are both covered.
+     *
+     * @return array{exact: bool, values: list<array{value: string, count: int}>}|null
+     */
+    public function topValues(int|string $column): ?array
+    {
+        if (\is_string($column)) {
+            $column = $this->resolveColumnName($column) + 1;
+        }
+
+        $chain = $this->chain();
+        $sketch = $chain !== null
+            ? $this->chainTopValues($chain, $column)
+            : $this->loadRandomAccessIndex()?->columnTopValues($this->currentEntry, $column);
+
+        if ($sketch === null) {
+            return null;
+        }
+
+        return ['exact' => ! $sketch->saturated(), 'values' => $sketch->topValues()];
+    }
+
+    /**
+     * Merged Misra-Gries sketch across a chain's members — the sketch is
+     * mergeable by construction, so per-sheet sections compose into one
+     * logical-table answer. Same all-or-nothing and clone-first rules as
+     * chainDigest()/chainHll(): a member without the sketch (or a k
+     * mismatch, impossible from one writer run) answers null rather than
+     * covering only part of the table. Memoized per (chain, column).
+     *
+     * @param  list<array{entry: string, total: int, dataStartLocal: int, globalStart: int}>  $chain
+     */
+    private function chainTopValues(array $chain, int $column): ?MisraGries
+    {
+        $key = $chain[0]['entry'].'|'.$column;
+        if (array_key_exists($key, $this->chainTopValuesCache)) {
+            return $this->chainTopValuesCache[$key];
+        }
+
+        $index = $this->loadRandomAccessIndex();
+        $merged = null;
+        foreach ($chain as $m) {
+            $sketch = $index?->columnTopValues($m['entry'], $column);
+            if ($sketch === null) {
+                return $this->chainTopValuesCache[$key] = null;
+            }
+            if ($merged === null) {
+                $merged = clone $sketch;
+            } else {
+                try {
+                    $merged->merge($sketch);
+                } catch (\InvalidArgumentException) {
+                    return $this->chainTopValuesCache[$key] = null;
+                }
+            }
+        }
+
+        return $this->chainTopValuesCache[$key] = $merged;
+    }
+
+    /**
+     * Row that holds a column's global MINIMUM value, named straight from
+     * the ARGP sidecar (KXSI "ARGP") with no row scan: the writer stored,
+     * per STAT block, the earliest row achieving that block's extreme, so
+     * the whole-column argmin is the extreme block's stored row. Returns
+     * `{row, value}` where `row` is a rowAt() coordinate — a sheet row on a
+     * single sheet, a global logical row across an auto-split chain — and
+     * `value` is the STAT minimum it carries. Ties resolve to the first
+     * occurrence (earliest row). Null when the column carries no ARGP
+     * section (not opted in, no index) or held no numeric value at all.
+     *
+     * @return array{row: int, value: int|float}|null
+     */
+    public function argMin(int|string $column): ?array
+    {
+        return $this->argExtreme($column, false);
+    }
+
+    /**
+     * Row that holds a column's global MAXIMUM value — the argmax twin of
+     * argMin(): same ARGP-only, zero-scan lookup, same `{row, value}` shape
+     * and first-occurrence tie rule. See argMin() for the coordinate and
+     * null contracts.
+     *
+     * @return array{row: int, value: int|float}|null
+     */
+    public function argMax(int|string $column): ?array
+    {
+        return $this->argExtreme($column, true);
+    }
+
+    /**
+     * Shared argmin/argmax lookup. Walks the STAT blocks in row order
+     * picking the extreme block value with a strict comparison — so the
+     * FIRST block reaching the extreme wins and, the writer having recorded
+     * first-occurrence within a block, the returned row is the earliest one
+     * globally. On a chain every member contributes its blocks and the
+     * winner's member-local ARGP row is lifted to a global logical row;
+     * all-or-nothing like columnStats/topValues (a member missing the
+     * section answers null rather than covering only part of the table).
+     *
+     * @return array{row: int, value: int|float}|null
+     */
+    private function argExtreme(int|string $column, bool $wantMax): ?array
+    {
+        if (\is_string($column)) {
+            $column = $this->resolveColumnName($column) + 1;
+        }
+        $index = $this->loadRandomAccessIndex();
+        if ($index === null) {
+            return null;
+        }
+
+        $bestVal = null;
+        $bestRow = null;
+        $consider = function (array $stat, array $argp, callable $toRow) use ($wantMax, &$bestVal, &$bestRow): void {
+            foreach ($stat['blocks'] as $i => $block) {
+                if ($block['count'] === 0 || ! isset($argp[$i])) {
+                    continue;
+                }
+                $value = $wantMax ? $block['max'] : $block['min'];
+                $better = $bestVal === null || ($wantMax ? $value > $bestVal : $value < $bestVal);
+                if ($better) {
+                    $bestVal = $value;
+                    $bestRow = $toRow($argp[$i][$wantMax ? 'maxRow' : 'minRow']);
+                }
+            }
+        };
+
+        $chain = $this->chain();
+        if ($chain !== null) {
+            foreach ($chain as $m) {
+                $stat = $index->columnStats($m['entry'], $column);
+                $argp = $index->argPointers($m['entry'], $column);
+                if ($stat === null || $argp === null) {
+                    return null;
+                }
+                $consider($stat, $argp, fn (int $local): int => $m['globalStart'] + ($local - $m['dataStartLocal']));
+            }
+        } else {
+            $stat = $index->columnStats($this->currentEntry, $column);
+            $argp = $index->argPointers($this->currentEntry, $column);
+            if ($stat === null || $argp === null) {
+                return null;
+            }
+            $consider($stat, $argp, fn (int $local): int => $local);
+        }
+
+        if ($bestRow === null) {
+            return null;
+        }
+
+        return ['row' => $bestRow, 'value' => $bestVal];
+    }
+
+    /**
      * Register a hook fired whenever a query CANNOT push down and falls
      * back to a full row scan — an unindexed column on rowsWhere /
      * rowsWhereAll, or a groupBy column that is not sorted / not tracked
@@ -949,6 +2005,94 @@ class StreamingXlsxReader
         $this->onFullScan = $callback === null ? null : \Closure::fromCallable($callback);
 
         return $this;
+    }
+
+    /**
+     * Control late materialization on rowsWhere / rowsWhereAll scans.
+     *
+     * In auto mode (the default, and the shipping behaviour) the planner
+     * decides per query from the sidecar alone: when the predicate is
+     * estimated selective, each candidate row is probed on the predicate
+     * column alone and fully tokenized only when it matches, so rejected
+     * rows skip the cost of parsing every other cell. When the estimate
+     * says nearly everything matches — or there is no estimate — it stays
+     * off and the eager scan runs unchanged. The results are identical
+     * either way; only the work to reach them differs.
+     *
+     * Pass true to force it on or false to force it off (for A/B
+     * measurement or a caller that knows its shape); pass null to restore
+     * auto. Returns $this for chaining.
+     */
+    public function useLateMaterialization(?bool $mode): self
+    {
+        $this->lateMaterialization = $mode;
+
+        return $this;
+    }
+
+    /**
+     * Planner decision for a single-column predicate: should the scan probe
+     * the predicate column and defer full tokenization to matches? Forced
+     * modes short-circuit. Auto turns it on only when the sidecar predicts
+     * the predicate is selective — a numeric predicate needs a sketch
+     * estimate under the selectivity ceiling; a string predicate falls back
+     * to the STRZ block-prune ratio as a selectivity proxy. No estimate ⇒
+     * off, so auto never regresses an unindexed or unsketched column. The
+     * decision is answered entirely from the sidecar (zero row I/O): the
+     * selectivity gate alone catches the only case that loses — nearly
+     * everything matching, where probing before the inevitable tokenize is
+     * pure overhead — so no row-width read is needed to guard it.
+     */
+    private function planLateMaterialize(int $column, string $op, int|float|string $value, int|float|string|null $value2): bool
+    {
+        if ($this->lateMaterialization !== null) {
+            return $this->lateMaterialization;
+        }
+
+        if (\is_string($value)) {
+            $ratio = $this->stringSurvivorRatio($column, $op, $value, \is_string($value2) ? $value2 : null);
+
+            return $ratio !== null && $ratio <= self::LATEMAT_MAX_STRING_SURVIVOR_RATIO;
+        }
+
+        $survivors = $this->survivingRowCount($column, $op, $value, $value2);
+        $estimate = $this->estimateSelectivity($column, $op, $value, $value2);
+        if ($survivors === null || $survivors === 0 || $estimate === null) {
+            return false;
+        }
+
+        return $estimate / $survivors <= self::LATEMAT_MAX_SELECTIVITY;
+    }
+
+    /**
+     * Fraction of a string column's STRZ blocks that survive a predicate's
+     * lexicographic prune, summed across chain members — the string-side
+     * selectivity proxy for the late-mat planner. Null when the column
+     * carries no STRZ section (no basis to gate on).
+     */
+    private function stringSurvivorRatio(int $column, string $op, string $value, ?string $value2): ?float
+    {
+        $index = $this->loadRandomAccessIndex();
+        if ($index === null) {
+            return null;
+        }
+
+        [$lo, $hi] = $this->pruneBoundsString($op, $value, $value2);
+        $chain = $this->chain();
+        $entries = $chain !== null ? array_map(fn ($m) => $m['entry'], $chain) : [$this->currentEntry];
+
+        $total = 0;
+        $survivors = 0;
+        foreach ($entries as $entry) {
+            $stats = $index->columnStringStats($entry, $column);
+            if ($stats === null) {
+                return null;
+            }
+            $total += \count($stats['blocks']);
+            $survivors += \count($this->survivingBlocksString($stats['blocks'], $lo, $hi));
+        }
+
+        return $total === 0 ? null : $survivors / $total;
     }
 
     private function fireFullScan(string $query, ?int $column, string $reason, string $entry): void
@@ -981,7 +2125,7 @@ class StreamingXlsxReader
      *
      * @return \Generator<int, array<int, mixed>>
      */
-    public function rowsWhere(int|string $column, string $op, int|float $value, int|float|null $value2 = null): \Generator
+    public function rowsWhere(int|string $column, string $op, int|float|string $value, int|float|string|null $value2 = null): \Generator
     {
         if (\is_string($column)) {
             $column = $this->resolveColumnName($column) + 1;
@@ -993,10 +2137,12 @@ class StreamingXlsxReader
         // filtered — it does not exist logically, and its local number
         // would collide with the previous member's last data row after
         // remapping.
+        $lateMat = $this->planLateMaterialize($column, $op, $value, $value2);
+
         $chain = $this->chain();
         if ($chain !== null) {
             foreach ($chain as $i => $m) {
-                foreach ($this->matchRowsIn($m['entry'], $column, $op, $value, $value2) as $rn => $row) {
+                foreach ($this->matchRowsIn($m['entry'], $column, $op, $value, $value2, $lateMat) as $rn => $row) {
                     if ($i > 0 && $rn === 1) {
                         continue;
                     }
@@ -1007,7 +2153,7 @@ class StreamingXlsxReader
             return;
         }
 
-        foreach ($this->matchRowsIn($this->currentEntry, $column, $op, $value, $value2) as $rn => $row) {
+        foreach ($this->matchRowsIn($this->currentEntry, $column, $op, $value, $value2, $lateMat) as $rn => $row) {
             yield $rn => $this->applyCasts($row);
         }
     }
@@ -1106,10 +2252,14 @@ class StreamingXlsxReader
      *     the row-count bound of the candidate blocks; estimate assumes
      *     predicate independence;
      *   - estimatedBytes: compressed bytes the scan would fetch (the S3
-     *     range budget — exactly what bounded streamFrom will request).
+     *     range budget — exactly what bounded streamFrom will request);
+     *   - lateMaterialization: whether a single-column scan would probe the
+     *     predicate column and defer full tokenization to matches (auto
+     *     planner decision; always false for a multi-predicate AND, which
+     *     runs the eager matcher). See useLateMaterialization().
      *
      * @param  list<array{0: int|string, 1: string, 2: int|float, 3?: int|float|null}>  $predicates
-     * @return array{strategy: string, candidateBlocks: int, runs: int, estimatedRows: array{upper: int|null, estimate: int|null}, estimatedBytes: int}
+     * @return array{strategy: string, candidateBlocks: int, runs: int, estimatedRows: array{upper: int|null, estimate: int|null}, estimatedBytes: int, lateMaterialization: bool}
      */
     public function explain(array $predicates): array
     {
@@ -1150,6 +2300,12 @@ class StreamingXlsxReader
             }
         }
 
+        // Late materialization is wired for single-column rowsWhere scans;
+        // a multi-predicate AND runs the eager matcher, so report false
+        // rather than imply a deferral the executor would not take.
+        $lateMat = \count($preds) === 1
+            && $this->planLateMaterialize($preds[0]['col'], $preds[0]['op'], $preds[0]['value'], $preds[0]['value2']);
+
         return [
             'strategy' => $pruned ? 'zone-map-prune' : 'full-scan',
             'candidateBlocks' => $candidateBlocks,
@@ -1159,6 +2315,7 @@ class StreamingXlsxReader
                 'estimate' => $this->estimateAnd($preds),
             ],
             'estimatedBytes' => $bytes,
+            'lateMaterialization' => $lateMat,
         ];
     }
 
@@ -1509,8 +2666,16 @@ class StreamingXlsxReader
      *
      * @return \Generator<int, array<int, mixed>>
      */
-    private function matchRowsIn(string $entry, int $column, string $op, int|float $value, int|float|null $value2): \Generator
+    private function matchRowsIn(string $entry, int $column, string $op, int|float|string $value, int|float|string|null $value2, bool $lateMat = false): \Generator
     {
+        // A string predicate value routes to the STRZ (string zone map)
+        // path; a numeric value keeps the STAT path below.
+        if (\is_string($value)) {
+            yield from $this->matchRowsStringIn($entry, $column, $op, $value, is_string($value2) ? $value2 : null, $lateMat);
+
+            return;
+        }
+
         [$lo, $hi] = $this->pruneBounds($op, $value, $value2);
 
         $index = $this->loadRandomAccessIndex();
@@ -1522,7 +2687,17 @@ class StreamingXlsxReader
             // this generator's contract (and the pruned path below) is
             // 1-based sheet row numbers.
             $this->fireFullScan('rowsWhere', $column, 'column-not-indexed', $entry);
-            foreach ($this->openSheetReader([$column - 1], $entry)->rowsFromOffset(null, 1) as $rn => $row) {
+            $sr = $this->openSheetReader([$column - 1], $entry);
+            if ($lateMat) {
+                foreach ($sr->rawRowsFromOffset(null, 1) as $rn => $xml) {
+                    if ($this->cellMatches($sr->probeColumn($xml, $column - 1), $op, $value, $value2)) {
+                        yield $rn => $sr->materializeRow($xml);
+                    }
+                }
+
+                return;
+            }
+            foreach ($sr->rowsFromOffset(null, 1) as $rn => $row) {
                 if ($this->cellMatches($row[$column - 1] ?? null, $op, $value, $value2)) {
                     yield $rn => $row;
                 }
@@ -1541,8 +2716,28 @@ class StreamingXlsxReader
             $start = $ranges[$firstBlock];
             $stopRow = $ranges[$lastBlock]['last_row'];
             $compLength = $this->runCompLength($ranges, $firstBlock, $lastBlock);
+            $sr = $this->openSheetReader([$column - 1], $entry);
 
-            foreach ($this->openSheetReader([$column - 1], $entry)->rowsFromOffset($start['comp_offset'], $start['start_row_at_offset'] ?? 1, $start['first_row'], $compLength) as $rn => $row) {
+            if ($lateMat) {
+                // Late materialization: probe the predicate column of each
+                // raw row and pay the full tokenize only on a match, so a
+                // rejected row skips every other cell's body parse.
+                foreach ($sr->rawRowsFromOffset($start['comp_offset'], $start['start_row_at_offset'] ?? 1, $start['first_row'], $compLength) as $rn => $xml) {
+                    if ($rn < $start['first_row']) {
+                        continue;
+                    }
+                    if ($rn > $stopRow) {
+                        break;
+                    }
+                    if ($this->cellMatches($sr->probeColumn($xml, $column - 1), $op, $value, $value2)) {
+                        yield $rn => $sr->materializeRow($xml);
+                    }
+                }
+
+                continue;
+            }
+
+            foreach ($sr->rowsFromOffset($start['comp_offset'], $start['start_row_at_offset'] ?? 1, $start['first_row'], $compLength) as $rn => $row) {
                 if ($rn < $start['first_row']) {
                     continue;
                 }
@@ -1550,6 +2745,81 @@ class StreamingXlsxReader
                     break;
                 }
                 if ($this->cellMatches($row[$column - 1] ?? null, $op, $value, $value2)) {
+                    yield $rn => $row;
+                }
+            }
+        }
+    }
+
+    /**
+     * String analogue of matchRowsIn: prune with the STRZ lexicographic
+     * zone maps, scan the surviving run(s), filter per cell with strcmp.
+     * Ops: '=', '<', '<=', '>', '>=', 'between', 'prefix'. Yields LOCAL
+     * 1-based row => raw row (casts belong to the caller).
+     *
+     * @return \Generator<int, array<int, mixed>>
+     */
+    private function matchRowsStringIn(string $entry, int $column, string $op, string $value, ?string $value2, bool $lateMat = false): \Generator
+    {
+        [$lo, $hi] = $this->pruneBoundsString($op, $value, $value2);
+
+        $index = $this->loadRandomAccessIndex();
+        $stats = $index?->columnStringStats($entry, $column);
+
+        if ($stats === null) {
+            $this->fireFullScan('rowsWhere', $column, 'column-not-string-indexed', $entry);
+            $sr = $this->openSheetReader([$column - 1], $entry);
+            if ($lateMat) {
+                foreach ($sr->rawRowsFromOffset(null, 1) as $rn => $xml) {
+                    if ($this->cellMatchesString($sr->probeColumn($xml, $column - 1), $op, $value, $value2)) {
+                        yield $rn => $sr->materializeRow($xml);
+                    }
+                }
+
+                return;
+            }
+            foreach ($sr->rowsFromOffset(null, 1) as $rn => $row) {
+                if ($this->cellMatchesString($row[$column - 1] ?? null, $op, $value, $value2)) {
+                    yield $rn => $row;
+                }
+            }
+
+            return;
+        }
+
+        $ranges = $this->blockRanges($index, $entry);
+        $runs = $this->planRuns($this->survivingBlocksString($stats['blocks'], $lo, $hi), $ranges, $this->maxBridgeBytes());
+
+        foreach ($runs as [$firstBlock, $lastBlock]) {
+            $start = $ranges[$firstBlock];
+            $stopRow = $ranges[$lastBlock]['last_row'];
+            $compLength = $this->runCompLength($ranges, $firstBlock, $lastBlock);
+            $sr = $this->openSheetReader([$column - 1], $entry);
+
+            if ($lateMat) {
+                foreach ($sr->rawRowsFromOffset($start['comp_offset'], $start['start_row_at_offset'] ?? 1, $start['first_row'], $compLength) as $rn => $xml) {
+                    if ($rn < $start['first_row']) {
+                        continue;
+                    }
+                    if ($rn > $stopRow) {
+                        break;
+                    }
+                    if ($this->cellMatchesString($sr->probeColumn($xml, $column - 1), $op, $value, $value2)) {
+                        yield $rn => $sr->materializeRow($xml);
+                    }
+                }
+
+                continue;
+            }
+
+            foreach ($sr->rowsFromOffset($start['comp_offset'], $start['start_row_at_offset'] ?? 1, $start['first_row'], $compLength) as $rn => $row) {
+                if ($rn < $start['first_row']) {
+                    continue;
+                }
+                if ($rn > $stopRow) {
+                    break;
+                }
+                if ($this->cellMatchesString($row[$column - 1] ?? null, $op, $value, $value2)) {
                     yield $rn => $row;
                 }
             }
@@ -1973,7 +3243,7 @@ class StreamingXlsxReader
      *
      * @return array{row: int, values: array<int, mixed>}|null
      */
-    public function findRow(int|string $column, int|float $value): ?array
+    public function findRow(int|string $column, int|float|string $value): ?array
     {
         foreach ($this->rowsWhere($column, '=', $value) as $rn => $row) {
             return ['row' => $rn, 'values' => $row];
@@ -2068,6 +3338,275 @@ class StreamingXlsxReader
         }
 
         return array_values($groups);
+    }
+
+    /**
+     * Percentile GROUP BY: the approximate $q-quantile of $aggregate
+     * within each bucketed group of $groupBy — the composition of the two
+     * row-space primitives, not a stored per-group sketch. When the
+     * sidecar tracks the group column, saw it sorted, and carries TDGB
+     * range-quantiles for the aggregate (single sheet), each group's
+     * contiguous sheet-row span is resolved from the zone maps — whole
+     * group-pure blocks for free, boundary blocks scanned — and its
+     * quantile answered by the range path over that span: large groups
+     * merge whole superblocks, small groups scan their few rows. Any
+     * missing precondition (unsorted or untracked group column, aggregate
+     * without TDGB, or an auto-split chain) degrades to a single honest
+     * scan that routes each row into a per-group t-digest, announced via
+     * onFullScan — identical results, no pushdown.
+     *
+     * Grouping semantics match groupStats(): 1-based columns, a monotone
+     * non-decreasing $bucket (identity by default), the header row
+     * excluded, rows with a non-numeric group cell dropped, and a group
+     * whose aggregate cells are all non-numeric present with count 0 and a
+     * null quantile. Groups are returned in first-encounter sheet order.
+     *
+     * @param  callable(float): (int|float)  $bucket
+     * @return list<array{group: int|float, count: int, quantile: float|null}>
+     */
+    public function groupQuantile(int|string $groupBy, int|string $aggregate, float $q, ?callable $bucket = null): array
+    {
+        if (\is_string($groupBy)) {
+            $groupBy = $this->resolveColumnName($groupBy) + 1;
+        }
+        if (\is_string($aggregate)) {
+            $aggregate = $this->resolveColumnName($aggregate) + 1;
+        }
+        if ($groupBy < 1 || $aggregate < 1) {
+            throw new \InvalidArgumentException(
+                "groupQuantile() columns are 1-based; got groupBy={$groupBy}, aggregate={$aggregate}"
+            );
+        }
+        if ($q < 0.0 || $q > 1.0) {
+            throw new \InvalidArgumentException("quantile must be within [0, 1]; got {$q}");
+        }
+        $bucket ??= static fn (float $v): float => $v;
+
+        $chain = $this->chain();
+        $index = $this->loadRandomAccessIndex();
+        $entry = $this->currentEntry;
+        $groupCol = $chain === null ? $index?->columnStats($entry, $groupBy) : null;
+        $sorted = $groupCol !== null && ($groupCol['sorted_asc'] || $groupCol['sorted_desc']);
+        $aggTracked = $chain === null && $index !== null
+            && \in_array($aggregate, $index->rangeQuantileColumns($entry), true);
+
+        // Composition (pushdown) path — taken only when it actually pays.
+        // Small groups cover no whole superblock, so per-group
+        // rangeQuantileDigest degenerates into one seek+scan per group; when
+        // there are many such groups a single coordinated pass is cheaper,
+        // so fall through to it (announced, so onFullScan stays honest).
+        if ($chain === null && $index !== null && $groupCol !== null && $sorted && $aggTracked) {
+            $spans = $this->groupRowSpans($entry, $groupBy, $bucket, $index, $groupCol);
+            if ($this->groupPushdownPaysOff($spans, $index->rangeQuantileSuperblocks($entry, $aggregate), max(0, $this->rowCount() - 1))) {
+                $out = [];
+                foreach ($spans as $span) {
+                    $digest = $this->rangeQuantileDigest($entry, $aggregate, $span['first'], $span['last']);
+                    $out[] = [
+                        'group' => $span['group'],
+                        'count' => $digest?->count() ?? 0,
+                        'quantile' => $digest?->quantile($q),
+                    ];
+                }
+
+                return $out;
+            }
+        }
+
+        // Honest-scan fallback (also the auto-split chain path): one pass
+        // per member, routing each row into a transient per-group digest.
+        $reason = match (true) {
+            $chain !== null => 'auto-split-chain',
+            $index === null || $groupCol === null => 'column-not-indexed',
+            ! $sorted => 'groupby-not-sorted',
+            ! $aggTracked => 'aggregate-not-range-indexed',
+            default => 'groups-smaller-than-superblock',
+        };
+
+        /** @var array<string, array{group: int|float, digest: TDigest|null}> $groups */
+        $groups = [];
+        foreach ($chain ?? [['entry' => $entry]] as $m) {
+            $this->scanGroupQuantile($m['entry'], $groupBy, $aggregate, $bucket, $reason, $groups);
+        }
+
+        $out = [];
+        foreach ($groups as $gp) {
+            $out[] = [
+                'group' => $gp['group'],
+                'count' => $gp['digest']?->count() ?? 0,
+                'quantile' => $gp['digest']?->quantile($q),
+            ];
+        }
+
+        return $out;
+    }
+
+    /**
+     * Decide whether the groupQuantile() pushdown is worth it for this
+     * grouping, from the sidecar alone (no rows read). Few groups always win
+     * (their per-group seeks are negligible). With many groups, the pushdown
+     * is kept only when whole-superblock merges cover at least
+     * GROUP_PUSHDOWN_MIN_MERGE of the data rows; otherwise each small group is
+     * edge-scanned whole and the many independent seeks beat a single pass,
+     * so the caller falls back. A two-pointer walk over the (row-ordered)
+     * group spans and superblock spans sums the mergeable rows.
+     *
+     * @param  list<array{group: int|float, first: int, last: int}>  $spans
+     * @param  list<array{end_row: int, digest: TDigest}>|null  $superblocks
+     */
+    private function groupPushdownPaysOff(array $spans, ?array $superblocks, int $totalDataRows): bool
+    {
+        if ($superblocks === null || $superblocks === [] || $totalDataRows <= 0) {
+            return false;
+        }
+        if (\count($spans) < self::GROUP_PUSHDOWN_MIN_GROUPS) {
+            return true;
+        }
+
+        usort($spans, static fn (array $a, array $b): int => $a['first'] <=> $b['first']);
+
+        $mergeable = 0;
+        $gi = 0;
+        $n = \count($spans);
+        $prevEnd = 1; // header boundary — data rows begin at 2 (matches TDGB)
+        foreach ($superblocks as $sb) {
+            $spanStart = $prevEnd + 1;
+            $spanEnd = $sb['end_row'];
+            $prevEnd = $spanEnd;
+            while ($gi < $n && $spans[$gi]['last'] < $spanStart) {
+                $gi++;
+            }
+            if ($gi < $n && $spans[$gi]['first'] <= $spanStart && $spans[$gi]['last'] >= $spanEnd) {
+                $mergeable += $spanEnd - $spanStart + 1;
+            }
+        }
+
+        return $mergeable >= $totalDataRows * self::GROUP_PUSHDOWN_MIN_MERGE;
+    }
+
+    /**
+     * Resolve each group's contiguous sheet-row span for the pushdown
+     * groupQuantile() path, in first-encounter order. Reuses groupStats()'s
+     * block classification: a group-pure block contributes its whole
+     * [first_row, last_row] to its group for free, while boundary blocks
+     * (and block 0, which carries the header) are scanned so the exact
+     * split rows between groups are found. Because the group column is
+     * sorted, a group's rows are contiguous, so min(first_row)/max(last_row)
+     * over its blocks and scanned rows is exactly its span.
+     *
+     * @param  callable(float): (int|float)  $bucket
+     * @param  array{blocks: list<array{min: float, max: float, count: int, other: int}>, sorted_asc: bool, sorted_desc: bool}  $groupCol
+     * @return list<array{group: int|float, first: int, last: int}>
+     */
+    private function groupRowSpans(string $entry, int $groupBy, callable $bucket, RandomAccessIndex $index, array $groupCol): array
+    {
+        $ranges = $this->blockRanges($index, $entry);
+
+        /** @var array<string, array{group: int|float, first: int, last: int}> $spans */
+        $spans = [];
+        $record = static function (int|float $g, int $firstRow, int $lastRow) use (&$spans): void {
+            $key = (string) $g;
+            if (! isset($spans[$key])) {
+                $spans[$key] = ['group' => $g, 'first' => $firstRow, 'last' => $lastRow];
+
+                return;
+            }
+            $spans[$key]['first'] = min($spans[$key]['first'], $firstRow);
+            $spans[$key]['last'] = max($spans[$key]['last'], $lastRow);
+        };
+
+        // Plan pass — identical classification to foldGroupStatsFor().
+        /** @var list<array{stats: array{0: int|float, 1: int}}|array{scan: array{0: int, 1: int}}> $plan */
+        $plan = [];
+        $scanRun = null;
+        foreach ($groupCol['blocks'] as $i => $block) {
+            if ($block['count'] === 0) {
+                if ($scanRun !== null) {
+                    $plan[] = ['scan' => $scanRun];
+                    $scanRun = null;
+                }
+
+                continue;
+            }
+            $g = $bucket($block['min']);
+            if ($i !== 0 && $block['other'] === 0 && $g == $bucket($block['max'])) {
+                if ($scanRun !== null) {
+                    $plan[] = ['scan' => $scanRun];
+                    $scanRun = null;
+                }
+                $plan[] = ['stats' => [$g, $i]];
+
+                continue;
+            }
+            $scanRun === null ? $scanRun = [$i, $i] : $scanRun[1] = $i;
+        }
+        if ($scanRun !== null) {
+            $plan[] = ['scan' => $scanRun];
+        }
+
+        // Execute pass.
+        foreach ($plan as $step) {
+            if (isset($step['stats'])) {
+                [$g, $i] = $step['stats'];
+                $record($g, $ranges[$i]['first_row'], $ranges[$i]['last_row']);
+
+                continue;
+            }
+
+            [$first, $last] = $step['scan'];
+            $start = $ranges[$first];
+            $stopRow = $ranges[$last]['last_row'];
+            $compLength = $this->runCompLength($ranges, $first, $last);
+            foreach ($this->openSheetReader([$groupBy - 1], $entry)->rowsFromOffset($start['comp_offset'], $start['start_row_at_offset'] ?? 1, $start['first_row'], $compLength) as $rn => $row) {
+                if ($rn > $stopRow) {
+                    break;
+                }
+                if ($rn === 1) {
+                    continue;
+                }
+                $gv = $this->statNumericCell($row[$groupBy - 1] ?? null);
+                if ($gv === null) {
+                    continue;
+                }
+                $record($bucket($gv), $rn, $rn);
+            }
+        }
+
+        return array_values($spans);
+    }
+
+    /**
+     * Honest-scan engine behind groupQuantile()'s fallback: one inflate
+     * pass over $entry, folding each data row's aggregate value into a
+     * transient per-group t-digest kept in $groups. A group is registered
+     * the moment a numeric group cell is seen, so groups whose aggregate
+     * cells are all non-numeric still surface (with a null digest → count
+     * 0, null quantile). Fires onFullScan once for the sheet, mirroring
+     * groupStats()'s degradation.
+     *
+     * @param  callable(float): (int|float)  $bucket
+     * @param  array<string, array{group: int|float, digest: TDigest|null}>  $groups
+     */
+    private function scanGroupQuantile(string $entry, int $groupBy, int $aggregate, callable $bucket, string $reason, array &$groups): void
+    {
+        $this->fireFullScan('groupQuantile', $groupBy, $reason, $entry);
+        foreach ($this->openSheetReader([$groupBy - 1, $aggregate - 1], $entry)->rowsFromOffset(null, 1) as $rn => $row) {
+            if ($rn === 1) {
+                continue;
+            }
+            $gv = $this->statNumericCell($row[$groupBy - 1] ?? null);
+            if ($gv === null) {
+                continue;
+            }
+            $g = $bucket($gv);
+            $key = (string) $g;
+            if (! isset($groups[$key])) {
+                $groups[$key] = ['group' => $g, 'digest' => null];
+            }
+            $av = $this->statNumericCell($row[$aggregate - 1] ?? null);
+            if ($av !== null) {
+                ($groups[$key]['digest'] ??= new TDigest())->add($av);
+            }
+        }
     }
 
     /**
@@ -2477,7 +4016,6 @@ class StreamingXlsxReader
             foreach ($this->sheets as $sheet) {
                 if ($sheet['entry'] === $shard['sheet']) {
                     $this->currentEntry = $shard['sheet'];
-                    $this->cachedHeader = null;
                     $this->columnCasts = [];
                     break;
                 }
@@ -2563,6 +4101,102 @@ class StreamingXlsxReader
             '>=' => $v >= $value,
             'between' => $v >= min($value, $value2) && $v <= max($value, $value2),
             default => false, // unreachable — pruneBounds validated $op
+        };
+    }
+
+    /**
+     * Lexicographic (STRZ) counterpart of pruneBounds. Returns the query
+     * range as `[lo, hi]` strings; a null side is unbounded (there is no
+     * −∞/+∞ string). Comparison is unsigned byte-wise (= code-point order).
+     *
+     * @return array{0: ?string, 1: ?string}
+     */
+    private function pruneBoundsString(string $op, string $value, ?string $value2): array
+    {
+        return match ($op) {
+            '=' => [$value, $value],
+            '<', '<=' => [null, $value],
+            '>', '>=' => [$value, null],
+            'prefix' => [$value, $this->stringPrefixUpper($value)],
+            'between' => $value2 === null
+                ? throw new \InvalidArgumentException("rowsWhere('between') requires a second bound")
+                : (strcmp($value, $value2) <= 0 ? [$value, $value2] : [$value2, $value]),
+            default => throw new \InvalidArgumentException(
+                "rowsWhere() string op must be one of =, <, <=, >, >=, between, prefix; got '{$op}'"
+            ),
+        };
+    }
+
+    /**
+     * Smallest string strictly greater than every string with prefix $v —
+     * the exclusive upper bound of the $v-prefix range. Increment the
+     * rightmost non-0xFF byte and drop the tail; null when $v is empty or
+     * all 0xFF (no finite upper bound, so the high side is unbounded).
+     */
+    private function stringPrefixUpper(string $v): ?string
+    {
+        for ($i = strlen($v) - 1; $i >= 0; $i--) {
+            $b = ord($v[$i]);
+            if ($b < 0xFF) {
+                return substr($v, 0, $i).chr($b + 1);
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * STRZ block survivor test for a `[lo, hi]` string range (null = that
+     * side is unbounded). A block survives when its truncated
+     * `[min, max]` overlaps `[lo, hi]`; the truncated min/max are sound
+     * (min ≤ every value, max ≥ every value), so pruning never drops a
+     * matching block. Empty blocks (count 0, null min/max) are skipped.
+     *
+     * @param  list<array{min: ?string, max: ?string, count: int, other: int}>  $stringBlocks
+     * @return list<int>
+     */
+    private function survivingBlocksString(array $stringBlocks, ?string $lo, ?string $hi): array
+    {
+        $survivors = [];
+        foreach ($stringBlocks as $i => $b) {
+            if ($b['count'] === 0 || $b['min'] === null || $b['max'] === null) {
+                continue;
+            }
+            if (($lo === null || strcmp($b['max'], $lo) >= 0)
+                && ($hi === null || strcmp($b['min'], $hi) <= 0)) {
+                $survivors[] = $i;
+            }
+        }
+
+        return $survivors;
+    }
+
+    /**
+     * Exact per-cell lexicographic predicate. Null / empty cells never
+     * match (they are the STRZ `other` class, never a tracked value);
+     * every other cell is compared by its string form via strcmp.
+     */
+    private function cellMatchesString(mixed $cell, string $op, string $value, ?string $value2): bool
+    {
+        if ($cell === null) {
+            return false;
+        }
+        $s = (string) $cell;
+        if ($s === '') {
+            return false;
+        }
+
+        return match ($op) {
+            '=' => strcmp($s, $value) === 0,
+            '<' => strcmp($s, $value) < 0,
+            '<=' => strcmp($s, $value) <= 0,
+            '>' => strcmp($s, $value) > 0,
+            '>=' => strcmp($s, $value) >= 0,
+            'prefix' => str_starts_with($s, $value),
+            'between' => $value2 !== null
+                && strcmp($s, strcmp($value, $value2) <= 0 ? $value : $value2) >= 0
+                && strcmp($s, strcmp($value, $value2) <= 0 ? $value2 : $value) <= 0,
+            default => false,
         };
     }
 
@@ -2967,22 +4601,71 @@ class StreamingXlsxReader
     /**
      * Raw tokenized header row of an arbitrary entry — casts and date
      * detection deliberately bypassed so equality means "same bytes on
-     * disk", the only sound continuation test.
+     * disk", the only sound continuation test and the basis for name
+     * resolution. Delegates to readHeaderRow so name lookup and header()
+     * share ONE bounded read and ONE cache.
      *
      * @return array<int, mixed>
      */
     private function rawHeaderOf(string $entry): array
     {
-        if (! array_key_exists($entry, $this->headerByEntry)) {
-            $this->headerByEntry[$entry] = [];
-            $reader = new StreamingSheetReader($this->source, $this->cd, $entry, 65536, $this->resolveSharedStrings(), null);
-            foreach ($reader->rows() as $row) {
-                $this->headerByEntry[$entry] = $row;
-                break;
+        return $this->readHeaderRow($entry);
+    }
+
+    /**
+     * Header (row 1) of an entry, read once and memoized. When the file is
+     * indexed the read is BOUNDED to the first block's compressed bytes —
+     * never a stream to EOF, which on S3 is a ranged GET spanning the whole
+     * sheet just to pull one row (the leak that hit both header() and every
+     * name-addressed query through resolveColumnName). Casts and date
+     * detection are bypassed so the cells are the raw bytes on disk.
+     *
+     * If the bounded read yields nothing — a corrupt or short block table —
+     * it FALLS BACK to the full read rather than trusting the sidecar to
+     * shape the answer: SPEC §7 requires a bad sidecar to at worst slow a
+     * read, never change it (and the empty result is not cached, so the
+     * fallback is not poisoned).
+     *
+     * @return array<int, mixed>
+     */
+    private function readHeaderRow(string $entry): array
+    {
+        return $this->headerByEntry[$entry] ??= $this->readFirstRow($entry, null);
+    }
+
+    /**
+     * Read row 1 of an entry with the given tokenizer date bundle (null =
+     * raw). BOUNDED to the first block's bytes when the file is indexed —
+     * never a stream to EOF — and, if that bounded read yields nothing (a
+     * corrupt or short block table), FALLS BACK to the full read so a bad
+     * sidecar at worst slows the read, never changes it (SPEC §7). Returns
+     * [] only when the sheet is genuinely empty; callers do the memoizing.
+     *
+     * @return array<int, mixed>
+     */
+    private function readFirstRow(string $entry, ?DateDetection $dates): array
+    {
+        $sst = $this->resolveSharedStrings();
+        $index = $this->loadRandomAccessIndex();
+        if ($index !== null) {
+            $ranges = $this->blockRanges($index, $entry);
+            if ($ranges !== []) {
+                $first = $ranges[0];
+                $compLength = $this->blockBytesForRow($index, $entry, 1) ?: null;
+                $reader = new StreamingSheetReader($this->source, $this->cd, $entry, 65536, $sst, $dates);
+                foreach ($reader->rowsFromOffset($first['comp_offset'] ?? 0, $first['start_row_at_offset'] ?? 1, 1, $compLength) as $row) {
+                    return $row;
+                }
+                // Bounded read produced no row — fall through to the full read.
             }
         }
 
-        return $this->headerByEntry[$entry];
+        $reader = new StreamingSheetReader($this->source, $this->cd, $entry, 65536, $sst, $dates);
+        foreach ($reader->rows() as $row) {
+            return $row;
+        }
+
+        return [];
     }
 
     /**

@@ -3,7 +3,9 @@
 namespace Kolay\XlsxStream\Writers;
 
 use Kolay\XlsxStream\Exceptions\XlsxStreamException;
+use Kolay\XlsxStream\Sketches\CoMoments;
 use Kolay\XlsxStream\Sketches\HyperLogLog;
+use Kolay\XlsxStream\Sketches\MisraGries;
 use Kolay\XlsxStream\Sketches\TDigest;
 use Kolay\XlsxStream\Styles\StyleRegistry;
 
@@ -241,6 +243,31 @@ abstract class BaseXlsxWriter
     /** @var array<string, array<int, array{asc: bool, desc: bool}>> final sortedness per sheet: entry => col => flags */
     protected array $indexColumnSorted = [];
 
+    // String zone maps (STRZ) — opt-in via withStringStats, orthogonal to
+    // withColumnStats. Per-block lexicographic [min, max] string prefixes
+    // for string range/prefix pruning. Full min/max are kept per open
+    // block, capped to STRING_STAT_CAP at block close, then the truncation
+    // length is chosen per column at finishFile (deferred shortest
+    // separator — restores pruning on common-prefix corpora).
+
+    /** Max bytes of a stored block min/max prefix. */
+    protected const STRING_STAT_CAP = 64;
+
+    /** @var list<int> 1-based columns tracked for string zone maps */
+    protected array $stringStatsColumns = [];
+
+    /** @var array<int, array{min: ?string, max: ?string, count: int, other: int}> current-block string accumulator */
+    protected array $stringAccum = [];
+
+    /** @var array<int, array{asc: bool, desc: bool, prev: ?string}> per-sheet lexicographic sortedness */
+    protected array $stringSorted = [];
+
+    /** @var array<string, array<int, list<array{min: ?string, max: ?string, count: int, other: int}>>> closed string blocks: entry => col => blocks */
+    protected array $indexStringBlocks = [];
+
+    /** @var array<string, array<int, array{asc: bool, desc: bool}>> final string sortedness per sheet */
+    protected array $indexStringSorted = [];
+
     // Column sketches (opt-in via withColumnSketches, orthogonal to
     // withColumnStats). For each tracked column the writer feeds one
     // whole-sheet t-digest (numeric values, same inclusion rule as STAT)
@@ -281,6 +308,62 @@ abstract class BaseXlsxWriter
 
     /** @var array<string, array<int, string>> finished sheets: entry => col => serialized HyperLogLog */
     protected array $indexColumnHlls = [];
+
+    // Range/group quantiles (TDGB) — opt-in via withRangeQuantiles. One
+    // t-digest per ROW-SPACE superblock per column: a superblock spans
+    // SUPERBLOCK_ROWS rows, its end snapped to the first sync point past
+    // that width, so a sheet holds ≤64 superblocks regardless of block
+    // count and each digest is built single-pass (no write-time merges).
+
+    /** Superblock row width; end snaps to the first sync point past it. */
+    protected const SUPERBLOCK_ROWS = 16384;
+
+    /** @var list<int> 1-based columns tracked for range/group quantiles */
+    protected array $rangeQuantileColumns = [];
+
+    /** @var array<int, \Kolay\XlsxStream\Sketches\TDigest> current open superblock digest per column */
+    protected array $rangeDigestAccum = [];
+
+    /** Rows accumulated in the current (shared) open superblock. */
+    protected int $rangeSuperblockRows = 0;
+
+    /** @var array<string, array<int, list<array{end_row: int, payload: string}>>> closed superblocks: entry => col => list */
+    protected array $indexRangeSuperblocks = [];
+
+    /** @var list<int> 1-based columns tracked for top-K frequent values (TOPK) */
+    protected array $topValuesColumns = [];
+
+    protected int $topValuesK = MisraGries::DEFAULT_K;
+
+    /** @var array<int, MisraGries> current-sheet Misra-Gries sketch per tracked column */
+    protected array $topValueSketches = [];
+
+    /** @var array<string, array<int, string>> finished sheets: entry => col => serialized MisraGries */
+    protected array $indexTopValues = [];
+
+    /** @var list<int> 1-based columns tracked for argmin/argmax row pointers (ARGP) */
+    protected array $argPointerColumns = [];
+
+    /** @var array<int, bool> O(1) membership set for argPointerColumns */
+    protected array $argPointerSet = [];
+
+    /** @var array<int, array{minRow: int, maxRow: int}> current block's arg rows per column (0 = none) */
+    protected array $argAccum = [];
+
+    /** @var array<string, array<int, list<array{minRow: int, maxRow: int}>>> finished: entry => col => per-block arg rows */
+    protected array $indexArgPointers = [];
+
+    /** @var list<int> 1-based columns tracked for pairwise correlation (CORR) */
+    protected array $correlationColumns = [];
+
+    /** @var list<array{0: int, 1: int}> the C(k,2) column pairs (colA < colB) */
+    protected array $correlationPairs = [];
+
+    /** @var array<string, CoMoments> current-sheet co-moment accumulator per pair key "a,b" */
+    protected array $coMomentAccum = [];
+
+    /** @var array<string, array<string, string>> finished: entry => pairKey => serialized CoMoments */
+    protected array $indexCorrelations = [];
 
     public function __construct()
     {
@@ -532,6 +615,42 @@ abstract class BaseXlsxWriter
     }
 
     /**
+     * Opt in to per-block STRING zone maps (STRZ) for the given 1-based
+     * columns — the lexicographic analogue of withColumnStats(), enabling
+     * string range / prefix pruning and string findRow. Comparison is
+     * unsigned byte-wise (= Unicode code-point order, NOT a locale
+     * collation; see SPEC §4.5). Like STAT, this implies the random-access
+     * index. Orthogonal to withColumnStats(): a column may carry numeric
+     * stats, string zone maps, both, or neither.
+     */
+    public function withStringStats(array $columns): self
+    {
+        if ($this->started) {
+            throw XlsxStreamException::alreadyStarted();
+        }
+        if ($columns === []) {
+            throw new XlsxStreamException('withStringStats() needs at least one column index.');
+        }
+        foreach ($columns as $col) {
+            if (! is_int($col) || $col < 1 || $col > self::MAX_COLUMNS) {
+                throw new XlsxStreamException(
+                    'withStringStats() expects 1-based integer column indexes; got: '.var_export($col, true)
+                );
+            }
+        }
+
+        if (! $this->randomAccessIndexEnabled) {
+            $this->withRandomAccessIndex();
+        }
+
+        $columns = array_values(array_unique($columns));
+        sort($columns);
+        $this->stringStatsColumns = $columns;
+
+        return $this;
+    }
+
+    /**
      * Track file-level approximate-statistics sketches for the given
      * 1-based columns and embed them in the random-access sidecar
      * ("TDIG" + "CHLL" TLV sections older readers transparently ignore).
@@ -587,6 +706,175 @@ abstract class BaseXlsxWriter
         $columns = array_values(array_unique($columns));
         sort($columns);
         $this->sketchColumns = $columns;
+
+        return $this;
+    }
+
+    /**
+     * Track the top-K most frequent values of each given column (1-based),
+     * answerable from the sidecar (topValues() / the categorical slice of
+     * profile()) with zero row reads. Values fold as their canonical string
+     * form (the CHLL rule, §4.4), so text and numeric columns are both
+     * covered. Bounded to k counters per column (reference k = 64): while a
+     * column's cardinality stays ≤ k the stored counts are EXACT — the
+     * complete categorical distribution — and above k they become top-k
+     * with error ≤ N/k, distinguished by the sketch's saturated bit. The
+     * header row is excluded, as for the other sketches. Implies the
+     * random-access index. Must be called before startFile().
+     */
+    public function withTopValues(array $columns, int $k = MisraGries::DEFAULT_K): self
+    {
+        if ($this->started) {
+            throw XlsxStreamException::alreadyStarted();
+        }
+        if ($columns === []) {
+            throw new XlsxStreamException('withTopValues() needs at least one column index.');
+        }
+        foreach ($columns as $col) {
+            if (! is_int($col) || $col < 1 || $col > self::MAX_COLUMNS) {
+                throw new XlsxStreamException(
+                    'withTopValues() expects 1-based integer column indexes; got: '.var_export($col, true)
+                );
+            }
+        }
+
+        if (! $this->randomAccessIndexEnabled) {
+            $this->withRandomAccessIndex();
+        }
+
+        $columns = array_values(array_unique($columns));
+        sort($columns);
+        $this->topValuesColumns = $columns;
+        $this->topValuesK = $k;
+
+        return $this;
+    }
+
+    /**
+     * Track the sheet row number of each given column's minimum and maximum
+     * per block (ARGP), so argMin()/argMax() answer "which row holds the
+     * extreme" from the sidecar with no scan. Aligned 1:1 with STAT blocks
+     * and defined over the same values STAT sees (it is STAT that ranks the
+     * blocks), so these columns are folded into withColumnStats() too —
+     * call order does not matter. First-occurrence semantics: the earliest
+     * row achieving a block's min/max is the one recorded. Implies the
+     * random-access index. Must be called before startFile().
+     */
+    public function withArgPointers(array $columns): self
+    {
+        if ($this->started) {
+            throw XlsxStreamException::alreadyStarted();
+        }
+        if ($columns === []) {
+            throw new XlsxStreamException('withArgPointers() needs at least one column index.');
+        }
+        foreach ($columns as $col) {
+            if (! is_int($col) || $col < 1 || $col > self::MAX_COLUMNS) {
+                throw new XlsxStreamException(
+                    'withArgPointers() expects 1-based integer column indexes; got: '.var_export($col, true)
+                );
+            }
+        }
+
+        $columns = array_values(array_unique($columns));
+        sort($columns);
+        $this->argPointerColumns = $columns;
+        $this->argPointerSet = array_fill_keys($columns, true);
+
+        // argMin/argMax rank blocks by STAT min/max, so every argptr column
+        // must also carry STAT — union in, never clobber an existing set.
+        $this->statsColumns = array_values(array_unique(array_merge($this->statsColumns, $columns)));
+        sort($this->statsColumns);
+
+        if (! $this->randomAccessIndexEnabled) {
+            $this->withRandomAccessIndex();
+        }
+
+        return $this;
+    }
+
+    /**
+     * Track pairwise Pearson correlation among the given 1-based columns:
+     * every unordered pair gets one CoMoments accumulator (n, Σx, Σy, Σxy,
+     * Σx², Σy²), so a reader answers correlation(a, b) from the sidecar with
+     * no scan. Only rows where BOTH cells are numeric (the same numeric
+     * interpretation STAT uses — DateTime as Excel serial, bool as 0/1,
+     * numeric strings as their value) feed a pair; the header is excluded.
+     *
+     * Cost is quadratic in the column count: k columns hold C(k, 2) pairs at
+     * 48 bytes each and cost k²/2 multiply-adds per row, so this is meant for
+     * a handful of measure columns, not every column. Accumulators are
+     * mergeable, so correlations compose across an auto-split chain like the
+     * sketches. Implies the random-access index. Call before startFile().
+     */
+    public function withCorrelations(array $columns): self
+    {
+        if ($this->started) {
+            throw XlsxStreamException::alreadyStarted();
+        }
+        foreach ($columns as $col) {
+            if (! is_int($col) || $col < 1 || $col > self::MAX_COLUMNS) {
+                throw new XlsxStreamException(
+                    'withCorrelations() expects 1-based integer column indexes; got: '.var_export($col, true)
+                );
+            }
+        }
+
+        $columns = array_values(array_unique($columns));
+        sort($columns);
+        if (count($columns) < 2) {
+            throw new XlsxStreamException('withCorrelations() needs at least two distinct columns.');
+        }
+
+        $this->correlationColumns = $columns;
+        $pairs = [];
+        for ($i = 0, $n = count($columns); $i < $n; $i++) {
+            for ($j = $i + 1; $j < $n; $j++) {
+                $pairs[] = [$columns[$i], $columns[$j]];
+            }
+        }
+        $this->correlationPairs = $pairs;
+
+        if (! $this->randomAccessIndexEnabled) {
+            $this->withRandomAccessIndex();
+        }
+
+        return $this;
+    }
+
+    /**
+     * Opt in to per-superblock t-digests (TDGB) for the given 1-based
+     * columns — range- and group-scoped approximate quantiles
+     * (`quantile(col, q, from, to)`, and group quantiles composed over a
+     * group's row range). Unlike withColumnSketches (one whole-sheet
+     * digest), this keeps one digest per ROW-SPACE superblock so a query
+     * can merge just the superblocks covering its range. Implies the
+     * random-access index. Numeric values only (same inclusion rule as
+     * withColumnStats). Must be called before startFile().
+     */
+    public function withRangeQuantiles(array $columns): self
+    {
+        if ($this->started) {
+            throw XlsxStreamException::alreadyStarted();
+        }
+        if ($columns === []) {
+            throw new XlsxStreamException('withRangeQuantiles() needs at least one column index.');
+        }
+        foreach ($columns as $col) {
+            if (! is_int($col) || $col < 1 || $col > self::MAX_COLUMNS) {
+                throw new XlsxStreamException(
+                    'withRangeQuantiles() expects 1-based integer column indexes; got: '.var_export($col, true)
+                );
+            }
+        }
+
+        if (! $this->randomAccessIndexEnabled) {
+            $this->withRandomAccessIndex();
+        }
+
+        $columns = array_values(array_unique($columns));
+        sort($columns);
+        $this->rangeQuantileColumns = $columns;
 
         return $this;
     }
@@ -1016,8 +1304,20 @@ abstract class BaseXlsxWriter
         if ($this->statsColumns !== []) {
             $this->accumulateColumnStats($row);
         }
+        if ($this->stringStatsColumns !== []) {
+            $this->accumulateStringStats($row);
+        }
         if ($this->sketchColumns !== []) {
             $this->accumulateColumnSketches($row);
+        }
+        if ($this->rangeQuantileColumns !== []) {
+            $this->accumulateRangeQuantiles($row);
+        }
+        if ($this->topValuesColumns !== []) {
+            $this->accumulateTopValues($row);
+        }
+        if ($this->correlationPairs !== []) {
+            $this->accumulateCorrelations($row);
         }
 
         $rowXml = $this->buildRowXml($this->currentSheetRow, $row, $styleId);
@@ -1328,8 +1628,15 @@ abstract class BaseXlsxWriter
         // The rows flushed above complete an index block; snapshot the
         // column-stat accumulators so block k always spans exactly the
         // rows between sync points k-1 and k.
-        if ($this->statsColumns !== []) {
+        if ($this->statsColumns !== [] || $this->stringStatsColumns !== []) {
             $this->closeStatsBlock($entry);
+        }
+
+        // Snap the superblock to this sync boundary once it has spanned at
+        // least SUPERBLOCK_ROWS rows (syncPeriod > SUPERBLOCK_ROWS ⇒ one
+        // block per superblock — the natural degenerate case).
+        if ($this->rangeQuantileColumns !== [] && $this->rangeSuperblockRows >= self::SUPERBLOCK_ROWS) {
+            $this->closeRangeSuperblock($entry, $this->currentSheetRow);
         }
 
         $this->rowsSinceSync = 0;
@@ -1365,6 +1672,11 @@ abstract class BaseXlsxWriter
             $row = array_values($row);
         }
 
+        // Row number for any argmin/argmax pointer set in this call. Data
+        // rows carry their sheet row in currentSheetRow (≥ 2); the header
+        // folds in with currentSheetRow == 0, so it claims its true row 1.
+        $argRow = $this->currentSheetRow ?: 1;
+
         foreach ($this->statsColumns as $col) {
             $v = $this->statNumericValue($row[$col - 1] ?? null);
             $acc = &$this->statsAccum[$col];
@@ -1374,15 +1686,25 @@ abstract class BaseXlsxWriter
                 continue;
             }
 
+            $trackArg = isset($this->argPointerSet[$col]);
             if ($acc['count'] === 0) {
                 $acc['min'] = $v;
                 $acc['max'] = $v;
+                if ($trackArg) {
+                    $this->argAccum[$col] = ['minRow' => $argRow, 'maxRow' => $argRow];
+                }
             } else {
                 if ($v < $acc['min']) {
                     $acc['min'] = $v;
+                    if ($trackArg) {
+                        $this->argAccum[$col]['minRow'] = $argRow;
+                    }
                 }
                 if ($v > $acc['max']) {
                     $acc['max'] = $v;
+                    if ($trackArg) {
+                        $this->argAccum[$col]['maxRow'] = $argRow;
+                    }
                 }
             }
             $acc['sum'] += $v;
@@ -1479,6 +1801,87 @@ abstract class BaseXlsxWriter
     }
 
     /**
+     * Fold one DATA row into every tracked column pair's co-moments (CORR).
+     * Each column's numeric value is resolved once per row (a column sits in
+     * up to k−1 pairs), then a pair accumulates only when BOTH sides are
+     * numeric and finite — the aligned-observation rule Pearson requires.
+     */
+    protected function accumulateCorrelations(array $row): void
+    {
+        if (! array_is_list($row)) {
+            $row = array_values($row);
+        }
+
+        $vals = [];
+        foreach ($this->correlationColumns as $col) {
+            $v = $this->statNumericValue($row[$col - 1] ?? null);
+            $vals[$col] = ($v !== null && is_finite($v)) ? $v : null;
+        }
+
+        foreach ($this->correlationPairs as [$a, $b]) {
+            if ($vals[$a] !== null && $vals[$b] !== null) {
+                $this->coMomentAccum[$a.','.$b]->add($vals[$a], $vals[$b]);
+            }
+        }
+    }
+
+    /**
+     * Fold one data row's tracked numeric values into the current open
+     * superblock digest (TDGB). One shared row counter drives the
+     * sync-snapped superblock close in flushRowBuffer.
+     */
+    protected function accumulateRangeQuantiles(array $row): void
+    {
+        if (! array_is_list($row)) {
+            $row = array_values($row);
+        }
+        foreach ($this->rangeQuantileColumns as $col) {
+            $v = $this->statNumericValue($row[$col - 1] ?? null);
+            if ($v !== null && is_finite($v)) {
+                $this->rangeDigestAccum[$col]->add($v);
+            }
+        }
+        $this->rangeSuperblockRows++;
+    }
+
+    /**
+     * Fold one data row's tracked values into their Misra-Gries sketches
+     * (TOPK), keyed by the same canonical string form the HyperLogLog uses
+     * (§4.4). Empty cells (null / '') are not values and are skipped, so a
+     * column of mostly-empty cells does not spend a counter on ''.
+     */
+    protected function accumulateTopValues(array $row): void
+    {
+        if (! array_is_list($row)) {
+            $row = array_values($row);
+        }
+        foreach ($this->topValuesColumns as $col) {
+            $canonical = $this->sketchCanonicalString($row[$col - 1] ?? null);
+            if ($canonical !== null) {
+                $this->topValueSketches[$col]->add($canonical);
+            }
+        }
+    }
+
+    /**
+     * Close the current open superblock at a sync point: serialize each
+     * column's digest with the superblock's last row, then reset. Called
+     * from flushRowBuffer once ≥ SUPERBLOCK_ROWS have accumulated (snap to
+     * the sync boundary), and once at sheet finalize for the remainder.
+     */
+    protected function closeRangeSuperblock(string $entry, int $endRow): void
+    {
+        foreach ($this->rangeQuantileColumns as $col) {
+            $this->indexRangeSuperblocks[$entry][$col][] = [
+                'end_row' => $endRow,
+                'payload' => $this->rangeDigestAccum[$col]->serialize(),
+            ];
+            $this->rangeDigestAccum[$col] = new TDigest();
+        }
+        $this->rangeSuperblockRows = 0;
+    }
+
+    /**
      * Drain the per-column staging buffers into the sheet's sketches.
      * Runs every SKETCH_FLUSH_ROWS rows and right before the sheet's
      * sketches are serialized (finishCurrentSheet).
@@ -1563,6 +1966,139 @@ abstract class BaseXlsxWriter
     }
 
     /**
+     * String analogue of accumulateColumnStats: fold each tracked cell's
+     * canonical string into the current block's lexicographic [min, max]
+     * (unsigned byte compare = strcmp). Empty/null cells count as `other`
+     * (mirrors the sketch canonical rule), so a string predicate that can
+     * never match them is not widened by them. $trackOrder = false for the
+     * header fold, exactly like the numeric path.
+     */
+    protected function accumulateStringStats(array $row, bool $trackOrder = true): void
+    {
+        if (! array_is_list($row)) {
+            $row = array_values($row);
+        }
+
+        foreach ($this->stringStatsColumns as $col) {
+            $s = $this->sketchCanonicalString($row[$col - 1] ?? null);
+            $acc = &$this->stringAccum[$col];
+
+            if ($s === null) {
+                $acc['other']++;
+                unset($acc);
+
+                continue;
+            }
+
+            if ($acc['count'] === 0) {
+                $acc['min'] = $s;
+                $acc['max'] = $s;
+            } else {
+                if (strcmp($s, $acc['min']) < 0) {
+                    $acc['min'] = $s;
+                }
+                if (strcmp($s, $acc['max']) > 0) {
+                    $acc['max'] = $s;
+                }
+            }
+            $acc['count']++;
+            unset($acc);
+
+            if (! $trackOrder) {
+                continue;
+            }
+
+            $so = &$this->stringSorted[$col];
+            if ($so['prev'] !== null) {
+                if (strcmp($s, $so['prev']) < 0) {
+                    $so['asc'] = false;
+                }
+                if (strcmp($s, $so['prev']) > 0) {
+                    $so['desc'] = false;
+                }
+            }
+            $so['prev'] = $s;
+            unset($so);
+        }
+    }
+
+    /** Byte-wise common prefix length of two strings. */
+    protected static function commonPrefixLen(string $a, string $b): int
+    {
+        $n = min(strlen($a), strlen($b));
+        $i = 0;
+        while ($i < $n && $a[$i] === $b[$i]) {
+            $i++;
+        }
+
+        return $i;
+    }
+
+    /**
+     * Deferred shortest-separator truncation length for one column: one
+     * byte past the DEEPEST divergence between adjacent boundary strings
+     * (the classic B-tree separator), so every block boundary stays
+     * distinguishable after truncation — restoring pruning on a
+     * common-prefix corpus, capped at STRING_STAT_CAP.
+     *
+     * The adjacent-pair (sorted) measure is deliberately robust to
+     * outliers: a lone off-prefix boundary (e.g. a differently-cased
+     * header folded into block 0) does NOT drag the length down the way a
+     * whole-set common prefix would. When two boundaries are identical
+     * (a key straddling a block edge) no length separates them; the cap
+     * bounds the cost and pruning honestly weakens at that one edge.
+     *
+     * @param  list<string>  $boundaries  every block's stored min and max
+     */
+    protected static function stringTruncationLength(array $boundaries): int
+    {
+        if (count($boundaries) <= 1) {
+            return self::STRING_STAT_CAP;
+        }
+        sort($boundaries, SORT_STRING); // byte order = strcmp = the STRZ collation
+
+        $maxAdjacent = 0;
+        for ($i = 1, $n = count($boundaries); $i < $n; $i++) {
+            $lcp = self::commonPrefixLen($boundaries[$i - 1], $boundaries[$i]);
+            if ($lcp > $maxAdjacent) {
+                $maxAdjacent = $lcp;
+            }
+        }
+
+        // +4 past the deepest adjacent divergence: enough to separate every
+        // boundary plus a little slack for query values sharing the prefix.
+        return max(1, min(self::STRING_STAT_CAP, $maxAdjacent + 4));
+    }
+
+    /** Sound LOWER bound: the first $len bytes are a prefix, always ≤ $s. */
+    protected static function truncateStringMin(string $s, int $len): string
+    {
+        return substr($s, 0, $len);
+    }
+
+    /**
+     * Sound UPPER bound: the smallest string ≥ every string sharing $s's
+     * $len-byte prefix. Increment the rightmost non-0xFF byte of the
+     * prefix and drop the tail; if $s already fits in $len it is exact; an
+     * all-0xFF prefix cannot be bumped, so $s is kept whole.
+     */
+    protected static function truncateStringMax(string $s, int $len): string
+    {
+        if (strlen($s) <= $len) {
+            return $s;
+        }
+        $p = substr($s, 0, $len);
+        for ($i = $len - 1; $i >= 0; $i--) {
+            $b = ord($p[$i]);
+            if ($b < 0xFF) {
+                return substr($p, 0, $i).chr($b + 1);
+            }
+        }
+
+        return $s;
+    }
+
+    /**
      * Snapshot the per-column accumulators as one closed index block for
      * the sheet and reset them for the next block.
      */
@@ -1571,6 +2107,28 @@ abstract class BaseXlsxWriter
         foreach ($this->statsColumns as $col) {
             $this->indexColumnBlocks[$entry][$col][] = $this->statsAccum[$col];
             $this->statsAccum[$col] = ['min' => 0.0, 'max' => 0.0, 'sum' => 0.0, 'count' => 0, 'other' => 0];
+        }
+
+        // Argmin/argmax row pointers (ARGP), 1:1 with the STAT blocks just
+        // pushed. A block with no numeric values keeps {0, 0} — row 0 does
+        // not exist, so it reads as "no pointer".
+        foreach ($this->argPointerColumns as $col) {
+            $this->indexArgPointers[$entry][$col][] = $this->argAccum[$col] ?? ['minRow' => 0, 'maxRow' => 0];
+            $this->argAccum[$col] = ['minRow' => 0, 'maxRow' => 0];
+        }
+
+        // String blocks: cap the full min/max to STRING_STAT_CAP now (sound
+        // bounds — min truncates down, max up); the shorter per-column
+        // separator length is chosen later at finishFile.
+        foreach ($this->stringStatsColumns as $col) {
+            $acc = $this->stringAccum[$col];
+            $this->indexStringBlocks[$entry][$col][] = [
+                'min' => $acc['min'] === null ? null : self::truncateStringMin($acc['min'], self::STRING_STAT_CAP),
+                'max' => $acc['max'] === null ? null : self::truncateStringMax($acc['max'], self::STRING_STAT_CAP),
+                'count' => $acc['count'],
+                'other' => $acc['other'],
+            ];
+            $this->stringAccum[$col] = ['min' => null, 'max' => null, 'count' => 0, 'other' => 0];
         }
     }
 
@@ -1583,6 +2141,7 @@ abstract class BaseXlsxWriter
     {
         $sheetSections = [];
         $columnStats = [];
+        $columnStringStats = [];
         $syncPointCrcs = [];
         foreach ($this->sheets as $sheet) {
             $entry = $sheet['filename'];
@@ -1610,6 +2169,45 @@ abstract class BaseXlsxWriter
                 }
                 $columnStats[$entry] = $cols;
             }
+
+            if ($this->stringStatsColumns !== []) {
+                $cols = [];
+                foreach ($this->stringStatsColumns as $col) {
+                    $blocks = $this->indexStringBlocks[$entry][$col] ?? [];
+
+                    // Deferred separator truncation: choose one length for
+                    // the whole column from its block boundaries, then
+                    // truncate every block's min (down) / max (up) to it.
+                    $boundaries = [];
+                    foreach ($blocks as $b) {
+                        if ($b['min'] !== null) {
+                            $boundaries[] = $b['min'];
+                        }
+                        if ($b['max'] !== null) {
+                            $boundaries[] = $b['max'];
+                        }
+                    }
+                    $len = self::stringTruncationLength($boundaries);
+                    foreach ($blocks as &$b) {
+                        if ($b['min'] !== null) {
+                            $b['min'] = self::truncateStringMin($b['min'], $len);
+                        }
+                        if ($b['max'] !== null) {
+                            $b['max'] = self::truncateStringMax($b['max'], $len);
+                        }
+                    }
+                    unset($b);
+
+                    $sorted = $this->indexStringSorted[$entry][$col] ?? ['asc' => false, 'desc' => false];
+                    $cols[] = [
+                        'col' => $col,
+                        'sorted_asc' => $sorted['asc'],
+                        'sorted_desc' => $sorted['desc'],
+                        'blocks' => $blocks,
+                    ];
+                }
+                $columnStringStats[$entry] = $cols;
+            }
         }
 
         return RandomAccessIndex::encode(
@@ -1618,7 +2216,12 @@ abstract class BaseXlsxWriter
             $columnStats,
             $syncPointCrcs,
             $this->indexColumnDigests,
-            $this->indexColumnHlls
+            $this->indexColumnHlls,
+            $columnStringStats,
+            $this->indexRangeSuperblocks,
+            $this->indexTopValues,
+            $this->indexArgPointers,
+            $this->indexCorrelations
         );
     }
 
@@ -1693,8 +2296,24 @@ abstract class BaseXlsxWriter
             // never hide a row the un-pruned path would return; without
             // this, rowsWhere() gave different results with and without
             // stats for out-of-data-range values matching the header.
+            // Fresh block-0 arg accumulators before the header folds in
+            // (so a numeric header can claim row 1 as its extreme).
+            foreach ($this->argPointerColumns as $col) {
+                $this->argAccum[$col] = ['minRow' => 0, 'maxRow' => 0];
+            }
             if ($this->columns !== []) {
                 $this->accumulateColumnStats($this->columns, trackOrder: false);
+            }
+        }
+
+        // Same fresh-sheet reset + header fold for string zone maps.
+        if ($this->stringStatsColumns !== []) {
+            foreach ($this->stringStatsColumns as $col) {
+                $this->stringAccum[$col] = ['min' => null, 'max' => null, 'count' => 0, 'other' => 0];
+                $this->stringSorted[$col] = ['asc' => true, 'desc' => true, 'prev' => null];
+            }
+            if ($this->columns !== []) {
+                $this->accumulateStringStats($this->columns, trackOrder: false);
             }
         }
 
@@ -1712,6 +2331,30 @@ abstract class BaseXlsxWriter
                 $this->sketchStrBuffer[$col] = [];
             }
             $this->sketchRowsBuffered = 0;
+        }
+
+        // Fresh sheet -> fresh open superblock digests (per-sheet, like the
+        // sketches). No header fold: quantiles estimate the data.
+        if ($this->rangeQuantileColumns !== []) {
+            foreach ($this->rangeQuantileColumns as $col) {
+                $this->rangeDigestAccum[$col] = new TDigest();
+            }
+            $this->rangeSuperblockRows = 0;
+        }
+
+        // Fresh sheet -> fresh Misra-Gries sketches (per-sheet, mergeable;
+        // header not folded, same reasoning as the other sketches).
+        if ($this->topValuesColumns !== []) {
+            foreach ($this->topValuesColumns as $col) {
+                $this->topValueSketches[$col] = new MisraGries($this->topValuesK);
+            }
+        }
+
+        // Fresh sheet -> fresh co-moment accumulators (per-sheet, mergeable).
+        if ($this->correlationPairs !== []) {
+            foreach ($this->correlationPairs as [$a, $b]) {
+                $this->coMomentAccum[$a.','.$b] = new CoMoments();
+            }
         }
 
         [$mtime, $mdate] = $this->dosTimeParts(time());
@@ -2030,12 +2673,16 @@ abstract class BaseXlsxWriter
         // Close the tail block (rows after the last sync point — possibly
         // empty, still emitted so block_count == sync_count + 1 holds for
         // every sheet) and pin the sheet's sortedness verdict.
-        if ($this->statsColumns !== []) {
+        if ($this->statsColumns !== [] || $this->stringStatsColumns !== []) {
             $entry = $sheetInfo['filename'];
             $this->closeStatsBlock($entry);
             foreach ($this->statsColumns as $col) {
                 $s = $this->statsSorted[$col];
                 $this->indexColumnSorted[$entry][$col] = ['asc' => $s['asc'], 'desc' => $s['desc']];
+            }
+            foreach ($this->stringStatsColumns as $col) {
+                $so = $this->stringSorted[$col];
+                $this->indexStringSorted[$entry][$col] = ['asc' => $so['asc'], 'desc' => $so['desc']];
             }
         }
 
@@ -2049,6 +2696,29 @@ abstract class BaseXlsxWriter
             foreach ($this->sketchColumns as $col) {
                 $this->indexColumnDigests[$entry][$col] = $this->sketchDigestAccum[$col]->serialize();
                 $this->indexColumnHlls[$entry][$col] = $this->sketchHllAccum[$col]->serialize();
+            }
+        }
+
+        // Close the final (partial) superblock — the rows since the last
+        // sync-snap. Guard on the row counter so a sheet that snapped
+        // exactly on its last sync point does not emit an empty trailer.
+        if ($this->rangeQuantileColumns !== [] && $this->rangeSuperblockRows > 0) {
+            $this->closeRangeSuperblock($sheetInfo['filename'], $this->currentSheetRow);
+        }
+
+        // Snapshot the sheet's Misra-Gries sketches in serialized form.
+        if ($this->topValuesColumns !== []) {
+            $entry = $sheetInfo['filename'];
+            foreach ($this->topValuesColumns as $col) {
+                $this->indexTopValues[$entry][$col] = $this->topValueSketches[$col]->serialize();
+            }
+        }
+
+        // Snapshot the sheet's co-moment accumulators in serialized form.
+        if ($this->correlationPairs !== []) {
+            $entry = $sheetInfo['filename'];
+            foreach ($this->correlationPairs as [$a, $b]) {
+                $this->indexCorrelations[$entry][$a.','.$b] = $this->coMomentAccum[$a.','.$b]->serialize();
             }
         }
     }

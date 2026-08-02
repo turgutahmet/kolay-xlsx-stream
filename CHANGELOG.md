@@ -5,6 +5,82 @@ All notable changes to `kolay/xlsx-stream` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.0] — 2026-08-02
+
+A backward-compatible minor: a data-profiling and exact-analytics layer on
+top of the born-indexed sidecar. Everything is a reader/sidecar addition —
+five new registered TLV sections, all additive (an older reader skips them),
+so the KXSI format byte stays `2` and classic writer output remains
+byte-identical. No breaking API changes. Full suite 742 tests / 19,629
+assertions; SPEC document version 1.8.0 with ten byte-pinned conformance
+vectors.
+
+### Added — profiling & exact quantiles
+
+- **`profile(columns?, histogram?, histogramBins?, percentiles?, histogramMode?)`**
+  — a one-call per-column report assembled from the sidecar: numeric/empty
+  counts, min/max/avg, percentiles (each with a rank certificate), histogram
+  (`histogramMode` 'width'/'depth'), distinct, top values, plus a top-level
+  correlations map and the data-row count. Reads **no data rows** — only the header once, as a single bounded
+  range request, to name columns. `data_rows` is null when the file has no
+  sidecar (no whole-file scan for a count it cannot otherwise fill).
+- **`exactQuantile(col, q, maxScanBlocks?)`** — the exact nearest-rank
+  quantile via the "Rank-Sandwich": a t-digest estimate fenced by the STAT
+  zone-map rank certificate brackets the target value, then only the blocks
+  that could hold it are read. A sorted, fully-numeric column answers from a
+  single row; a `maxScanBlocks` budget degrades to the certified estimate
+  with `exceeded: true` rather than throwing.
+- **`explainQuantile(col, q)`** — the zero-I/O quantile plan: the estimate,
+  its deterministic `rank_lo`/`rank_hi` certificate, and what an exact answer
+  would scan (`exact_would_scan_blocks`, `exact_est_bytes`).
+- **`histogram(col, bins, mode)`** — a distribution from the t-digest CDF,
+  counts summing to the exact total (zero I/O). `mode: 'width'` (default) is
+  equi-width over `[min, max]`; `mode: 'depth'` is equi-depth (quantile
+  edges, each bin ≈ equal count) — the readable choice for a skewed column.
+- **`countEmpty(col)`** — the missing side of `columnStats()['count']`
+  (data rows minus numeric count, header-safe), from the STAT zone maps.
+
+### Added — new sketches & registered TLV sections
+
+- **`withCorrelations([cols])` + `correlation(a, b)`** — exact pairwise
+  Pearson correlation from per-pair co-moment accumulators (§4.9 `CORR`),
+  stored in centred (Welford) form and merged by Chan's algorithm so a
+  timestamp/date-serial column — huge values, tiny spread — stays accurate
+  where the textbook sum form loses precision. Only rows numeric in both
+  columns feed a pair; mergeable across chains.
+- **`withTopValues([cols], k?)` + `topValues(col)`** — Misra-Gries
+  frequent-items sketch; exact when cardinality ≤ k, otherwise top-k with an
+  N/k bound and a `saturated` flag (§4.7 `TOPK`).
+- **`withArgPointers([cols])` + `argMin(col)`/`argMax(col)`** — the sheet row
+  holding a column's extreme value, named from the sidecar with no scan
+  (§4.8 `ARGP`).
+- **Range and grouped quantiles** — `quantile(col, q, from, to)` and
+  `groupQuantile(groupBy, aggregate, q)` over per-superblock t-digests
+  (§4.6 `TDGB`), merging only the superblocks a range fully covers.
+- **String zone maps** — lexicographic per-block `[min, max]` for string
+  `rowsWhere`/`findRow` predicates (§4.5 `STRZ`).
+
+### Added — scan performance
+
+- **Late materialization** — `rowsWhere` can probe just the predicate column
+  of each candidate row and fully tokenize only matches, skipping every other
+  cell's parse on a rejected row. On by default when the planner predicts a
+  selective predicate (measured 8× at 1% selectivity, 1.7× at 50%, and
+  correctly off near 100% where it would lose); `useLateMaterialization(?bool)`
+  forces it for A/B measurement, and `explain()` reports the decision.
+
+### Changed
+
+- `header()` and every name-addressed query now read the header **bounded**
+  (only the first block) when the file is indexed, instead of a stream to
+  EOF — on S3, one small ranged GET rather than one spanning the whole sheet
+  to pull a single row. The bounded read falls back to a full read if the
+  block table is unusable (a bad sidecar may slow a read, never change it).
+- SPEC document version 1.6.0 → 1.8.1: `STRZ`, `TDGB`, `TOPK`, `ARGP` and
+  `CORR` graduate from reserved to registered sections (§4.5–§4.9), each with
+  a byte-pinned conformance vector; §6.2 documents the `profile()` surface;
+  §4.9 pins the `CORR` payload as centred moments.
+
 ## [3.3.0] — 2026-07-06
 
 A backward-compatible minor: a real query engine on top of the born-indexed
