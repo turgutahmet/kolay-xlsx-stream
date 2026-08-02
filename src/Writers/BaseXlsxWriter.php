@@ -340,6 +340,18 @@ abstract class BaseXlsxWriter
     /** @var array<string, array<int, string>> finished sheets: entry => col => serialized MisraGries */
     protected array $indexTopValues = [];
 
+    /** @var list<int> 1-based columns tracked for argmin/argmax row pointers (ARGP) */
+    protected array $argPointerColumns = [];
+
+    /** @var array<int, bool> O(1) membership set for argPointerColumns */
+    protected array $argPointerSet = [];
+
+    /** @var array<int, array{minRow: int, maxRow: int}> current block's arg rows per column (0 = none) */
+    protected array $argAccum = [];
+
+    /** @var array<string, array<int, list<array{minRow: int, maxRow: int}>>> finished: entry => col => per-block arg rows */
+    protected array $indexArgPointers = [];
+
     public function __construct()
     {
         $this->styles = new StyleRegistry();
@@ -721,6 +733,49 @@ abstract class BaseXlsxWriter
         sort($columns);
         $this->topValuesColumns = $columns;
         $this->topValuesK = $k;
+
+        return $this;
+    }
+
+    /**
+     * Track the sheet row number of each given column's minimum and maximum
+     * per block (ARGP), so argMin()/argMax() answer "which row holds the
+     * extreme" from the sidecar with no scan. Aligned 1:1 with STAT blocks
+     * and defined over the same values STAT sees (it is STAT that ranks the
+     * blocks), so these columns are folded into withColumnStats() too —
+     * call order does not matter. First-occurrence semantics: the earliest
+     * row achieving a block's min/max is the one recorded. Implies the
+     * random-access index. Must be called before startFile().
+     */
+    public function withArgPointers(array $columns): self
+    {
+        if ($this->started) {
+            throw XlsxStreamException::alreadyStarted();
+        }
+        if ($columns === []) {
+            throw new XlsxStreamException('withArgPointers() needs at least one column index.');
+        }
+        foreach ($columns as $col) {
+            if (! is_int($col) || $col < 1 || $col > self::MAX_COLUMNS) {
+                throw new XlsxStreamException(
+                    'withArgPointers() expects 1-based integer column indexes; got: '.var_export($col, true)
+                );
+            }
+        }
+
+        $columns = array_values(array_unique($columns));
+        sort($columns);
+        $this->argPointerColumns = $columns;
+        $this->argPointerSet = array_fill_keys($columns, true);
+
+        // argMin/argMax rank blocks by STAT min/max, so every argptr column
+        // must also carry STAT — union in, never clobber an existing set.
+        $this->statsColumns = array_values(array_unique(array_merge($this->statsColumns, $columns)));
+        sort($this->statsColumns);
+
+        if (! $this->randomAccessIndexEnabled) {
+            $this->withRandomAccessIndex();
+        }
 
         return $this;
     }
@@ -1552,6 +1607,11 @@ abstract class BaseXlsxWriter
             $row = array_values($row);
         }
 
+        // Row number for any argmin/argmax pointer set in this call. Data
+        // rows carry their sheet row in currentSheetRow (≥ 2); the header
+        // folds in with currentSheetRow == 0, so it claims its true row 1.
+        $argRow = $this->currentSheetRow ?: 1;
+
         foreach ($this->statsColumns as $col) {
             $v = $this->statNumericValue($row[$col - 1] ?? null);
             $acc = &$this->statsAccum[$col];
@@ -1561,15 +1621,25 @@ abstract class BaseXlsxWriter
                 continue;
             }
 
+            $trackArg = isset($this->argPointerSet[$col]);
             if ($acc['count'] === 0) {
                 $acc['min'] = $v;
                 $acc['max'] = $v;
+                if ($trackArg) {
+                    $this->argAccum[$col] = ['minRow' => $argRow, 'maxRow' => $argRow];
+                }
             } else {
                 if ($v < $acc['min']) {
                     $acc['min'] = $v;
+                    if ($trackArg) {
+                        $this->argAccum[$col]['minRow'] = $argRow;
+                    }
                 }
                 if ($v > $acc['max']) {
                     $acc['max'] = $v;
+                    if ($trackArg) {
+                        $this->argAccum[$col]['maxRow'] = $argRow;
+                    }
                 }
             }
             $acc['sum'] += $v;
@@ -1949,6 +2019,14 @@ abstract class BaseXlsxWriter
             $this->statsAccum[$col] = ['min' => 0.0, 'max' => 0.0, 'sum' => 0.0, 'count' => 0, 'other' => 0];
         }
 
+        // Argmin/argmax row pointers (ARGP), 1:1 with the STAT blocks just
+        // pushed. A block with no numeric values keeps {0, 0} — row 0 does
+        // not exist, so it reads as "no pointer".
+        foreach ($this->argPointerColumns as $col) {
+            $this->indexArgPointers[$entry][$col][] = $this->argAccum[$col] ?? ['minRow' => 0, 'maxRow' => 0];
+            $this->argAccum[$col] = ['minRow' => 0, 'maxRow' => 0];
+        }
+
         // String blocks: cap the full min/max to STRING_STAT_CAP now (sound
         // bounds — min truncates down, max up); the shorter per-column
         // separator length is chosen later at finishFile.
@@ -2051,7 +2129,8 @@ abstract class BaseXlsxWriter
             $this->indexColumnHlls,
             $columnStringStats,
             $this->indexRangeSuperblocks,
-            $this->indexTopValues
+            $this->indexTopValues,
+            $this->indexArgPointers
         );
     }
 
@@ -2126,6 +2205,11 @@ abstract class BaseXlsxWriter
             // never hide a row the un-pruned path would return; without
             // this, rowsWhere() gave different results with and without
             // stats for out-of-data-range values matching the header.
+            // Fresh block-0 arg accumulators before the header folds in
+            // (so a numeric header can claim row 1 as its extreme).
+            foreach ($this->argPointerColumns as $col) {
+                $this->argAccum[$col] = ['minRow' => 0, 'maxRow' => 0];
+            }
             if ($this->columns !== []) {
                 $this->accumulateColumnStats($this->columns, trackOrder: false);
             }

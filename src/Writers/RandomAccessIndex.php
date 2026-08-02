@@ -137,6 +137,8 @@ class RandomAccessIndex
 
     public const TAG_TOP_VALUES = 'TOPK';
 
+    public const TAG_ARG_POINTER = 'ARGP';
+
     public const SORTED_ASC = 0x01;
     public const SORTED_DESC = 0x02;
 
@@ -165,7 +167,7 @@ class RandomAccessIndex
      *     1-based column => serialized HyperLogLog payload. Pass [] to omit
      *     the CHLL section entirely.
      */
-    public static function encode(int $syncPeriod, array $sheets, array $columnStats = [], array $syncPointCrcs = [], array $columnDigests = [], array $columnHlls = [], array $columnStringStats = [], array $columnRangeQuantiles = [], array $columnTopValues = []): string
+    public static function encode(int $syncPeriod, array $sheets, array $columnStats = [], array $syncPointCrcs = [], array $columnDigests = [], array $columnHlls = [], array $columnStringStats = [], array $columnRangeQuantiles = [], array $columnTopValues = [], array $columnArgPointers = []): string
     {
         $body = '';
         foreach ($sheets as $sheet) {
@@ -292,6 +294,26 @@ class RandomAccessIndex
         if ($columnTopValues !== []) {
             $topk = self::encodeSketchSection($sheets, $columnTopValues);
             $body .= self::TAG_TOP_VALUES.pack('V', strlen($topk)).$topk;
+        }
+
+        // ARGP — per-block argmin/argmax row numbers, 1:1 with STAT. Per
+        // sheet in core-body order: tracked column count, then per column
+        // its 1-based index and block count, then two uint32 row numbers
+        // per block (0 = the block held no numeric value).
+        if ($columnArgPointers !== []) {
+            $argp = '';
+            foreach ($sheets as $sheet) {
+                $cols = $columnArgPointers[$sheet['entry']] ?? [];
+                ksort($cols);
+                $argp .= pack('v', count($cols));
+                foreach ($cols as $col => $blocks) {
+                    $argp .= pack('vV', $col, count($blocks));
+                    foreach ($blocks as $block) {
+                        $argp .= pack('VV', $block['minRow'], $block['maxRow']);
+                    }
+                }
+            }
+            $body .= self::TAG_ARG_POINTER.pack('V', strlen($argp)).$argp;
         }
 
         $header = self::MAGIC;

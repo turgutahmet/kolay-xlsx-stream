@@ -47,6 +47,8 @@ class RandomAccessIndex
 
     public const TAG_TOP_VALUES = 'TOPK';
 
+    public const TAG_ARG_POINTER = 'ARGP';
+
     public const SORTED_ASC = 0x01;
     public const SORTED_DESC = 0x02;
 
@@ -142,7 +144,10 @@ class RandomAccessIndex
     /** @var array<string, array<int, MisraGries>> memoized deserialized Misra-Gries sketches */
     private array $columnTopValues = [];
 
-    private function __construct(int $syncPeriod, array $totals, array $crcs, array $syncs, array $columnStats = [], array $syncPointCrcs = [], array $columnDigestPayloads = [], array $columnHllPayloads = [], array $columnStringStats = [], array $columnRangeQuantiles = [], array $columnTopValues = [])
+    /** @var array<string, array<int, list<array{minRow: int, maxRow: int}>>> per-block argmin/argmax rows (ARGP) */
+    private array $columnArgPointersByEntry = [];
+
+    private function __construct(int $syncPeriod, array $totals, array $crcs, array $syncs, array $columnStats = [], array $syncPointCrcs = [], array $columnDigestPayloads = [], array $columnHllPayloads = [], array $columnStringStats = [], array $columnRangeQuantiles = [], array $columnTopValues = [], array $columnArgPointers = [])
     {
         $this->syncPeriod = $syncPeriod;
         $this->totalRowsByEntry = $totals;
@@ -155,6 +160,7 @@ class RandomAccessIndex
         $this->columnStringStatsByEntry = $columnStringStats;
         $this->columnRangeQuantilesByEntry = $columnRangeQuantiles;
         $this->columnTopValuePayloads = $columnTopValues;
+        $this->columnArgPointersByEntry = $columnArgPointers;
     }
 
     public static function decode(string $payload): self
@@ -342,6 +348,7 @@ class RandomAccessIndex
         $columnStringStats = [];
         $columnRangeQuantiles = [];
         $columnTopValues = [];
+        $columnArgPointers = [];
         $entryOrder = array_keys($totals);
         while ($cursor + 8 <= $bodyLen) {
             $tag = substr($body, $cursor, 4);
@@ -395,12 +402,17 @@ class RandomAccessIndex
                     $entryOrder,
                     self::TAG_TOP_VALUES
                 );
+            } elseif ($tag === self::TAG_ARG_POINTER) {
+                $columnArgPointers = self::decodeArgpSection(
+                    substr($body, $cursor, $length),
+                    $entryOrder
+                );
             }
 
             $cursor += $length;
         }
 
-        return new self($syncPeriod, $totals, $crcs, $syncs, $columnStats, $syncPointCrcs, $columnDigestPayloads, $columnHllPayloads, $columnStringStats, $columnRangeQuantiles, $columnTopValues);
+        return new self($syncPeriod, $totals, $crcs, $syncs, $columnStats, $syncPointCrcs, $columnDigestPayloads, $columnHllPayloads, $columnStringStats, $columnRangeQuantiles, $columnTopValues, $columnArgPointers);
     }
 
     /**
@@ -665,6 +677,56 @@ class RandomAccessIndex
     }
 
     /**
+     * Decode the ARGP section: per sheet, a tracked column count, then per
+     * column its 1-based index, block count, and two uint32 row numbers per
+     * block (argmin, argmax; 0 = the block held no numeric value).
+     *
+     * @param  list<string>  $entryOrder
+     * @return array<string, array<int, list<array{minRow: int, maxRow: int}>>>
+     */
+    private static function decodeArgpSection(string $data, array $entryOrder): array
+    {
+        $result = [];
+        $cursor = 0;
+        $len = strlen($data);
+
+        foreach ($entryOrder as $entry) {
+            if ($cursor + 2 > $len) {
+                throw XlsxReadException::corruptCentralDirectory('truncated ARGP section sheet header');
+            }
+            $colCount = unpack('v', substr($data, $cursor, 2))[1];
+            $cursor += 2;
+
+            for ($c = 0; $c < $colCount; $c++) {
+                if ($cursor + 6 > $len) {
+                    throw XlsxReadException::corruptCentralDirectory('truncated ARGP column header');
+                }
+                $col = unpack('v', substr($data, $cursor, 2))[1];
+                $blockCount = unpack('V', substr($data, $cursor + 2, 4))[1];
+                $cursor += 6;
+
+                if ($col < 1) {
+                    throw XlsxReadException::corruptCentralDirectory('ARGP section column index must be 1-based');
+                }
+
+                $blocks = [];
+                for ($b = 0; $b < $blockCount; $b++) {
+                    if ($cursor + 8 > $len) {
+                        throw XlsxReadException::corruptCentralDirectory("truncated ARGP block for sheet '{$entry}' column {$col}");
+                    }
+                    $rows = unpack('Vmin/Vmax', substr($data, $cursor, 8));
+                    $cursor += 8;
+                    $blocks[] = ['minRow' => $rows['min'], 'maxRow' => $rows['max']];
+                }
+
+                $result[$entry][$col] = $blocks;
+            }
+        }
+
+        return $result;
+    }
+
+    /**
      * Parse a "TDIG" or "CHLL" TLV payload — both share one frame:
      * per-sheet records in core-body order, each listing (column,
      * payload_len, payload) triples. Only the framing is validated
@@ -899,6 +961,25 @@ class RandomAccessIndex
     public function topValueColumns(string $sheetEntry): array
     {
         return array_keys($this->columnTopValuePayloads[$sheetEntry] ?? []);
+    }
+
+    /**
+     * Per-block argmin/argmax row numbers for one column (KXSI "ARGP"
+     * section), aligned 1:1 with the STAT blocks, or null when the sidecar
+     * carries none. A block that held no numeric value has {minRow: 0,
+     * maxRow: 0}.
+     *
+     * @return list<array{minRow: int, maxRow: int}>|null
+     */
+    public function argPointers(string $sheetEntry, int $column): ?array
+    {
+        return $this->columnArgPointersByEntry[$sheetEntry][$column] ?? null;
+    }
+
+    /** @return list<int> 1-based columns that carry ARGP row pointers for the sheet */
+    public function argPointerColumns(string $sheetEntry): array
+    {
+        return array_keys($this->columnArgPointersByEntry[$sheetEntry] ?? []);
     }
 
     /**
