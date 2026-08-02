@@ -141,6 +141,9 @@ class RandomAccessIndex
      */
     private array $columnRangeQuantilesByEntry = [];
 
+    /** @var array<string, array<int, list<array{end_row: int, digest: TDigest}>>> memoized deserialized TDGB superblocks */
+    private array $columnRangeQuantileDigests = [];
+
     /** @var array<string, array<int, string>> entry path => 1-based column => serialized MisraGries (TOPK) */
     private array $columnTopValuePayloads = [];
 
@@ -912,12 +915,19 @@ class RandomAccessIndex
         if ($raw === null) {
             return null;
         }
-        $out = [];
-        foreach ($raw as $sb) {
-            $out[] = ['end_row' => $sb['end_row'], 'digest' => TDigest::deserialize($sb['payload'])];
+        // Memoize the deserialized digests — a range/group quantile revisits
+        // the same superblocks every call, and re-parsing every payload each
+        // time (unlike columnDigest/columnHll, which cache) was pure waste.
+        // Callers clone before merging, so the cached digests stay pristine.
+        if (! isset($this->columnRangeQuantileDigests[$sheetEntry][$column])) {
+            $out = [];
+            foreach ($raw as $sb) {
+                $out[] = ['end_row' => $sb['end_row'], 'digest' => TDigest::deserialize($sb['payload'])];
+            }
+            $this->columnRangeQuantileDigests[$sheetEntry][$column] = $out;
         }
 
-        return $out;
+        return $this->columnRangeQuantileDigests[$sheetEntry][$column];
     }
 
     /** @return list<int> 1-based columns that carry range-quantile digests for the sheet */
