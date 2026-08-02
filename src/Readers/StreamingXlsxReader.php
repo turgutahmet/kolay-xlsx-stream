@@ -895,6 +895,113 @@ class StreamingXlsxReader
     }
 
     /**
+     * One-call data-profiling report for the workbook, assembled entirely
+     * from the sidecar. For each profiled column it packages what the
+     * tracked sections know — numeric_count/empty_count (STAT), min/max/avg
+     * (STAT), the percentiles and histogram (TDIG), distinct (CHLL),
+     * top_values (TOPK) — plus a top-level correlations map (CORR) and the
+     * data-row count. Fields whose backing section is absent are null, so a
+     * text column shows its top_values while its numeric fields stay empty.
+     *
+     * $columns selects the report (names or 1-based indexes); null profiles
+     * every column that carries at least one tracked section. $histogram
+     * toggles the per-column histogram (the one bulky field); $percentiles
+     * chooses which quantiles to report (keyed p{⌊100q⌋} in the output).
+     *
+     * ZERO row I/O — every number comes from the index cached at open, so on
+     * S3 a multi-GB file profiles from bytes already in hand. It is NOT free
+     * of CPU, though: each column runs its sketch math (quantile
+     * interpolation, HLL estimate, histogram, top-k) and each pair its
+     * correlation, so the cost is O(columns · sketch-work + pairs). "One
+     * range request" is a statement about I/O, not latency.
+     *
+     * @param  list<int|string>|null  $columns
+     * @param  list<float>  $percentiles
+     * @return array{data_rows: int, columns: array<int, array<string, mixed>>, correlations: array<string, float|null>}
+     */
+    public function profile(?array $columns = null, bool $histogram = true, int $histogramBins = 10, array $percentiles = [0.5, 0.95]): array
+    {
+        $index = $this->loadRandomAccessIndex();
+        $chain = $this->chain();
+        $entry = $chain !== null ? $chain[0]['entry'] : $this->currentEntry;
+
+        if ($index === null) {
+            return ['data_rows' => max(0, $this->rowCount() - 1), 'columns' => [], 'correlations' => []];
+        }
+
+        if ($columns === null) {
+            $cols = $this->trackedColumns($index, $entry);
+        } else {
+            $cols = [];
+            foreach ($columns as $c) {
+                $cols[] = \is_string($c) ? $this->resolveColumnName($c) + 1 : $c;
+            }
+            $cols = array_values(array_unique($cols));
+            sort($cols);
+        }
+
+        $header = $this->header();
+        $report = [];
+        foreach ($cols as $col) {
+            $stats = $this->columnStats($col);
+
+            $pcts = [];
+            foreach ($percentiles as $q) {
+                $pcts['p'.(int) floor($q * 100)] = $this->quantile($col, $q);
+            }
+
+            $report[$col] = [
+                'column' => $col,
+                'name' => $header[$col - 1] ?? null,
+                'numeric_count' => $stats['count'] ?? null,
+                'empty_count' => $this->countEmpty($col),
+                'min' => $stats['min'] ?? null,
+                'max' => $stats['max'] ?? null,
+                'avg' => $stats['avg'] ?? null,
+                'sorted' => $stats['sorted'] ?? null,
+                'percentiles' => $pcts,
+                'histogram' => $histogram ? $this->histogram($col, $histogramBins) : null,
+                'distinct' => $this->countDistinct($col),
+                'top_values' => $this->topValues($col),
+            ];
+        }
+
+        $correlations = [];
+        foreach ($index->correlationPairs($entry) as [$a, $b]) {
+            $correlations[$a.','.$b] = $this->correlation($a, $b);
+        }
+
+        return [
+            'data_rows' => max(0, $this->rowCount() - 1),
+            'columns' => $report,
+            'correlations' => $correlations,
+        ];
+    }
+
+    /**
+     * The 1-based columns carrying at least one tracked section (STAT,
+     * STRZ, TDIG, CHLL, TOPK), ascending and de-duplicated — the default
+     * column set profile() reports. Read from a representative entry (chain
+     * members share one schema).
+     *
+     * @return list<int>
+     */
+    private function trackedColumns(RandomAccessIndex $index, string $entry): array
+    {
+        $cols = array_merge(
+            $index->statsColumns($entry),
+            $index->stringStatsColumns($entry),
+            $index->digestColumns($entry),
+            $index->hllColumns($entry),
+            $index->topValueColumns($entry),
+        );
+        $cols = array_values(array_unique($cols));
+        sort($cols);
+
+        return $cols;
+    }
+
+    /**
      * Approximate value at quantile $q (0 = min .. 1 = max) of a
      * column's numeric values, answered from the sidecar's t-digest
      * sketch (KXSI "TDIG") alone — ZERO row data is read and, the index
