@@ -1,5 +1,51 @@
 # Upgrade Guide
 
+## Upgrading from v3.3.0 to v3.4.0
+
+**Nothing to change.** No breaking API changes, no behavioral changes: every
+call site works unchanged, the base `Source` contract is unchanged, and
+classic writer output stays byte-identical. The whole release is reader +
+sidecar — five new **registered TLV sections** (`STRZ`, `TDGB`, `TOPK`,
+`ARGP`, `CORR`), all additive, so the KXSI format byte stays `2` and an older
+reader skips what it doesn't know. A v3.4 reader also reads v3.3 files
+unchanged.
+
+### New opt-in capabilities
+
+Writer (before `startFile()`):
+
+- `withColumnSketches([...])` already shipped t-digest + HyperLogLog; v3.4
+  adds `withRangeQuantiles([...])` (`TDGB`), `withTopValues([...])` (`TOPK`),
+  `withCorrelations([...])` (`CORR`), `withArgPointers([...])` (`ARGP`), and
+  `withStringStats([...])` (`STRZ`). `queryable([...])` still wires the common
+  set in one call.
+
+Reader (all answered from the sidecar):
+
+- **`profile()`** — one-call per-column report (counts, min/max/avg, certified
+  percentiles, histogram, distinct, top values, correlations).
+- **`exactQuantile(col, q, maxScanBlocks?)`** / **`explainQuantile(col, q)`**
+  — exact nearest-rank quantile with a deterministic rank certificate.
+- **`histogram(col, bins, mode)`** (`'width'` / `'depth'`),
+  **`topValues(col)`**, **`correlation(a, b)`**, **`argMin(col)`** /
+  **`argMax(col)`**, **`countEmpty(col)`**.
+- **`quantile(col, q, from, to)`** (row-range) and
+  **`groupQuantile(groupBy, aggregate, q)`** (percentile GROUP BY).
+- String predicates: **`rowsWhere('code', '=', 'INV-…')`** / **`findRow(...)`**
+  over `STRZ` zone maps.
+
+### Two things worth knowing
+
+- **String collation is byte order, not locale.** `STRZ` string queries
+  compare on unsigned UTF-8 bytes (= Unicode code-point order), the only
+  sound basis for a streaming zone map. This is NOT locale collation — in
+  Turkish, `İ`/`ı` sort by their byte values, not `tr_TR` rules. Use it for
+  exact/prefix/range lookups (codes, SKUs, IDs), not locale-correct sorting.
+- **`profile()` reads no data rows, but is not zero-CPU.** Every number comes
+  from the index cached at open (it does one small **bounded** header read to
+  name columns); computing the report still spends CPU per column and per
+  correlated pair. "One range request" is an I/O statement, not "instant".
+
 ## Upgrading from v3.2.2 to v3.3.0
 
 No breaking API changes — every call site works unchanged, the base

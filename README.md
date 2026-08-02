@@ -584,6 +584,24 @@ $reader->sampleRows(1000, seed: 42);
 $reader->onFullScan(fn (array $ctx) => logger()->warning('full scan', $ctx));
 ```
 
+### String lookups — find a record by code on S3 *(v3.4+)*
+
+`withStringStats([...])` adds per-block **lexicographic** zone maps (`STRZ`),
+so a string predicate prunes to the one block that can hold the value — a
+point lookup in a multi-GB S3 file in a couple of range requests:
+
+```php
+$writer->withStringStats([8]);                    // writer side, before startFile()
+
+$reader->findRow('kod', 'INV-2024-00871');        // one matching row, block-pruned
+$reader->rowsWhere('kod', 'prefix', 'INV-2024');  // =, <, <=, >, >=, between, prefix
+```
+
+Collation is **unsigned UTF-8 byte order** (= Unicode code-point order), the
+only sound basis for a streaming zone map — NOT locale. In Turkish, `İ`/`ı`
+sort by their bytes, not `tr_TR` rules; use this for exact / prefix / range
+lookups (codes, SKUs, IDs), not locale-correct sorting.
+
 ### Data profiling & exact analytics *(v3.4+)*
 
 The sidecar grows a profiling layer — a full per-column report, exact
