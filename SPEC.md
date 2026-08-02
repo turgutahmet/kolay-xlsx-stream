@@ -20,7 +20,7 @@ OPTIONAL in this document are to be interpreted as described in
 
 | | |
 |---|---|
-| Document version | **1.8.0** |
+| Document version | **1.8.1** |
 | Format version described | KXSI binary version **2** (the `version` header byte) |
 | Reference implementation | `kolay/xlsx-stream` ≥ 3.2.0 (PHP) — writer + reader |
 | Conformance suite | `tests/SpecVectors/` in the reference repository (§8) |
@@ -694,22 +694,32 @@ then per block, in block order (aligned 1:1 with `STAT`):
 
 ### 4.9 Registered: `CORR` — per-pair co-moment accumulators (Pearson correlation)
 
-For each tracked column pair, the six running co-moments — n, Σx, Σy, Σxy,
-Σx², Σy² — of the rows where **both** cells are numeric. They are everything
-Pearson's correlation coefficient needs, so a reader answers `correlation(a,
-b)` from the sidecar alone with no row scan:
+For each tracked column pair, six values — n and the running **means and
+centred moments** (`mean_x`, `mean_y`, `M2_x = Σ(x−x̄)²`, `M2_y = Σ(y−ȳ)²`,
+`C_xy = Σ(x−x̄)(y−ȳ)`) — over the rows where **both** cells are numeric. They
+are everything Pearson's correlation coefficient needs, so a reader answers
+`correlation(a, b)` from the sidecar alone with no row scan:
 
 ```
-r = (n·Σxy − Σx·Σy) / √((n·Σx² − (Σx)²)(n·Σy² − (Σy)²))
+r = C_xy / √(M2_x · M2_y)
 ```
 
 The pair population is the STAT one restricted to rows numeric in **both**
 columns (§4.1 numeric interpretation — DateTime as Excel serial, bool as
 0/1, numeric strings as their value); the header row is excluded, and a row
-where either cell is non-numeric feeds neither the pair's n nor any sum. The
-six sums are plainly ADDITIVE, so the accumulator is **mergeable by
-construction**: it composes across auto-split members, shards and future
-stitched files exactly like the sketch family (sum the corresponding sums).
+where either cell is non-numeric feeds neither the pair's n nor any moment.
+
+**Centred, not raw sums — a deliberate choice.** The moments are accumulated
+by the Welford update (each observation shifts the means by 1/n of its
+residual and updates the centred moments). This avoids the textbook
+`n·Σxy − Σx·Σy` form, which subtracts two large like-sized quantities and
+loses precision exactly on the most ordinary export column — a timestamp or
+date serial, whose values are huge relative to their spread. The centred
+form is **still mergeable by construction** via Chan's parallel algorithm:
+two states combine by exact algebra on (n, means, moments), with
+`na·nb / (na+nb)` weighting on the mean-difference terms, so `CORR` composes
+across auto-split members, shards and future stitched files like the sketch
+family.
 
 **Payload**, repeated per sheet in core-body order:
 
@@ -724,19 +734,17 @@ then per pair, in ascending (`column_a`, `column_b`) order:
 | 2 | `column_a` — uint16, **1-based**; MUST be ≥ 1 |
 | 2 | `column_b` — uint16, **1-based**; MUST be > `column_a` |
 | 8 | `n` — uint64, the count of rows numeric in both columns |
-| 8 | `sum_x` — little-endian double, Σx over those rows |
-| 8 | `sum_y` — little-endian double, Σy |
-| 8 | `sum_xy` — little-endian double, Σxy |
-| 8 | `sum_x2` — little-endian double, Σx² |
-| 8 | `sum_y2` — little-endian double, Σy² |
+| 8 | `mean_x` — little-endian double, x̄ over those rows |
+| 8 | `mean_y` — little-endian double, ȳ |
+| 8 | `m2_x` — little-endian double, Σ(x−x̄)² |
+| 8 | `m2_y` — little-endian double, Σ(y−ȳ)² |
+| 8 | `c_xy` — little-endian double, Σ(x−x̄)(y−ȳ) |
 
 The 48-byte accumulator layout (uint64 n then five doubles) is fixed, so the
-section frames pairs by count, not by a length prefix. A reader computes r
-from the sums and clamps it to [-1, 1]; the coefficient is **undefined**
-(the reader reports no value) when n < 2 or either column has zero variance.
-The moment form is exact to a rounding whisker on real-world magnitudes but
-subtracts like-sized quantities, so extreme values with tiny variance can
-lose precision — the standard trade for O(1) mergeable state.
+section frames pairs by count, not by a length prefix. A reader computes
+`r = C_xy / √(M2_x · M2_y)` and clamps it to [-1, 1]; the coefficient is
+**undefined** (the reader reports no value) when n < 2 or either column has
+zero variance (`M2 ≤ 0`).
 
 ### 4.10 Reserved tags
 
@@ -858,7 +866,7 @@ Structural (on the payload alone):
     `block_count` equals the column's `STAT` block count, and the two row
     numbers per block stay inside the section. For `CORR` (§4.9): per pair,
     `1 ≤ column_a < column_b`, the 48-byte accumulator stays inside the
-    section, and — before r is *computed* — its five sums are finite. The
+    section, and — before r is *computed* — its five moments are finite. The
     reference decoder validates framing at decode time and payload internals
     lazily at first access.
 

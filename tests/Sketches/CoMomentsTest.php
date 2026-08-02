@@ -16,6 +16,26 @@ use Kolay\XlsxStream\Tests\TestCase;
  */
 class CoMomentsTest extends TestCase
 {
+    /** Numerically stable two-pass reference: means first, then centred moments. */
+    private function twoPassOracle(array $x, array $y): float
+    {
+        $n = count($x);
+        $mx = array_sum($x) / $n;
+        $my = array_sum($y) / $n;
+        $sxx = 0.0;
+        $syy = 0.0;
+        $sxy = 0.0;
+        for ($i = 0; $i < $n; $i++) {
+            $dx = $x[$i] - $mx;
+            $dy = $y[$i] - $my;
+            $sxx += $dx * $dx;
+            $syy += $dy * $dy;
+            $sxy += $dx * $dy;
+        }
+
+        return $sxy / sqrt($sxx * $syy);
+    }
+
     private function oracle(array $x, array $y): float
     {
         $n = count($x);
@@ -85,6 +105,28 @@ class CoMomentsTest extends TestCase
         }
         $this->assertLessThanOrEqual(1.0, $acc->pearson());
         $this->assertGreaterThanOrEqual(-1.0, $acc->pearson());
+    }
+
+    public function test_precision_holds_on_large_offset_values(): void
+    {
+        // The case the naive Σx² − (Σx)² form got silently wrong: a
+        // timestamp column — values huge relative to their spread. A
+        // one-hour Unix-epoch window correlated with a small measure.
+        mt_srand(97);
+        $base = 1_700_000_000; // ~2023 epoch seconds
+        $x = [];
+        $y = [];
+        $acc = new CoMoments();
+        for ($i = 0; $i < 50_000; $i++) {
+            $xi = $base + mt_rand(0, 3600);        // within one hour
+            $yi = ($xi - $base) * 0.5 + mt_rand(-100, 100) / 10;
+            $x[] = $xi;
+            $y[] = $yi;
+            $acc->add($xi, $yi);
+        }
+        // Centred form must track the STABLE two-pass oracle to near
+        // machine precision, not the 1e-2 error the sum form gave here.
+        $this->assertEqualsWithDelta($this->twoPassOracle($x, $y), $acc->pearson(), 1e-9);
     }
 
     public function test_accumulators_are_additive_under_merge(): void
