@@ -1168,6 +1168,70 @@ class StreamingXlsxReader
     }
 
     /**
+     * Equi-width histogram of a column over [min, max] — the shape of its
+     * distribution, answered from the t-digest CDF alone (zero row I/O).
+     * Returns $bins bins as `{lo, hi, count}` in ascending order: bin 0 is
+     * [min, edge₁] and each later bin (edgeᵢ, edgeᵢ₊₁], so they tile the
+     * range with no gap and no overlap. Counts come from the digest rank
+     * (CDF) at each edge and are accumulated with cumulative rounding, so
+     * they sum to the exact numeric total (columnStats count) with no drift.
+     *
+     * The counts are estimates (digest rank error, typically well under 1%
+     * of the column); the edges are exact. A constant column (max == min)
+     * has no range to divide and collapses to a single [min, max] bin
+     * holding every value. Chain-aware (min/max/count and the CDF all span
+     * an auto-split table). Null when the column has no t-digest to read a
+     * distribution from, or holds no numeric value.
+     *
+     * @return list<array{lo: float, hi: float, count: int}>|null
+     */
+    public function histogram(int|string $column, int $bins = 10): ?array
+    {
+        if (\is_string($column)) {
+            $column = $this->resolveColumnName($column) + 1;
+        }
+        if ($bins < 1) {
+            throw new \InvalidArgumentException("histogram bins must be >= 1; got {$bins}");
+        }
+
+        $stats = $this->columnStats($column);
+        if ($stats === null || $stats['count'] === 0 || $stats['min'] === null || $stats['max'] === null) {
+            return null;
+        }
+
+        $chain = $this->chain();
+        $digest = $chain !== null
+            ? $this->chainDigest($chain, $column)
+            : $this->loadRandomAccessIndex()?->columnDigest($this->currentEntry, $column);
+        if ($digest === null) {
+            return null;
+        }
+
+        $min = (float) $stats['min'];
+        $max = (float) $stats['max'];
+        $count = $stats['count'];
+
+        if ($max <= $min) {
+            return [['lo' => $min, 'hi' => $max, 'count' => $count]];
+        }
+
+        $result = [];
+        $cumPrev = 0;
+        $span = $max - $min;
+        for ($i = 0; $i < $bins; $i++) {
+            $lo = $min + $i * $span / $bins;
+            $hi = $min + ($i + 1) * $span / $bins;
+            // Last bin closes at max, where rank == 1, so the counts total
+            // exactly $count; earlier edges take the digest's CDF fraction.
+            $cumHi = $i === $bins - 1 ? $count : (int) round($count * ($digest->rank($hi) ?? 1.0));
+            $result[] = ['lo' => $lo, 'hi' => $hi, 'count' => max(0, $cumHi - $cumPrev)];
+            $cumPrev = $cumHi;
+        }
+
+        return $result;
+    }
+
+    /**
      * Deterministic rank certificate for a value $x from STAT zone maps:
      * `[lower, upper]` bounds the true count of numeric data cells ≤ $x.
      * `lower` sums blocks proven entirely below $x; `upper` sums blocks that
