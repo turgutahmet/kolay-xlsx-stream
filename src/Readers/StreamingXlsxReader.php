@@ -222,6 +222,20 @@ class StreamingXlsxReader
     private const LATEMAT_MAX_STRING_SURVIVOR_RATIO = 0.5;
 
     /**
+     * groupQuantile() pushdown gate. The pushdown answers each group from
+     * the TDGB superblocks, but a group narrower than a superblock covers
+     * none and is edge-scanned whole, so MANY small groups (calendar /
+     * category — the common case) become many independent seeks, slower than
+     * one coordinated pass. Below MIN_GROUPS the per-group seeks are
+     * negligible and the pushdown always wins; at or above it, the pushdown
+     * is kept only when whole-superblock merges cover at least MIN_MERGE of
+     * the data rows (otherwise it degenerates and the single pass is used).
+     */
+    private const GROUP_PUSHDOWN_MIN_GROUPS = 16;
+
+    private const GROUP_PUSHDOWN_MIN_MERGE = 0.5;
+
+    /**
      * cellXfs index → is-date bitmap from xl/styles.xml, resolved
      * lazily like the sst (styles are workbook-wide, so no per-sheet
      * invalidation). null when the archive has no styles.xml.
@@ -3376,19 +3390,26 @@ class StreamingXlsxReader
         $aggTracked = $chain === null && $index !== null
             && \in_array($aggregate, $index->rangeQuantileColumns($entry), true);
 
-        // Composition (pushdown) path.
+        // Composition (pushdown) path — taken only when it actually pays.
+        // Small groups cover no whole superblock, so per-group
+        // rangeQuantileDigest degenerates into one seek+scan per group; when
+        // there are many such groups a single coordinated pass is cheaper,
+        // so fall through to it (announced, so onFullScan stays honest).
         if ($chain === null && $index !== null && $groupCol !== null && $sorted && $aggTracked) {
-            $out = [];
-            foreach ($this->groupRowSpans($entry, $groupBy, $bucket, $index, $groupCol) as $span) {
-                $digest = $this->rangeQuantileDigest($entry, $aggregate, $span['first'], $span['last']);
-                $out[] = [
-                    'group' => $span['group'],
-                    'count' => $digest?->count() ?? 0,
-                    'quantile' => $digest?->quantile($q),
-                ];
-            }
+            $spans = $this->groupRowSpans($entry, $groupBy, $bucket, $index, $groupCol);
+            if ($this->groupPushdownPaysOff($spans, $index->rangeQuantileSuperblocks($entry, $aggregate), max(0, $this->rowCount() - 1))) {
+                $out = [];
+                foreach ($spans as $span) {
+                    $digest = $this->rangeQuantileDigest($entry, $aggregate, $span['first'], $span['last']);
+                    $out[] = [
+                        'group' => $span['group'],
+                        'count' => $digest?->count() ?? 0,
+                        'quantile' => $digest?->quantile($q),
+                    ];
+                }
 
-            return $out;
+                return $out;
+            }
         }
 
         // Honest-scan fallback (also the auto-split chain path): one pass
@@ -3397,7 +3418,8 @@ class StreamingXlsxReader
             $chain !== null => 'auto-split-chain',
             $index === null || $groupCol === null => 'column-not-indexed',
             ! $sorted => 'groupby-not-sorted',
-            default => 'aggregate-not-range-indexed',
+            ! $aggTracked => 'aggregate-not-range-indexed',
+            default => 'groups-smaller-than-superblock',
         };
 
         /** @var array<string, array{group: int|float, digest: TDigest|null}> $groups */
@@ -3416,6 +3438,49 @@ class StreamingXlsxReader
         }
 
         return $out;
+    }
+
+    /**
+     * Decide whether the groupQuantile() pushdown is worth it for this
+     * grouping, from the sidecar alone (no rows read). Few groups always win
+     * (their per-group seeks are negligible). With many groups, the pushdown
+     * is kept only when whole-superblock merges cover at least
+     * GROUP_PUSHDOWN_MIN_MERGE of the data rows; otherwise each small group is
+     * edge-scanned whole and the many independent seeks beat a single pass,
+     * so the caller falls back. A two-pointer walk over the (row-ordered)
+     * group spans and superblock spans sums the mergeable rows.
+     *
+     * @param  list<array{group: int|float, first: int, last: int}>  $spans
+     * @param  list<array{end_row: int, digest: TDigest}>|null  $superblocks
+     */
+    private function groupPushdownPaysOff(array $spans, ?array $superblocks, int $totalDataRows): bool
+    {
+        if ($superblocks === null || $superblocks === [] || $totalDataRows <= 0) {
+            return false;
+        }
+        if (\count($spans) < self::GROUP_PUSHDOWN_MIN_GROUPS) {
+            return true;
+        }
+
+        usort($spans, static fn (array $a, array $b): int => $a['first'] <=> $b['first']);
+
+        $mergeable = 0;
+        $gi = 0;
+        $n = \count($spans);
+        $prevEnd = 1; // header boundary — data rows begin at 2 (matches TDGB)
+        foreach ($superblocks as $sb) {
+            $spanStart = $prevEnd + 1;
+            $spanEnd = $sb['end_row'];
+            $prevEnd = $spanEnd;
+            while ($gi < $n && $spans[$gi]['last'] < $spanStart) {
+                $gi++;
+            }
+            if ($gi < $n && $spans[$gi]['first'] <= $spanStart && $spans[$gi]['last'] >= $spanEnd) {
+                $mergeable += $spanEnd - $spanStart + 1;
+            }
+        }
+
+        return $mergeable >= $totalDataRows * self::GROUP_PUSHDOWN_MIN_MERGE;
     }
 
     /**

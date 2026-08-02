@@ -121,6 +121,34 @@ class GroupQuantileTest extends TestCase
         $reader->close();
     }
 
+    public function test_many_small_groups_take_the_single_pass_not_per_group_scans(): void
+    {
+        // 40 sorted groups of 1000 rows each — every group is far smaller
+        // than a 16384-row superblock, so per-group pushdown would degenerate
+        // into 40 independent seek+scans (measured ~2x a single pass). The
+        // planner must take the single coordinated pass instead AND announce
+        // it, so onFullScan stays honest for a query that really scans.
+        $oracle = $this->writeFixture(40_000, function (int $i): array {
+            $g = intdiv($i - 1, 1_000) + 1; // 1..40, sorted ascending
+
+            return [$g, round((($i * 7919) % 10_000) + 0.5, 3)];
+        });
+
+        $scans = [];
+        $reader = StreamingXlsxReader::fromFile($this->testFile);
+        $reader->onFullScan(function (array $ctx) use (&$scans): void {
+            $scans[] = $ctx;
+        });
+
+        $result = $reader->groupQuantile('group', 'amount', 0.9);
+        $this->assertCount(40, $result);
+        $this->assertGroupsMatch($oracle, $result, 0.9);
+
+        $this->assertNotEmpty($scans, 'a degenerate pushdown must announce its scan');
+        $this->assertSame('groups-smaller-than-superblock', $scans[0]['reason']);
+        $reader->close();
+    }
+
     public function test_unsorted_group_column_falls_back_to_honest_scan(): void
     {
         // Non-monotone group ids → not contiguous → no pushdown basis.
