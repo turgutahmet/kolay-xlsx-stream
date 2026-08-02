@@ -56,6 +56,7 @@ class AutoSplitSpanTest extends TestCase
         $writer->withColumnStats([1, 2]);
         $writer->withColumnSketches([1, 2]);
         $writer->withTopValues([3]); // city: 5 distinct ≤ k → exact across the chain
+        $writer->withArgPointers([1]); // id is monotone: argmin in member 1, argmax in the last
         $writer->startFile(['id', 'amount', 'city', 'flag']);
 
         for ($i = 1; $i <= self::DATA_ROWS; $i++) {
@@ -256,6 +257,29 @@ class AutoSplitSpanTest extends TestCase
         $this->assertEquals($oracle, $got, 'chain-merged top values must equal the exact whole-table counts');
         // Sanity: the totals actually span both full sheets, not just one.
         $this->assertSame(self::DATA_ROWS, array_sum($got));
+    }
+
+    public function test_arg_pointers_span_the_chain(): void
+    {
+        $reader = $this->reader();
+
+        // id is 1..DATA_ROWS ascending, so the global minimum sits in
+        // member 1 and the global maximum in the last member — argMin/argMax
+        // must return GLOBAL rows that rowAt reads back to the extreme value.
+        $lo = $reader->argMin(1);
+        $hi = $reader->argMax(1);
+        $this->assertNotNull($lo);
+        $this->assertNotNull($hi);
+
+        $this->assertSame(1.0, $lo['value']);
+        $this->assertSame((float) self::DATA_ROWS, $hi['value']);
+
+        // The rows are logical (global) coordinates: min at the first data
+        // row, max at the very last — both crossing the sheet boundary.
+        $this->assertSame(2, $lo['row']);
+        $this->assertSame(self::GLOBAL_ROWS, $hi['row']);
+        $this->assertSame(1, (int) $reader->rowAt($lo['row'])[0]);
+        $this->assertSame(self::DATA_ROWS, (int) $reader->rowAt($hi['row'])[0]);
     }
 
     public function test_shards_cover_every_chain_sheet(): void

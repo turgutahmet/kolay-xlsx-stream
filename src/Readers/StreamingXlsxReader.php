@@ -1164,6 +1164,101 @@ class StreamingXlsxReader
     }
 
     /**
+     * Row that holds a column's global MINIMUM value, named straight from
+     * the ARGP sidecar (KXSI "ARGP") with no row scan: the writer stored,
+     * per STAT block, the earliest row achieving that block's extreme, so
+     * the whole-column argmin is the extreme block's stored row. Returns
+     * `{row, value}` where `row` is a rowAt() coordinate — a sheet row on a
+     * single sheet, a global logical row across an auto-split chain — and
+     * `value` is the STAT minimum it carries. Ties resolve to the first
+     * occurrence (earliest row). Null when the column carries no ARGP
+     * section (not opted in, no index) or held no numeric value at all.
+     *
+     * @return array{row: int, value: int|float}|null
+     */
+    public function argMin(int|string $column): ?array
+    {
+        return $this->argExtreme($column, false);
+    }
+
+    /**
+     * Row that holds a column's global MAXIMUM value — the argmax twin of
+     * argMin(): same ARGP-only, zero-scan lookup, same `{row, value}` shape
+     * and first-occurrence tie rule. See argMin() for the coordinate and
+     * null contracts.
+     *
+     * @return array{row: int, value: int|float}|null
+     */
+    public function argMax(int|string $column): ?array
+    {
+        return $this->argExtreme($column, true);
+    }
+
+    /**
+     * Shared argmin/argmax lookup. Walks the STAT blocks in row order
+     * picking the extreme block value with a strict comparison — so the
+     * FIRST block reaching the extreme wins and, the writer having recorded
+     * first-occurrence within a block, the returned row is the earliest one
+     * globally. On a chain every member contributes its blocks and the
+     * winner's member-local ARGP row is lifted to a global logical row;
+     * all-or-nothing like columnStats/topValues (a member missing the
+     * section answers null rather than covering only part of the table).
+     *
+     * @return array{row: int, value: int|float}|null
+     */
+    private function argExtreme(int|string $column, bool $wantMax): ?array
+    {
+        if (\is_string($column)) {
+            $column = $this->resolveColumnName($column) + 1;
+        }
+        $index = $this->loadRandomAccessIndex();
+        if ($index === null) {
+            return null;
+        }
+
+        $bestVal = null;
+        $bestRow = null;
+        $consider = function (array $stat, array $argp, callable $toRow) use ($wantMax, &$bestVal, &$bestRow): void {
+            foreach ($stat['blocks'] as $i => $block) {
+                if ($block['count'] === 0 || ! isset($argp[$i])) {
+                    continue;
+                }
+                $value = $wantMax ? $block['max'] : $block['min'];
+                $better = $bestVal === null || ($wantMax ? $value > $bestVal : $value < $bestVal);
+                if ($better) {
+                    $bestVal = $value;
+                    $bestRow = $toRow($argp[$i][$wantMax ? 'maxRow' : 'minRow']);
+                }
+            }
+        };
+
+        $chain = $this->chain();
+        if ($chain !== null) {
+            foreach ($chain as $m) {
+                $stat = $index->columnStats($m['entry'], $column);
+                $argp = $index->argPointers($m['entry'], $column);
+                if ($stat === null || $argp === null) {
+                    return null;
+                }
+                $consider($stat, $argp, fn (int $local): int => $m['globalStart'] + ($local - $m['dataStartLocal']));
+            }
+        } else {
+            $stat = $index->columnStats($this->currentEntry, $column);
+            $argp = $index->argPointers($this->currentEntry, $column);
+            if ($stat === null || $argp === null) {
+                return null;
+            }
+            $consider($stat, $argp, fn (int $local): int => $local);
+        }
+
+        if ($bestRow === null) {
+            return null;
+        }
+
+        return ['row' => $bestRow, 'value' => $bestVal];
+    }
+
+    /**
      * Register a hook fired whenever a query CANNOT push down and falls
      * back to a full row scan — an unindexed column on rowsWhere /
      * rowsWhereAll, or a groupBy column that is not sorted / not tracked
