@@ -584,6 +584,61 @@ $reader->sampleRows(1000, seed: 42);
 $reader->onFullScan(fn (array $ctx) => logger()->warning('full scan', $ctx));
 ```
 
+### Data profiling & exact analytics *(v3.4+)*
+
+The sidecar grows a profiling layer — a full per-column report, exact
+quantiles with a deterministic certificate, histograms, frequent values,
+and correlation — answered from the index cached at open, reading **no data
+rows** (`profile()` reads only the header once, bounded, to name columns):
+
+```php
+// Writer side, before startFile() — opt in to the extra sketches:
+$writer->withColumnSketches([2, 3])   // t-digest + HyperLogLog (quantiles, distinct)
+       ->withTopValues([4])           // frequent-items sketch (heavy hitters)
+       ->withCorrelations([2, 3])     // pairwise Pearson co-moments
+       ->withArgPointers([2]);        // rows holding each block's min/max
+
+// One call: a data-profiling report of a multi-GB S3 file, no row scan.
+$profile = $reader->profile();
+//   ['data_rows' => .., 'columns' => [2 => ['name' => 'amount', 'min' => ..,
+//     'percentiles' => ['p50' => ['value' => .., 'rank_lo' => .., 'rank_hi' => ..],
+//     'p95' => [..]], 'histogram' => [..], 'distinct' => .., 'top_values' => ..]],
+//    'correlations' => ['2,3' => 0.87]]
+
+// A quantile that PROVES its number: the estimate fenced by a zone-map
+// rank certificate (rank_hi − rank_lo is the residual uncertainty).
+$reader->explainQuantile('amount', 0.95);
+//   ['estimate' => .., 'rank_lo' => .., 'rank_hi' => ..,
+//    'exact_would_scan_blocks' => .., 'exact_est_bytes' => ..]
+
+// The EXACT quantile — bracketed by the certificate, then only the blocks
+// that could hold it are read; a budget degrades to the estimate, never throws:
+$reader->exactQuantile('amount', 0.95, maxScanBlocks: 8);
+//   ['value' => .., 'exact' => true, 'blocksScanned' => 4, 'exceeded' => false]
+
+// Distribution shape, heavy hitters, the row of an extreme, missing values:
+$reader->histogram('amount', bins: 20);       // {lo, hi, count} bins from the CDF
+$reader->topValues('status');                 // ['exact' => bool, 'values' => [..]]
+$reader->argMax('amount');                     // ['row' => 138, 'value' => 9999.0]
+$reader->countEmpty('amount');                 // non-numeric/missing data cells
+$reader->correlation('amount', 'score');       // exact Pearson r
+
+// Quantile of a ROW RANGE or a GROUP — from per-superblock digests:
+$reader->quantile('amount', 0.5, from: 1000, to: 5000);
+$reader->groupQuantile('region', 'amount', 0.9);
+
+// Scan tuning: late materialization is on by default when the planner
+// predicts a selective predicate; force it for A/B measurement.
+$reader->useLateMaterialization(true);
+```
+
+Every number comes from the sidecar (zero row I/O), so it is not free of
+CPU — `profile()` runs each column's sketch math; "one range request" is a
+statement about I/O, not latency. A percentile's certificate width tracks
+**row-order locality**, not value clustering: a column sorted by (or
+covarying with) the sheet's order certifies tightly, a scattered one is
+honestly reported as `[0, N]`. See [SPEC.md](SPEC.md) §4–§6 for the format.
+
 ### Integrity — verified reads & writes *(v3.3+)*
 
 For data that matters (payroll, HR, audit exports):
