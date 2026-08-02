@@ -111,6 +111,14 @@ class AutoSplitSpanTest extends TestCase
         $this->assertSame('asc', $stats['sorted']);
     }
 
+    public function test_count_empty_folds_across_the_chain(): void
+    {
+        // id is numeric on every data row, so its empty count is exactly 0
+        // across the chain — proving countEmpty folds all members and
+        // excludes the (text) header the raw 'other' tally would include.
+        $this->assertSame(0, $this->reader()->countEmpty(1));
+    }
+
     public function test_find_row_reaches_past_the_first_sheet(): void
     {
         $hit = $this->reader()->findRow(1, 2_000_000);

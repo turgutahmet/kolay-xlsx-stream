@@ -819,6 +819,31 @@ class StreamingXlsxReader
     }
 
     /**
+     * How many DATA rows hold no numeric value in $column — the missing
+     * side of columnStats()['count'], answered from the STAT zone maps
+     * alone (zero row I/O). A cell counts as empty when it is blank or
+     * non-numeric (the STAT `other` class, SPEC §4.1); the header row is
+     * excluded, so countEmpty(col) + columnStats(col)['count'] always
+     * equals the table's data-row count. This is the empty_count field of
+     * profile() and the honest denominator for a completeness ratio.
+     *
+     * Derived as data-rows − numeric-count rather than by reading the raw
+     * `other` tally: `other` folds in the text header, and this framing is
+     * header-safe by construction. Chain-aware (rowCount and columnStats
+     * both span an auto-split table). Returns null when the column carries
+     * no STAT — there is no basis to count from.
+     */
+    public function countEmpty(int|string $column): ?int
+    {
+        $stats = $this->columnStats($column);
+        if ($stats === null) {
+            return null;
+        }
+
+        return max(0, ($this->rowCount() - 1) - $stats['count']);
+    }
+
+    /**
      * Approximate value at quantile $q (0 = min .. 1 = max) of a
      * column's numeric values, answered from the sidecar's t-digest
      * sketch (KXSI "TDIG") alone — ZERO row data is read and, the index
