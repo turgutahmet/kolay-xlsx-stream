@@ -57,6 +57,7 @@ class AutoSplitSpanTest extends TestCase
         $writer->withColumnSketches([1, 2]);
         $writer->withTopValues([3]); // city: 5 distinct ≤ k → exact across the chain
         $writer->withArgPointers([1]); // id is monotone: argmin in member 1, argmax in the last
+        $writer->withCorrelations([1, 2]); // amount = 2*id → perfectly correlated across the chain
         $writer->startFile(['id', 'amount', 'city', 'flag']);
 
         for ($i = 1; $i <= self::DATA_ROWS; $i++) {
@@ -117,6 +118,13 @@ class AutoSplitSpanTest extends TestCase
         // across the chain — proving countEmpty folds all members and
         // excludes the (text) header the raw 'other' tally would include.
         $this->assertSame(0, $this->reader()->countEmpty(1));
+    }
+
+    public function test_correlation_folds_across_the_chain(): void
+    {
+        // amount = 2*id is a perfect positive linear relationship, so the
+        // chain-merged co-moments must report r == 1 across all members.
+        $this->assertEqualsWithDelta(1.0, $this->reader()->correlation(1, 2), 1e-9);
     }
 
     public function test_find_row_reaches_past_the_first_sheet(): void

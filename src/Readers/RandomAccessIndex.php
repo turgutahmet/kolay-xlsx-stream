@@ -3,6 +3,7 @@
 namespace Kolay\XlsxStream\Readers;
 
 use Kolay\XlsxStream\Exceptions\XlsxReadException;
+use Kolay\XlsxStream\Sketches\CoMoments;
 use Kolay\XlsxStream\Sketches\HyperLogLog;
 use Kolay\XlsxStream\Sketches\MisraGries;
 use Kolay\XlsxStream\Sketches\TDigest;
@@ -48,6 +49,8 @@ class RandomAccessIndex
     public const TAG_TOP_VALUES = 'TOPK';
 
     public const TAG_ARG_POINTER = 'ARGP';
+
+    public const TAG_CORRELATION = 'CORR';
 
     public const SORTED_ASC = 0x01;
     public const SORTED_DESC = 0x02;
@@ -147,7 +150,13 @@ class RandomAccessIndex
     /** @var array<string, array<int, list<array{minRow: int, maxRow: int}>>> per-block argmin/argmax rows (ARGP) */
     private array $columnArgPointersByEntry = [];
 
-    private function __construct(int $syncPeriod, array $totals, array $crcs, array $syncs, array $columnStats = [], array $syncPointCrcs = [], array $columnDigestPayloads = [], array $columnHllPayloads = [], array $columnStringStats = [], array $columnRangeQuantiles = [], array $columnTopValues = [], array $columnArgPointers = [])
+    /** @var array<string, array<string, string>> entry => "a,b" => serialized CoMoments (CORR) */
+    private array $columnCorrelationPayloadsByEntry = [];
+
+    /** @var array<string, array<string, CoMoments>> memoized deserialized co-moment accumulators */
+    private array $columnCorrelations = [];
+
+    private function __construct(int $syncPeriod, array $totals, array $crcs, array $syncs, array $columnStats = [], array $syncPointCrcs = [], array $columnDigestPayloads = [], array $columnHllPayloads = [], array $columnStringStats = [], array $columnRangeQuantiles = [], array $columnTopValues = [], array $columnArgPointers = [], array $columnCorrelations = [])
     {
         $this->syncPeriod = $syncPeriod;
         $this->totalRowsByEntry = $totals;
@@ -161,6 +170,7 @@ class RandomAccessIndex
         $this->columnRangeQuantilesByEntry = $columnRangeQuantiles;
         $this->columnTopValuePayloads = $columnTopValues;
         $this->columnArgPointersByEntry = $columnArgPointers;
+        $this->columnCorrelationPayloadsByEntry = $columnCorrelations;
     }
 
     public static function decode(string $payload): self
@@ -349,6 +359,7 @@ class RandomAccessIndex
         $columnRangeQuantiles = [];
         $columnTopValues = [];
         $columnArgPointers = [];
+        $columnCorrelations = [];
         $entryOrder = array_keys($totals);
         while ($cursor + 8 <= $bodyLen) {
             $tag = substr($body, $cursor, 4);
@@ -407,12 +418,17 @@ class RandomAccessIndex
                     substr($body, $cursor, $length),
                     $entryOrder
                 );
+            } elseif ($tag === self::TAG_CORRELATION) {
+                $columnCorrelations = self::decodeCorrSection(
+                    substr($body, $cursor, $length),
+                    $entryOrder
+                );
             }
 
             $cursor += $length;
         }
 
-        return new self($syncPeriod, $totals, $crcs, $syncs, $columnStats, $syncPointCrcs, $columnDigestPayloads, $columnHllPayloads, $columnStringStats, $columnRangeQuantiles, $columnTopValues, $columnArgPointers);
+        return new self($syncPeriod, $totals, $crcs, $syncs, $columnStats, $syncPointCrcs, $columnDigestPayloads, $columnHllPayloads, $columnStringStats, $columnRangeQuantiles, $columnTopValues, $columnArgPointers, $columnCorrelations);
     }
 
     /**
@@ -727,6 +743,47 @@ class RandomAccessIndex
     }
 
     /**
+     * Decode the CORR section: per sheet, a pair count, then per pair its
+     * two 1-based column indexes and the fixed 48-byte CoMoments payload.
+     * Only the framing is validated here (pair count, column ids, payload
+     * length); the accumulator's finiteness is checked lazily on access.
+     *
+     * @param  list<string>  $entryOrder
+     * @return array<string, array<string, string>>  entry => "a,b" => payload
+     */
+    private static function decodeCorrSection(string $data, array $entryOrder): array
+    {
+        $result = [];
+        $cursor = 0;
+        $len = strlen($data);
+        $payloadBytes = CoMoments::PAYLOAD_BYTES;
+
+        foreach ($entryOrder as $entry) {
+            if ($cursor + 2 > $len) {
+                throw XlsxReadException::corruptCentralDirectory('truncated CORR section sheet header');
+            }
+            $pairCount = unpack('v', substr($data, $cursor, 2))[1];
+            $cursor += 2;
+
+            for ($p = 0; $p < $pairCount; $p++) {
+                if ($cursor + 4 + $payloadBytes > $len) {
+                    throw XlsxReadException::corruptCentralDirectory("truncated CORR pair for sheet '{$entry}'");
+                }
+                $cols = unpack('va/vb', substr($data, $cursor, 4));
+                $cursor += 4;
+                if ($cols['a'] < 1 || $cols['b'] < 1 || $cols['a'] >= $cols['b']) {
+                    throw XlsxReadException::corruptCentralDirectory('CORR pair columns must be 1-based with a < b');
+                }
+                $payload = substr($data, $cursor, $payloadBytes);
+                $cursor += $payloadBytes;
+                $result[$entry][$cols['a'].','.$cols['b']] = $payload;
+            }
+        }
+
+        return $result;
+    }
+
+    /**
      * Parse a "TDIG" or "CHLL" TLV payload — both share one frame:
      * per-sheet records in core-body order, each listing (column,
      * payload_len, payload) triples. Only the framing is validated
@@ -980,6 +1037,48 @@ class RandomAccessIndex
     public function argPointerColumns(string $sheetEntry): array
     {
         return array_keys($this->columnArgPointersByEntry[$sheetEntry] ?? []);
+    }
+
+    /**
+     * Co-moment accumulator for a column pair (KXSI "CORR" section), or null
+     * when the sidecar carries no correlation for it. Column order does not
+     * matter — (a, b) and (b, a) resolve to the same pair. The deserialized
+     * accumulator is memoized; callers that merge across a chain must clone
+     * before mutating (the sums are all scalars, so clone is a safe copy).
+     */
+    public function correlation(string $sheetEntry, int $columnA, int $columnB): ?CoMoments
+    {
+        if ($columnA === $columnB) {
+            return null;
+        }
+        $key = $columnA < $columnB ? $columnA.','.$columnB : $columnB.','.$columnA;
+
+        if (isset($this->columnCorrelations[$sheetEntry][$key])) {
+            return $this->columnCorrelations[$sheetEntry][$key];
+        }
+        $payload = $this->columnCorrelationPayloadsByEntry[$sheetEntry][$key] ?? null;
+        if ($payload === null) {
+            return null;
+        }
+
+        return $this->columnCorrelations[$sheetEntry][$key] = CoMoments::deserialize($payload);
+    }
+
+    /**
+     * Column pairs that carry a CORR accumulator for the sheet, each as
+     * [a, b] with a < b.
+     *
+     * @return list<array{0: int, 1: int}>
+     */
+    public function correlationPairs(string $sheetEntry): array
+    {
+        $pairs = [];
+        foreach (array_keys($this->columnCorrelationPayloadsByEntry[$sheetEntry] ?? []) as $key) {
+            [$a, $b] = explode(',', (string) $key);
+            $pairs[] = [(int) $a, (int) $b];
+        }
+
+        return $pairs;
     }
 
     /**

@@ -844,6 +844,57 @@ class StreamingXlsxReader
     }
 
     /**
+     * Exact Pearson correlation between two columns, answered from the CORR
+     * co-moment accumulators alone (zero row I/O). The population is the rows
+     * where BOTH cells are numeric under the STAT interpretation; the header
+     * is excluded. Column order does not matter. Returns null when the pair
+     * was not tracked (withCorrelations), when the two columns are the same,
+     * or when the correlation is undefined (fewer than two shared
+     * observations, or a constant column).
+     *
+     * Chain-aware: the accumulators are mergeable, so a correlation over an
+     * auto-split table folds every member exactly (all-or-nothing — a member
+     * missing the pair answers null rather than covering only part).
+     */
+    public function correlation(int|string $columnA, int|string $columnB): ?float
+    {
+        if (\is_string($columnA)) {
+            $columnA = $this->resolveColumnName($columnA) + 1;
+        }
+        if (\is_string($columnB)) {
+            $columnB = $this->resolveColumnName($columnB) + 1;
+        }
+        if ($columnA === $columnB) {
+            return null;
+        }
+
+        $index = $this->loadRandomAccessIndex();
+        if ($index === null) {
+            return null;
+        }
+
+        $chain = $this->chain();
+        if ($chain !== null) {
+            $merged = null;
+            foreach ($chain as $m) {
+                $co = $index->correlation($m['entry'], $columnA, $columnB);
+                if ($co === null) {
+                    return null;
+                }
+                if ($merged === null) {
+                    $merged = clone $co;
+                } else {
+                    $merged->merge($co);
+                }
+            }
+
+            return $merged?->pearson();
+        }
+
+        return $index->correlation($this->currentEntry, $columnA, $columnB)?->pearson();
+    }
+
+    /**
      * Approximate value at quantile $q (0 = min .. 1 = max) of a
      * column's numeric values, answered from the sidecar's t-digest
      * sketch (KXSI "TDIG") alone — ZERO row data is read and, the index

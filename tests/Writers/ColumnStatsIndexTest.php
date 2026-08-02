@@ -126,12 +126,12 @@ class ColumnStatsIndexTest extends TestCase
 
     /**
      * Forward-compat gate for the still-reserved v3.4 tags (SPEC §4.9):
-     * CORR and SMPL are not yet registered, so today's reader MUST skip
-     * every one of them and still parse STAT + the core body. (STRZ, TDGB,
-     * TOPK and ARGP graduated to registered sections in v3.4.) This is the
-     * load-bearing proof that v3.4's new TLVs ship additively without
-     * stranding a v3.3 reader — the same guarantee 'ZZZZ' proves
-     * generically, pinned to the concrete reserved tags.
+     * SMPL is not yet registered, so today's reader MUST skip it and still
+     * parse STAT + the core body. (STRZ, TDGB, TOPK, ARGP and CORR graduated
+     * to registered sections in v3.4.) This is the load-bearing proof that
+     * v3.4's new TLVs ship additively without stranding a v3.3 reader — the
+     * same guarantee 'ZZZZ' proves generically, pinned to the concrete
+     * reserved tags.
      */
     public function test_decoder_skips_v34_reserved_tags(): void
     {
@@ -148,11 +148,11 @@ class ColumnStatsIndexTest extends TestCase
         $statPos = strpos($body, 'STAT');
 
         // Splice every still-reserved v3.4 tag (varied lengths, incl. 0)
-        // before STAT. STRZ, TDGB, TOPK and ARGP are intentionally absent —
-        // all are registered as of v3.4 and now decoded, so no longer
-        // skip-only.
+        // before STAT. STRZ, TDGB, TOPK, ARGP and CORR are intentionally
+        // absent — all are registered as of v3.4 and now decoded, so no
+        // longer skip-only.
         $spliced = '';
-        foreach (['CORR' => 3, 'SMPL' => 9] as $tag => $len) {
+        foreach (['SMPL' => 9] as $tag => $len) {
             $spliced .= $tag.pack('V', $len).str_repeat("\x5A", $len);
         }
         $body = substr($body, 0, $statPos).$spliced.substr($body, $statPos);

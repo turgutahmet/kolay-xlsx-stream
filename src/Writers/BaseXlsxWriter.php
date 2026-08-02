@@ -3,6 +3,7 @@
 namespace Kolay\XlsxStream\Writers;
 
 use Kolay\XlsxStream\Exceptions\XlsxStreamException;
+use Kolay\XlsxStream\Sketches\CoMoments;
 use Kolay\XlsxStream\Sketches\HyperLogLog;
 use Kolay\XlsxStream\Sketches\MisraGries;
 use Kolay\XlsxStream\Sketches\TDigest;
@@ -351,6 +352,18 @@ abstract class BaseXlsxWriter
 
     /** @var array<string, array<int, list<array{minRow: int, maxRow: int}>>> finished: entry => col => per-block arg rows */
     protected array $indexArgPointers = [];
+
+    /** @var list<int> 1-based columns tracked for pairwise correlation (CORR) */
+    protected array $correlationColumns = [];
+
+    /** @var list<array{0: int, 1: int}> the C(k,2) column pairs (colA < colB) */
+    protected array $correlationPairs = [];
+
+    /** @var array<string, CoMoments> current-sheet co-moment accumulator per pair key "a,b" */
+    protected array $coMomentAccum = [];
+
+    /** @var array<string, array<string, string>> finished: entry => pairKey => serialized CoMoments */
+    protected array $indexCorrelations = [];
 
     public function __construct()
     {
@@ -772,6 +785,55 @@ abstract class BaseXlsxWriter
         // must also carry STAT — union in, never clobber an existing set.
         $this->statsColumns = array_values(array_unique(array_merge($this->statsColumns, $columns)));
         sort($this->statsColumns);
+
+        if (! $this->randomAccessIndexEnabled) {
+            $this->withRandomAccessIndex();
+        }
+
+        return $this;
+    }
+
+    /**
+     * Track pairwise Pearson correlation among the given 1-based columns:
+     * every unordered pair gets one CoMoments accumulator (n, Σx, Σy, Σxy,
+     * Σx², Σy²), so a reader answers correlation(a, b) from the sidecar with
+     * no scan. Only rows where BOTH cells are numeric (the same numeric
+     * interpretation STAT uses — DateTime as Excel serial, bool as 0/1,
+     * numeric strings as their value) feed a pair; the header is excluded.
+     *
+     * Cost is quadratic in the column count: k columns hold C(k, 2) pairs at
+     * 48 bytes each and cost k²/2 multiply-adds per row, so this is meant for
+     * a handful of measure columns, not every column. Accumulators are
+     * mergeable, so correlations compose across an auto-split chain like the
+     * sketches. Implies the random-access index. Call before startFile().
+     */
+    public function withCorrelations(array $columns): self
+    {
+        if ($this->started) {
+            throw XlsxStreamException::alreadyStarted();
+        }
+        foreach ($columns as $col) {
+            if (! is_int($col) || $col < 1 || $col > self::MAX_COLUMNS) {
+                throw new XlsxStreamException(
+                    'withCorrelations() expects 1-based integer column indexes; got: '.var_export($col, true)
+                );
+            }
+        }
+
+        $columns = array_values(array_unique($columns));
+        sort($columns);
+        if (count($columns) < 2) {
+            throw new XlsxStreamException('withCorrelations() needs at least two distinct columns.');
+        }
+
+        $this->correlationColumns = $columns;
+        $pairs = [];
+        for ($i = 0, $n = count($columns); $i < $n; $i++) {
+            for ($j = $i + 1; $j < $n; $j++) {
+                $pairs[] = [$columns[$i], $columns[$j]];
+            }
+        }
+        $this->correlationPairs = $pairs;
 
         if (! $this->randomAccessIndexEnabled) {
             $this->withRandomAccessIndex();
@@ -1253,6 +1315,9 @@ abstract class BaseXlsxWriter
         }
         if ($this->topValuesColumns !== []) {
             $this->accumulateTopValues($row);
+        }
+        if ($this->correlationPairs !== []) {
+            $this->accumulateCorrelations($row);
         }
 
         $rowXml = $this->buildRowXml($this->currentSheetRow, $row, $styleId);
@@ -1736,6 +1801,31 @@ abstract class BaseXlsxWriter
     }
 
     /**
+     * Fold one DATA row into every tracked column pair's co-moments (CORR).
+     * Each column's numeric value is resolved once per row (a column sits in
+     * up to k−1 pairs), then a pair accumulates only when BOTH sides are
+     * numeric and finite — the aligned-observation rule Pearson requires.
+     */
+    protected function accumulateCorrelations(array $row): void
+    {
+        if (! array_is_list($row)) {
+            $row = array_values($row);
+        }
+
+        $vals = [];
+        foreach ($this->correlationColumns as $col) {
+            $v = $this->statNumericValue($row[$col - 1] ?? null);
+            $vals[$col] = ($v !== null && is_finite($v)) ? $v : null;
+        }
+
+        foreach ($this->correlationPairs as [$a, $b]) {
+            if ($vals[$a] !== null && $vals[$b] !== null) {
+                $this->coMomentAccum[$a.','.$b]->add($vals[$a], $vals[$b]);
+            }
+        }
+    }
+
+    /**
      * Fold one data row's tracked numeric values into the current open
      * superblock digest (TDGB). One shared row counter drives the
      * sync-snapped superblock close in flushRowBuffer.
@@ -2130,7 +2220,8 @@ abstract class BaseXlsxWriter
             $columnStringStats,
             $this->indexRangeSuperblocks,
             $this->indexTopValues,
-            $this->indexArgPointers
+            $this->indexArgPointers,
+            $this->indexCorrelations
         );
     }
 
@@ -2256,6 +2347,13 @@ abstract class BaseXlsxWriter
         if ($this->topValuesColumns !== []) {
             foreach ($this->topValuesColumns as $col) {
                 $this->topValueSketches[$col] = new MisraGries($this->topValuesK);
+            }
+        }
+
+        // Fresh sheet -> fresh co-moment accumulators (per-sheet, mergeable).
+        if ($this->correlationPairs !== []) {
+            foreach ($this->correlationPairs as [$a, $b]) {
+                $this->coMomentAccum[$a.','.$b] = new CoMoments();
             }
         }
 
@@ -2613,6 +2711,14 @@ abstract class BaseXlsxWriter
             $entry = $sheetInfo['filename'];
             foreach ($this->topValuesColumns as $col) {
                 $this->indexTopValues[$entry][$col] = $this->topValueSketches[$col]->serialize();
+            }
+        }
+
+        // Snapshot the sheet's co-moment accumulators in serialized form.
+        if ($this->correlationPairs !== []) {
+            $entry = $sheetInfo['filename'];
+            foreach ($this->correlationPairs as [$a, $b]) {
+                $this->indexCorrelations[$entry][$a.','.$b] = $this->coMomentAccum[$a.','.$b]->serialize();
             }
         }
     }

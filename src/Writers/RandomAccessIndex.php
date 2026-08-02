@@ -139,6 +139,8 @@ class RandomAccessIndex
 
     public const TAG_ARG_POINTER = 'ARGP';
 
+    public const TAG_CORRELATION = 'CORR';
+
     public const SORTED_ASC = 0x01;
     public const SORTED_DESC = 0x02;
 
@@ -167,7 +169,7 @@ class RandomAccessIndex
      *     1-based column => serialized HyperLogLog payload. Pass [] to omit
      *     the CHLL section entirely.
      */
-    public static function encode(int $syncPeriod, array $sheets, array $columnStats = [], array $syncPointCrcs = [], array $columnDigests = [], array $columnHlls = [], array $columnStringStats = [], array $columnRangeQuantiles = [], array $columnTopValues = [], array $columnArgPointers = []): string
+    public static function encode(int $syncPeriod, array $sheets, array $columnStats = [], array $syncPointCrcs = [], array $columnDigests = [], array $columnHlls = [], array $columnStringStats = [], array $columnRangeQuantiles = [], array $columnTopValues = [], array $columnArgPointers = [], array $columnCorrelations = []): string
     {
         $body = '';
         foreach ($sheets as $sheet) {
@@ -314,6 +316,26 @@ class RandomAccessIndex
                 }
             }
             $body .= self::TAG_ARG_POINTER.pack('V', strlen($argp)).$argp;
+        }
+
+        // CORR — per-pair co-moment accumulators for exact Pearson
+        // correlation. Per sheet in core-body order: pair count, then per
+        // pair its two 1-based column indexes (ascending) and the fixed
+        // 48-byte CoMoments payload.
+        if ($columnCorrelations !== []) {
+            $corr = '';
+            foreach ($sheets as $sheet) {
+                // Insertion order is canonical: pairs were built (a, b) with
+                // a < b, outer a ascending — a numeric order a string ksort
+                // would break ("10,2" before "2,3").
+                $pairs = $columnCorrelations[$sheet['entry']] ?? [];
+                $corr .= pack('v', count($pairs));
+                foreach ($pairs as $key => $payload) {
+                    [$a, $b] = explode(',', $key);
+                    $corr .= pack('vv', (int) $a, (int) $b).$payload;
+                }
+            }
+            $body .= self::TAG_CORRELATION.pack('V', strlen($corr)).$corr;
         }
 
         $header = self::MAGIC;
