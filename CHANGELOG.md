@@ -5,6 +5,94 @@ All notable changes to `kolay/xlsx-stream` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — 3.5.0
+
+Template mode: stream rows into a layout another producer authored. A
+backward-compatible minor — the classic writer's output stays byte-identical,
+the KXSI format byte stays `2`, [SPEC.md](SPEC.md) is unchanged, and the
+`Source` contract is untouched. No breaking API changes.
+
+The expensive part of an .xlsx is not its layout, it is its rows. A sheet is
+cut once at `<sheetData>`, the rows are streamed into the cut, and every other
+archive entry is moved across without being inflated. The template also serves
+as a style oracle: the sample rows below `dataStartRow` are read, not written,
+and their `s="…"` ids tell the writer how that producer encoded each style.
+
+### Added
+
+- **`Templates\Template`** — `open(Source|string)`, `fromString()`,
+  `sheetNames()`, `sheet(name, dataStartRow)`, `close()`. Built on the existing
+  reader stack, so a template can live on S3 as readily as on disk.
+- **`Templates\TemplateSheet`** — the seam: head, header rows, tail, the
+  per-variant style map and row attributes. Parsed once, used many times.
+- **`SinkableXlsxWriter::fromTemplate($sink, $template, maxUniqueStrings?)`**
+  and **`BaseXlsxWriter::useTemplate()`** — enter template mode.
+- **`sheet(string $name, int $dataStartRow)`** — choose the sheet to stream
+  into; calling it again finalizes the current sheet and opens the next.
+- **`writeRow($row, $styleId = null, int $variant = 0)`** — `variant` picks
+  which sample row this row should look like. It is a separate argument on
+  purpose: `$styleId` never changes meaning with the writer's mode.
+- **`writeRows($rows, ?callable $variantFor)`** — the callback receives the
+  row and its ordinal, so zebra striping needs no counter.
+- **`Sources\StringSource`** — an in-memory `Source`, which makes opening a
+  template held in a string a zero-I/O operation.
+- **`Writers\SharedStringTable`** — appends to a template's shared strings,
+  preserving its indices, with a ceiling past which new strings are written
+  inline so memory stops growing.
+- **`StyleRegistry::fromStylesXml()`** — seeds the style table from the
+  template's own `styles.xml` and appends to it, so the ids its sample rows
+  hand out keep meaning what they meant. Blocks this package does not model
+  (borders, `dxfs`, `cellStyles`) survive untouched.
+
+### Behaviour worth knowing
+
+- **The template wins on formats.** A `DateTimeInterface` written into a
+  column the sample row styled takes that column's number format; the classic
+  datetime style is not applied. Past the sample's last styled cell the
+  template says nothing, so the classic rule applies through a format appended
+  on first use — data with no dates leaves `styles.xml` byte-identical.
+- **Text cells** join the template's `xl/sharedStrings.xml` when it has one,
+  which is what PhpSpreadsheet expects reading back; a template without that
+  part gets inline strings. Creating the part would need a new workbook
+  relationship and a new content type, which this design does not open.
+- **Untouched entries are moved, not rewritten** — the compressed body is
+  copied through, so the CRC and compressed size are the template's own and
+  stored entries stay stored.
+- **The random-access sidecar works** on the streamed sheet, and its content
+  type is declared in the template's `[Content_Types].xml`. Sheets carried
+  across untouched are not described by the sidecar; the reader answers from
+  them by scanning.
+- **Layout calls are refused, not half-applied.** `startFile()`,
+  `newSheet()`, `compact()`, `setHeaderStyle()`, `setColumnWidths()`,
+  `setAutoColumnWidth()`, `freezeFirstRow()`, `freezeRowsAndColumns()`,
+  `enableAutoFilter()`, `setColumnFormat()`, `clearColumnFormats()` and
+  `registerRowStyle()` throw in template mode, as does passing a style id to
+  `writeRow()`.
+- **Templates are validated up front.** A merge, auto filter, conditional
+  format, data validation, sort state or hyperlink whose range reaches
+  `dataStartRow` or below is refused, because the part below the data is
+  copied verbatim and such a range would cover only the rows the template
+  declared. A sheet backed by `<tableParts>` is refused for the same reason.
+  A sheet that binds SpreadsheetML only to a namespace prefix is refused,
+  because streamed rows are written unprefixed.
+- A file this package produced with `enableAutoFilter()` cannot serve as a
+  template: that filter spans the whole sheet by construction.
+
+### Measured
+
+- **17× faster, 14× less memory** than building the same 8,000 × 10 report
+  with PhpSpreadsheet. Ratios depend on the workload — PhpSpreadsheet's
+  per-row style cost is not linear — so [BENCHMARK.md §5](BENCHMARK.md)
+  reports each figure with the workload it came from.
+- **Parity: zero differences.** The same layout written entirely by
+  PhpSpreadsheet versus written by PhpSpreadsheet and streamed into, both read
+  back through PhpSpreadsheet: 400 rows × 6 columns compared on value, type,
+  number format, font, fill, borders, alignment, merges, widths, heights,
+  frozen pane and gridlines.
+- **About 4 % slower than the classic writer** at both 8,000 × 10 and
+  100,000 × 20. The shared string table costs no measurable time and about
+  12.8 MB for 100,000 distinct strings, bounded by `maxUniqueStrings`.
+
 ## [3.4.0] — 2026-08-02
 
 A backward-compatible minor: a data-profiling and exact-analytics layer on

@@ -36,8 +36,8 @@ has to be reinvented.
 
 ```php
 $template = Template::open('/tmp/layout.xlsx');
-$writer = SinkableXlsxWriter::fromTemplate($template, $sink);
-$writer->sheet('Leave', dataStartRow: 3);
+$writer = SinkableXlsxWriter::fromTemplate($sink, $template);
+$writer->sheet('Leaves', dataStartRow: 3);
 foreach ($rows as $i => $row) {
     $writer->writeRow($row, variant: $i % 2);   // zebra, styled by the template
 }
@@ -45,9 +45,21 @@ $writer->finishFile();   // untouched sheets + static parts copied byte-identica
 ```
 
 Measured on a real report (8,000 × 10 cells): **17× faster, 14× less memory**
-than building the same file with PhpSpreadsheet, and a PhpSpreadsheet
-round-trip over 80 cells shows **zero differences** in value, type, font, fill,
-border, alignment, number format, merge, width, height, freeze and gridlines.
+than building the same file with PhpSpreadsheet. Ratios move with the
+workload — PhpSpreadsheet's per-row style cost is not linear — so every
+figure is reported with the load it came from in
+[BENCHMARK.md §5](BENCHMARK.md) rather than reduced to one headline number.
+
+Parity is the acceptance criterion, not the speed: the same layout written
+entirely by PhpSpreadsheet versus written by PhpSpreadsheet and streamed into,
+both read back through PhpSpreadsheet, over 400 rows × 6 columns shows **zero
+differences** in value, type, font, fill, border, alignment, number format,
+merge, width, height, freeze and gridlines.
+
+Everything below the sample rows is copied verbatim, so a range drawn over
+them — an auto filter, a conditional format, a merge — is **refused** at open
+time rather than carried across to cover only the rows the template declared.
+A template's filter belongs on the header row.
 
 The classic writer is unaffected: template mode is a separate builder family
 behind one boolean, and existing golden outputs stay byte-identical. Everything

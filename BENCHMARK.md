@@ -385,6 +385,14 @@ count, while the streamed path never holds more than one row buffer. The
 output is 1.3 % larger because our style table appends rather than
 de-duplicating against entries it deliberately treats as opaque.
 
+**Read this ratio with its workload, not as a headline.** The README and the
+roadmap quote 17× faster and 14× less memory, measured on a real 8,000 × 10
+report where PhpSpreadsheet took 3.1 s. The 265× above is 20,000 × 6 where it
+took 28.4 s. Neither number is wrong and neither generalises: PhpSpreadsheet's
+per-row cost is dominated by the style objects it builds for every cell, so it
+grows faster than linearly with the row count while the streamed path stays
+flat. A number without its load is not a measurement.
+
 ### 5.3 Cost against this package's own classic writer
 
 `bench/template_bench.php` writes identical data through both paths onto

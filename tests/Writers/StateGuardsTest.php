@@ -6,11 +6,15 @@ use Kolay\XlsxStream\Tests\TestCase;
 
 use Kolay\XlsxStream\Exceptions\XlsxStreamException;
 use Kolay\XlsxStream\Sinks\FileSink;
+use Kolay\XlsxStream\Templates\Template;
 use Kolay\XlsxStream\Writers\SinkableXlsxWriter;
 
 class StateGuardsTest extends TestCase
 {
     private string $testFile;
+
+    /** @var list<string> */
+    private array $templates = [];
 
     protected function setUp(): void
     {
@@ -23,7 +27,80 @@ class StateGuardsTest extends TestCase
         if (file_exists($this->testFile)) {
             unlink($this->testFile);
         }
+        foreach ($this->templates as $path) {
+            @unlink($path);
+        }
+        $this->templates = [];
         parent::tearDown();
+    }
+
+    /**
+     * Entering template mode is a state transition like any other, and the
+     * two ends of the writer's life are where it must be refused: a writer
+     * that already started has emitted parts the template would replace, and
+     * a closed one has nothing left to write.
+     */
+    public function test_template_mode_cannot_be_entered_after_start_or_after_close()
+    {
+        $template = Template::open($this->minimalTemplate());
+
+        $started = new SinkableXlsxWriter(new FileSink($this->testFile));
+        $started->startFile(['a']);
+        try {
+            $started->useTemplate($template);
+            $this->fail('useTemplate() after startFile() should throw');
+        } catch (XlsxStreamException $e) {
+            $this->assertStringContainsString('already', $e->getMessage());
+        }
+        $started->writeRow(['x']);
+        $started->finishFile();
+
+        try {
+            $started->useTemplate($template);
+            $this->fail('useTemplate() after finishFile() should throw');
+        } catch (XlsxStreamException $e) {
+            $this->assertStringContainsString('closed', $e->getMessage());
+        }
+
+        $template->close();
+    }
+
+    public function test_a_finished_template_writer_refuses_further_work()
+    {
+        $out = sys_get_temp_dir().'/guards_tpl_'.uniqid().'.xlsx';
+        $writer = SinkableXlsxWriter::fromTemplate(new FileSink($out), $this->minimalTemplate());
+        $writer->sheet('Report', 2);
+        $writer->writeRow(['x']);
+        $writer->finishFile();
+
+        foreach ([
+            'sheet' => fn () => $writer->sheet('Report', 2),
+            'writeRow' => fn () => $writer->writeRow(['y']),
+            'finishFile' => fn () => $writer->finishFile(),
+        ] as $operation => $call) {
+            try {
+                $call();
+                $this->fail("{$operation}() after finishFile() should throw");
+            } catch (XlsxStreamException $e) {
+                $this->assertStringContainsString('closed', $e->getMessage(), $operation);
+            }
+        }
+
+        @unlink($out);
+    }
+
+    /** A one-sheet layout with a header row and a single sample row. */
+    private function minimalTemplate(): string
+    {
+        $path = sys_get_temp_dir().'/guards_tpl_src_'.uniqid().'.xlsx';
+        $writer = SinkableXlsxWriter::createForFile($path);
+        $writer->setHeaderStyle(['bold' => true]);
+        $writer->startFile(['Value']);
+        $writer->writeRow(['sample']);
+        $writer->finishFile();
+        $this->templates[] = $path;
+
+        return $path;
     }
 
     public function test_write_row_before_start_throws()
