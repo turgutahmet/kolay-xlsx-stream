@@ -129,6 +129,16 @@ final class SharedStringTable
         return $this->seedReferences + $this->references;
     }
 
+    /**
+     * True when the table is an untouched template seed, so the template's
+     * own sharedStrings.xml can be moved into the output rather than
+     * re-rendered from its bytes.
+     */
+    public function isSeedUnmodified(): bool
+    {
+        return $this->seedXml !== null && $this->index === [];
+    }
+
     public function isEmpty(): bool
     {
         return $this->uniqueCount() === 0;

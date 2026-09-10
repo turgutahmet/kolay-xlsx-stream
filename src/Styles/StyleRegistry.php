@@ -120,6 +120,20 @@ class StyleRegistry
         return $registry;
     }
 
+    /**
+     * True when this registry is a template seed nothing has been appended
+     * to, so the template's own styles.xml can be moved into the output
+     * instead of re-rendered.
+     */
+    public function isSeedUnmodified(): bool
+    {
+        return $this->seeded
+            && $this->customNumFmts === []
+            && $this->fonts === []
+            && $this->fills === []
+            && $this->cellXfs === [];
+    }
+
     /** Seed table name => the child element whose occurrences define its size. */
     private const SEED_TABLE_CHILD = [
         'numFmts' => 'numFmt',

@@ -147,4 +147,78 @@ class XlsxStreamException extends \Exception
             'A template is a layout: put one row per style variant below dataStartRow, not a full report.'
         );
     }
+
+    /**
+     * Create exception for a sheet whose dialect the row builders cannot write into
+     */
+    public static function templateUnsupportedDialect(string $name): self
+    {
+        return new self(
+            "Template sheet '{$name}' binds SpreadsheetML only to a namespace prefix, ".
+            'never as the default namespace. Streamed rows are written unprefixed, so they '.
+            'would land in no namespace at all and Excel would offer to repair the file. '.
+            'Re-save the template from Excel or PhpSpreadsheet, which both declare the default namespace.'
+        );
+    }
+
+    /**
+     * Create exception for a template operation attempted before a sheet was chosen
+     */
+    public static function templateSheetNotSelected(): self
+    {
+        return new self(
+            'No template sheet is being streamed. Call sheet() with the sheet name '.
+            'and the row its data starts on before writing rows.'
+        );
+    }
+
+    /**
+     * Create exception for a template sheet chosen twice
+     */
+    public static function templateSheetAlreadyStreamed(string $name): self
+    {
+        return new self(
+            "Template sheet '{$name}' has already been streamed. ".
+            'Each sheet is cut once; write all of its rows before moving to the next.'
+        );
+    }
+
+    /**
+     * Create exception for a classic operation that template mode forbids
+     */
+    public static function templateModeForbids(string $operation, string $because): self
+    {
+        return new self("{$operation} is not available in template mode — {$because}.");
+    }
+
+    /**
+     * Create exception for a template operation attempted on a classic writer
+     */
+    public static function templateModeRequired(string $operation): self
+    {
+        return new self("{$operation} requires template mode. Attach a template with useTemplate() first.");
+    }
+
+    /**
+     * Create exception for a template attached to an already-configured writer
+     */
+    public static function templateConflictsWith(string $what): self
+    {
+        return new self(
+            "A template cannot be attached after {$what} — the template owns the layout. ".
+            'Call useTemplate() on a fresh writer.'
+        );
+    }
+
+    /**
+     * Create exception for a template sheet that ran past Excel's row limit
+     */
+    public static function templateSheetRowLimit(string $name, int $limit): self
+    {
+        return new self(
+            "Template sheet '{$name}' reached row {$limit}, Excel's per-sheet limit. ".
+            'Template mode cannot auto-split — the overflow sheet would have no layout to inherit. '.
+            'Split the data across template sheets yourself.'
+        );
+    }
 }
