@@ -107,4 +107,44 @@ class XlsxStreamException extends \Exception
             'ZIP64 writer support is tracked for a future release.'
         );
     }
+
+    /**
+     * Create exception for a template sheet name that is not in the workbook
+     */
+    public static function templateSheetNotFound(string $name, array $available): self
+    {
+        $list = $available === [] ? '(none)' : implode(', ', $available);
+
+        return new self("Template has no sheet named '{$name}'. Available: {$list}.");
+    }
+
+    /**
+     * Create exception for a template sheet with no sheetData element
+     */
+    public static function templateSheetDataMissing(string $entry): self
+    {
+        return new self("Template sheet '{$entry}' has no <sheetData> element to stream into.");
+    }
+
+    /**
+     * Create exception for a merge that reaches into the streamed data region
+     */
+    public static function templateMergeInDataRegion(string $ref, int $dataStartRow): self
+    {
+        return new self(
+            "Template merge '{$ref}' reaches row {$dataStartRow} or below, inside the data region. ".
+            'Merges over streamed rows are not supported; keep merges above dataStartRow.'
+        );
+    }
+
+    /**
+     * Create exception for a template whose sample-row block is implausibly large
+     */
+    public static function templateTooManySampleRows(int $count, int $max): self
+    {
+        return new self(
+            "Template declares {$count} sample rows (limit {$max}). ".
+            'A template is a layout: put one row per style variant below dataStartRow, not a full report.'
+        );
+    }
 }

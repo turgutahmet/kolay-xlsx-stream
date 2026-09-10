@@ -1,0 +1,426 @@
+<?php
+
+namespace Kolay\XlsxStream\Templates;
+
+use Kolay\XlsxStream\Exceptions\XlsxStreamException;
+use Kolay\XlsxStream\Readers\CellTokenizer;
+
+/**
+ * One template sheet cut at its `<sheetData>` seam.
+ *
+ * The cut is the whole of template mode's contact with a foreign sheet:
+ * everything before `<sheetData>` is `head`, the rows above `dataStartRow`
+ * are kept verbatim as `headerRowsXml`, the rows from `dataStartRow` on are
+ * consumed as SAMPLES (never emitted), and everything from `</sheetData>` on
+ * is `tail`, copied byte-for-byte. The package does not interpret the sheet;
+ * it opens one seam and closes it.
+ *
+ * A sample row is a **style-id oracle**: its cells' `s="…"` attributes say
+ * how the producing application encoded that row's look, so the writer can
+ * stamp the same ids on streamed rows without knowing anything about fonts,
+ * fills or number formats. One sample row per variant (zebra striping, a
+ * "missing" highlight) — `variant` selects among them at write time.
+ *
+ * Parsing is a hand-written forward scan rather than a regex with a lazy
+ * quantifier: sheet XML is attacker-reachable input and the package does not
+ * put backtracking-prone patterns anywhere it parses documents.
+ */
+class TemplateSheet
+{
+    /**
+     * A template is a layout, not a report. Past this many sample rows the
+     * caller almost certainly passed a full data file by mistake, and each
+     * sample would cost a parsed style map.
+     */
+    public const MAX_SAMPLE_ROWS = 256;
+
+    private function __construct(
+        private string $head,
+        private string $headerRowsXml,
+        private string $tail,
+        private int $dataStartRow,
+        /** @var list<array<int, int>> variant => 0-based column => cellXfs id */
+        private array $styleMaps,
+        /** @var list<array{ht: ?string, customHeight: bool, s: ?int, customFormat: bool}> */
+        private array $rowAttributes,
+        private string $prefix,
+    ) {
+    }
+
+    /** XML from the document start through the opening `<sheetData>` tag. */
+    public function head(): string
+    {
+        return $this->head;
+    }
+
+    /** The rows above `dataStartRow`, verbatim (may be empty). */
+    public function headerRowsXml(): string
+    {
+        return $this->headerRowsXml;
+    }
+
+    /** `</sheetData>` through the document end, verbatim. */
+    public function tail(): string
+    {
+        return $this->tail;
+    }
+
+    /** First sheet row number the streamed data occupies. */
+    public function dataStartRow(): int
+    {
+        return $this->dataStartRow;
+    }
+
+    /** How many style variants the template offers (always ≥ 1). */
+    public function variantCount(): int
+    {
+        return \count($this->styleMaps);
+    }
+
+    /**
+     * 0-based column index => cellXfs id for one variant. Columns the sample
+     * left unstyled are absent, so a caller writing past the sample's width
+     * simply gets no `s=` for those cells.
+     *
+     * @return array<int, int>
+     */
+    public function styleMap(int $variant): array
+    {
+        return $this->styleMaps[$this->normaliseVariant($variant)];
+    }
+
+    /**
+     * Row-level attributes copied from the sample: height (`ht`), whether it
+     * is a custom height, the row style id and custom-format flag.
+     *
+     * @return array{ht: ?string, customHeight: bool, s: ?int, customFormat: bool}
+     */
+    public function rowAttributes(int $variant): array
+    {
+        return $this->rowAttributes[$this->normaliseVariant($variant)];
+    }
+
+    /** Namespace prefix the sheet uses on its elements ('' or e.g. 'x:'). */
+    public function elementPrefix(): string
+    {
+        return $this->prefix;
+    }
+
+    private function normaliseVariant(int $variant): int
+    {
+        $count = \count($this->styleMaps);
+
+        return ($variant >= 0 && $variant < $count) ? $variant : 0;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Parsing
+    // ─────────────────────────────────────────────────────────────────────
+
+    /**
+     * Cut a sheet XML document at its `<sheetData>` seam.
+     *
+     * @param  string  $entry  zip entry name, for error messages
+     */
+    public static function parse(string $xml, int $dataStartRow, string $entry): self
+    {
+        if ($dataStartRow < 1) {
+            throw new XlsxStreamException("dataStartRow must be >= 1, got {$dataStartRow}.");
+        }
+
+        [$prefix, $openStart, $openEnd, $selfClosing] = self::locateSheetData($xml, $entry);
+
+        if ($selfClosing) {
+            // Normalise `<sheetData/>` into the open/close pair the writer
+            // needs to stream between.
+            $head = substr($xml, 0, $openStart).'<'.$prefix.'sheetData>';
+            $rowsRegion = '';
+            $tail = '</'.$prefix.'sheetData>'.substr($xml, $openEnd);
+        } else {
+            $head = substr($xml, 0, $openEnd);
+            $closeStart = self::locateSheetDataClose($xml, $prefix, $openEnd, $entry);
+            $rowsRegion = substr($xml, $openEnd, $closeStart - $openEnd);
+            $tail = substr($xml, $closeStart);
+        }
+
+        // <dimension> spans the whole used range, which a streaming write
+        // cannot know when head goes out — and it is optional in the schema
+        // (our own preamble never emits one). Drop it; Excel recomputes.
+        $head = self::stripDimension($head);
+
+        self::assertNoMergeInDataRegion($tail, $dataStartRow);
+
+        $rows = self::scanRows($rowsRegion, $prefix);
+
+        $headerRows = '';
+        $samples = [];
+        foreach ($rows as $row) {
+            if ($row['index'] < $dataStartRow) {
+                $headerRows .= $row['xml'];
+            } else {
+                $samples[] = $row;
+            }
+        }
+
+        if (\count($samples) > self::MAX_SAMPLE_ROWS) {
+            throw XlsxStreamException::templateTooManySampleRows(\count($samples), self::MAX_SAMPLE_ROWS);
+        }
+
+        $styleMaps = [];
+        $rowAttributes = [];
+        foreach ($samples as $sample) {
+            $styleMaps[] = self::scanCellStyles($sample['body'], $prefix);
+            $rowAttributes[] = self::parseRowAttributes($sample['attrs']);
+        }
+
+        if ($styleMaps === []) {
+            // No sample rows: one unstyled variant so writeRow() always has a
+            // variant to resolve against.
+            $styleMaps[] = [];
+            $rowAttributes[] = ['ht' => null, 'customHeight' => false, 's' => null, 'customFormat' => false];
+        }
+
+        return new self($head, $headerRows, $tail, $dataStartRow, $styleMaps, $rowAttributes, $prefix);
+    }
+
+    /**
+     * Find the `<sheetData>` opening tag, tolerating any namespace prefix.
+     *
+     * @return array{0: string, 1: int, 2: int, 3: bool} prefix, tag start, tag end (exclusive), self-closing
+     */
+    private static function locateSheetData(string $xml, string $entry): array
+    {
+        if (! preg_match('/<((?:[A-Za-z_][\w.\-]*:)?)sheetData(\s[^>]*?)?(\/?)>/', $xml, $m, PREG_OFFSET_CAPTURE)) {
+            throw XlsxStreamException::templateSheetDataMissing($entry);
+        }
+
+        return [
+            $m[1][0],
+            $m[0][1],
+            $m[0][1] + \strlen($m[0][0]),
+            $m[3][0] === '/',
+        ];
+    }
+
+    private static function locateSheetDataClose(string $xml, string $prefix, int $from, string $entry): int
+    {
+        if (! preg_match('/<\/'.preg_quote($prefix, '/').'sheetData\s*>/', $xml, $m, PREG_OFFSET_CAPTURE, $from)) {
+            throw XlsxStreamException::templateSheetDataMissing($entry);
+        }
+
+        return $m[0][1];
+    }
+
+    private static function stripDimension(string $head): string
+    {
+        $stripped = preg_replace(
+            '/<(?:[A-Za-z_][\w.\-]*:)?dimension\b[^>]*(?:\/>|>.*?<\/(?:[A-Za-z_][\w.\-]*:)?dimension\s*>)/s',
+            '',
+            $head,
+            1
+        );
+
+        return $stripped ?? $head;
+    }
+
+    /**
+     * A merge that reaches into the streamed rows would need the writer to
+     * rewrite the tail against a row count it only learns at the end — the
+     * second seam this design refuses to open. Reject it loudly.
+     */
+    private static function assertNoMergeInDataRegion(string $tail, int $dataStartRow): void
+    {
+        if (! preg_match_all('/<(?:[A-Za-z_][\w.\-]*:)?mergeCell\b[^>]*?\bref="([^"]+)"/', $tail, $matches)) {
+            return;
+        }
+
+        foreach ($matches[1] as $ref) {
+            foreach (explode(':', $ref) as $corner) {
+                if (preg_match('/(\d+)\s*$/', $corner, $rm) && (int) $rm[1] >= $dataStartRow) {
+                    throw XlsxStreamException::templateMergeInDataRegion($ref, $dataStartRow);
+                }
+            }
+        }
+    }
+
+    /**
+     * Forward scan over `<row>` elements. Rows carry their number in `r`;
+     * a producer that omits it (our own compact mode) is numbered
+     * positionally from the previous row.
+     *
+     * @return list<array{xml: string, attrs: string, body: string, index: int}>
+     */
+    private static function scanRows(string $region, string $prefix): array
+    {
+        $open = '<'.$prefix.'row';
+        $close = '</'.$prefix.'row';
+        $openLen = \strlen($open);
+
+        $rows = [];
+        $cursor = 0;
+        $previousIndex = 0;
+
+        while (true) {
+            $start = strpos($region, $open, $cursor);
+            if ($start === false) {
+                break;
+            }
+            if (! self::isTagBoundary($region[$start + $openLen] ?? '')) {
+                $cursor = $start + $openLen; // e.g. <rowBreaks>
+                continue;
+            }
+
+            $tagEnd = self::tagEnd($region, $start + $openLen);
+            if ($tagEnd === false) {
+                break;
+            }
+            $selfClosing = ($region[$tagEnd - 1] ?? '') === '/';
+            $attrs = substr(
+                $region,
+                $start + $openLen,
+                $tagEnd - ($start + $openLen) - ($selfClosing ? 1 : 0)
+            );
+
+            if ($selfClosing) {
+                $end = $tagEnd + 1;
+                $body = '';
+            } else {
+                $closePos = strpos($region, $close, $tagEnd);
+                if ($closePos === false) {
+                    break;
+                }
+                $closeEnd = self::tagEnd($region, $closePos + \strlen($close));
+                if ($closeEnd === false) {
+                    break;
+                }
+                $body = substr($region, $tagEnd + 1, $closePos - $tagEnd - 1);
+                $end = $closeEnd + 1;
+            }
+
+            $index = preg_match('/(?<![A-Za-z])r="(\d+)"/', $attrs, $m)
+                ? (int) $m[1]
+                : $previousIndex + 1;
+            $previousIndex = $index;
+
+            $rows[] = [
+                'xml' => substr($region, $start, $end - $start),
+                'attrs' => $attrs,
+                'body' => $body,
+                'index' => $index,
+            ];
+            $cursor = $end;
+        }
+
+        return $rows;
+    }
+
+    /**
+     * Sample row → 0-based column => cellXfs id. Only styled cells land in
+     * the map; an unstyled sample cell means "no `s=` for this column".
+     *
+     * @return array<int, int>
+     */
+    private static function scanCellStyles(string $body, string $prefix): array
+    {
+        $open = '<'.$prefix.'c';
+        $close = '</'.$prefix.'c';
+        $openLen = \strlen($open);
+
+        $map = [];
+        $cursor = 0;
+        $previousColumn = -1;
+
+        while (true) {
+            $start = strpos($body, $open, $cursor);
+            if ($start === false) {
+                break;
+            }
+            if (! self::isTagBoundary($body[$start + $openLen] ?? '')) {
+                $cursor = $start + $openLen; // e.g. <col…> is not <c…>
+                continue;
+            }
+
+            $tagEnd = self::tagEnd($body, $start + $openLen);
+            if ($tagEnd === false) {
+                break;
+            }
+            $selfClosing = ($body[$tagEnd - 1] ?? '') === '/';
+            $attrs = substr(
+                $body,
+                $start + $openLen,
+                $tagEnd - ($start + $openLen) - ($selfClosing ? 1 : 0)
+            );
+
+            $column = preg_match('/(?<![A-Za-z])r="([A-Z]+)\d*"/', $attrs, $m)
+                ? CellTokenizer::columnLettersToIndex($m[1])
+                : $previousColumn + 1;
+            $previousColumn = $column;
+
+            if (preg_match('/(?<![A-Za-z])s="(\d+)"/', $attrs, $m)) {
+                $map[$column] = (int) $m[1];
+            }
+
+            if ($selfClosing) {
+                $cursor = $tagEnd + 1;
+
+                continue;
+            }
+            $closePos = strpos($body, $close, $tagEnd);
+            $closeEnd = $closePos === false ? false : self::tagEnd($body, $closePos + \strlen($close));
+            $cursor = $closeEnd === false ? $tagEnd + 1 : $closeEnd + 1;
+        }
+
+        ksort($map);
+
+        return $map;
+    }
+
+    /**
+     * Row attributes worth carrying onto streamed rows. Each lookup is
+     * lookbehind-guarded so `customHeight="1"` cannot be read as `ht="1"`
+     * and `spans="1:4"` cannot be read as the row style `s="…"`.
+     *
+     * @return array{ht: ?string, customHeight: bool, s: ?int, customFormat: bool}
+     */
+    private static function parseRowAttributes(string $attrs): array
+    {
+        return [
+            'ht' => preg_match('/(?<![A-Za-z])ht="([^"]*)"/', $attrs, $m) ? $m[1] : null,
+            'customHeight' => (bool) preg_match('/(?<![A-Za-z])customHeight="(?:1|true)"/', $attrs),
+            's' => preg_match('/(?<![A-Za-z])s="(\d+)"/', $attrs, $m) ? (int) $m[1] : null,
+            'customFormat' => (bool) preg_match('/(?<![A-Za-z])customFormat="(?:1|true)"/', $attrs),
+        ];
+    }
+
+    private static function isTagBoundary(string $char): bool
+    {
+        return $char === ' ' || $char === '>' || $char === '/' || $char === "\t" || $char === "\n" || $char === "\r";
+    }
+
+    /**
+     * Offset of the '>' closing the tag that starts at $from, respecting
+     * quoted attribute values. Same walk CellTokenizer uses.
+     */
+    private static function tagEnd(string $s, int $from): int|false
+    {
+        $i = $from;
+        $len = \strlen($s);
+
+        while ($i < $len) {
+            $i += strcspn($s, '>"\'', $i);
+            if ($i >= $len) {
+                return false;
+            }
+            if ($s[$i] === '>') {
+                return $i;
+            }
+            $closing = strpos($s, $s[$i], $i + 1);
+            if ($closing === false) {
+                return false;
+            }
+            $i = $closing + 1;
+        }
+
+        return false;
+    }
+}
