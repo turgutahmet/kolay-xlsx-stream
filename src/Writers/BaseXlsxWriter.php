@@ -405,6 +405,15 @@ abstract class BaseXlsxWriter
     protected array $templateRowSuffixes = [];
 
     /**
+     * Template mode: 0-based columns whose string values are written as text
+     * even when they look numeric. Filled from the 1-based indexes passed to
+     * textColumns() and cleared by the next sheet().
+     *
+     * @var array<int, true>
+     */
+    protected array $templateTextColumns = [];
+
+    /**
      * cellXfs id for a date written into a column the sample rows never
      * styled. Registered lazily, so a template whose data is all text or
      * numbers keeps its styles.xml byte-identical.
@@ -2990,11 +2999,60 @@ abstract class BaseXlsxWriter
         }
 
         $this->templateSheet = $sheet;
+        $this->templateTextColumns = [];
         $this->templateSheetName = $name;
         $this->templateSheetEntry = $entry;
         $this->started = true;
         $this->currentSheetIndex++;
         $this->startTemplateSheet();
+
+        return $this;
+    }
+
+    /**
+     * Declare which columns of the current template sheet hold text, so a
+     * value like "12345678901" is written as a string rather than the number
+     * the type rules would otherwise infer.
+     *
+     *   $writer->sheet('Employees', dataStartRow: 3)->textColumns([1, 4]);
+     *
+     * A numeric-looking string is normally written as a number unless
+     * precision would be lost — a leading zero, a leading plus, or more than
+     * fifteen digits. A national identity number, a tax number or an account
+     * number sits inside that window, so it would silently become a
+     * right-aligned number Excel may even render in scientific notation.
+     * This is the column-level counterpart of PhpSpreadsheet's
+     * setCellValueExplicit(TYPE_STRING).
+     *
+     * Columns are 1-based, as everywhere else in this package. The
+     * declaration governs STRING values only: an int stays an int, so pass
+     * the identifier as a string when you want it written as text. It applies
+     * to the sheet chosen by the last sheet() call and the next sheet()
+     * clears it, which is why calling it before choosing a sheet throws
+     * rather than being quietly dropped.
+     *
+     * @param  list<int>  $columns  1-based column indexes
+     */
+    public function textColumns(array $columns): self
+    {
+        if ($this->closed) {
+            throw XlsxStreamException::writerAlreadyClosed();
+        }
+        if (! $this->templateMode) {
+            throw XlsxStreamException::templateModeRequired('textColumns()');
+        }
+        if ($this->templateSheet === null) {
+            throw XlsxStreamException::templateSheetNotSelected();
+        }
+
+        $map = [];
+        foreach ($columns as $column) {
+            if ($column < 1) {
+                throw new XlsxStreamException("Column index must be >= 1, got {$column}.");
+            }
+            $map[$column - 1] = true;
+        }
+        $this->templateTextColumns = $map;
 
         return $this;
     }
@@ -3169,6 +3227,7 @@ abstract class BaseXlsxWriter
         $this->assertTemplateRowUnstyled($rowStyleId);
 
         $styleMap = $this->templateStyleMaps[$variant] ?? $this->templateStyleMaps[0];
+        $text = $this->templateTextColumns;
         $count = count($data);
         if ($count > 0 && ! isset($this->colLetterCache[$count])) {
             for ($c = 1; $c <= $count; $c++) {
@@ -3193,7 +3252,7 @@ abstract class BaseXlsxWriter
                     continue;
                 }
 
-                if (is_numeric($value)) {
+                if (! isset($text[$index]) && is_numeric($value)) {
                     if ($this->shouldPreserveNumericString($value)) {
                         $xml .= '<c r="'.$cellRef.'"'.$s.' t="inlineStr"><is>'
                             .self::renderInlineText($this->fastXmlEscape($value)).'</is></c>';
@@ -3261,6 +3320,7 @@ abstract class BaseXlsxWriter
 
         $sst = $this->sharedStrings;
         $styleMap = $this->templateStyleMaps[$variant] ?? $this->templateStyleMaps[0];
+        $text = $this->templateTextColumns;
         $count = count($data);
         if ($count > 0 && ! isset($this->colLetterCache[$count])) {
             for ($c = 1; $c <= $count; $c++) {
@@ -3285,7 +3345,7 @@ abstract class BaseXlsxWriter
                     continue;
                 }
 
-                if (is_numeric($value) && ! $this->shouldPreserveNumericString($value)) {
+                if (! isset($text[$index]) && is_numeric($value) && ! $this->shouldPreserveNumericString($value)) {
                     $xml .= '<c r="'.$cellRef.'"'.$s.' t="n"><v>'.(0 + $value).'</v></c>';
 
                     continue;

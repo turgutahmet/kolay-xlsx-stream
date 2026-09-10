@@ -350,7 +350,13 @@ compared cell by cell.
 
 | Compared | Result |
 |---|---|
-| 400 rows × 6 columns × 12 properties | **0 differences** |
+| 400 rows × 6 columns × 12 properties, PhpSpreadsheet 5.9.0 | **0 differences** |
+| the same, PhpSpreadsheet 1.30.6 | **0 differences** |
+
+Both majors run on tag day. They differ in ways a template feature feels —
+1.x writes an empty `<tableParts count="0"/>` on every sheet, which a guard
+against table-backed sheets refuses unless it triggers on an actual
+`<tablePart>` — and only a 1.x leg catches that.
 
 The twelve are value, data type, number format, font weight, font size,
 font colour, fill type, fill colour, all four borders, horizontal and

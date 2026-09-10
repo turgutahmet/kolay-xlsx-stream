@@ -343,10 +343,20 @@ try {
 // ---------------------------------------------------------------
 // Cost, on the same layout and the same data
 // ---------------------------------------------------------------
+// PHP reports real memory at the allocator's 2 MB granularity, so at this
+// row count the streamed path's delta is often 0 — a ratio computed from it
+// would be arithmetic, not a measurement. Say so instead of printing a number.
+$memoryRatio = $streamMemory > 0
+    ? sprintf('%.1fx', $referenceMemory / $streamMemory)
+    : 'below the 2 MB measurement granularity';
+
 fwrite(STDOUT, sprintf(
-    "\n  layout by PhpSpreadsheet, rows by PhpSpreadsheet: %6.3f s  %6.1f MB  %s\n".
+    "\n  PhpSpreadsheet %s\n".
+    "  layout by PhpSpreadsheet, rows by PhpSpreadsheet: %6.3f s  %6.1f MB  %s\n".
     "  layout by PhpSpreadsheet, rows by xlsx-stream:     %6.3f s  %6.1f MB  %s\n".
-    "  speed %.1fx, memory %.1fx\n\n",
+    "  speed %.1fx, memory %s\n".
+    "  (%d rows — see BENCHMARK.md section 5 for figures at a realistic size)\n\n",
+    \Composer\InstalledVersions::getPrettyVersion('phpoffice/phpspreadsheet') ?? 'unknown',
     $referenceSeconds,
     $referenceMemory / 1048576,
     number_format(filesize($referencePath)).' B',
@@ -354,7 +364,8 @@ fwrite(STDOUT, sprintf(
     $streamMemory / 1048576,
     number_format(filesize($streamedPath)).' B',
     $referenceSeconds / max($streamSeconds, 1e-9),
-    $referenceMemory / max($streamMemory, 1024)
+    $memoryRatio,
+    DATA_ROWS
 ));
 
 // ---------------------------------------------------------------

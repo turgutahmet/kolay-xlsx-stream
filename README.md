@@ -1035,10 +1035,26 @@ sheet above the data:
   below the data is copied verbatim and such a range would keep covering
   only the rows the template declared — a filter that silently stops after
   four rows. Draw the filter across the header row instead.
-- A sheet backed by a **table** (`<tableParts>`) is refused for the same
-  reason: its range lives in another part of the archive.
+- A sheet backed by a **table** is refused for the same reason: its range
+  lives in another part of the archive. An empty `<tableParts count="0"/>`
+  is fine — PhpSpreadsheet 1.x writes one on every sheet.
 - A file this package produced with `enableAutoFilter()` therefore cannot
   serve as a template — that filter spans the whole sheet by construction.
+
+**Identity numbers stay text.** A numeric-looking string is written as a
+number unless precision would be lost — a leading zero, a leading plus, or
+more than fifteen digits. A national identity number, a tax number or an
+account number sits inside that window, so it would otherwise land as a
+right-aligned number. Declare those columns:
+
+```php
+$writer->sheet('Employees', dataStartRow: 3)->textColumns([1, 4]);
+```
+
+Columns are 1-based. The declaration governs string values, so an `int`
+stays an `int` — pass the identifier as a string when you want it as text.
+It applies to the sheet chosen by the last `sheet()` call, and the next
+`sheet()` clears it.
 
 **Number formats.** Where the template holds an opinion it wins outright,
 including for dates: a `DateTimeInterface` written into a column the sample
@@ -1073,6 +1089,9 @@ name.
 the data arrives. A merge whose row span is only known while streaming is
 not covered — that is first-class writer styling, and it is on the roadmap
 for v3.6.
+
+Templates from **PhpSpreadsheet 1.x and 5.x** are both covered by the parity
+suite, which runs against each major on tag day.
 
 Measured on a real 8,000 × 10 report against building the same file with
 PhpSpreadsheet: **17× faster, 14× less memory**. A different workload gives

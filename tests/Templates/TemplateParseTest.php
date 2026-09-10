@@ -327,8 +327,24 @@ class TemplateParseTest extends TestCase
         $bytes = $this->buildXlsx($this->scaffold(['Leave' => $this->sheetWithTail('<tableParts count="1"><tablePart r:id="rId1"/></tableParts>')]));
 
         $this->expectException(XlsxStreamException::class);
-        $this->expectExceptionMessageMatches('/tableParts/');
+        $this->expectExceptionMessageMatches('/tablePart/');
         Template::fromString($bytes)->sheet('Leave', dataStartRow: 3);
+    }
+
+    /**
+     * PhpSpreadsheet 1.x writes an empty <tableParts count="0"/> on every
+     * sheet it produces. Refusing the wrapper rather than an actual
+     * <tablePart> child would therefore refuse every template that library
+     * made — verified against 1.30.6, which emits it, and 5.9.0, which does
+     * not. A guard against false rejection must not be the thing causing one.
+     */
+    public function test_an_empty_table_parts_wrapper_is_accepted(): void
+    {
+        $tail = '<autoFilter ref="A2:D2"/><tableParts count="0"/>';
+        $bytes = $this->buildXlsx($this->scaffold(['Leave' => $this->sheetWithTail($tail)]));
+
+        $sheet = Template::fromString($bytes)->sheet('Leave', dataStartRow: 3);
+        $this->assertStringContainsString('<tableParts count="0"/>', $sheet->tail());
     }
 
     /**

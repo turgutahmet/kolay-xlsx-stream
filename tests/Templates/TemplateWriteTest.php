@@ -676,6 +676,108 @@ class TemplateWriteTest extends TestCase
         $template->close();
     }
 
+    /**
+     * A numeric-looking string becomes a number unless precision would be
+     * lost — no leading zero, no leading plus, fifteen digits or fewer. A
+     * national identity number sits inside that window, so without a
+     * declaration it would land as a right-aligned number. textColumns()
+     * is how a caller says the column is text.
+     */
+    public function test_text_columns_keep_numeric_looking_strings_as_text(): void
+    {
+        $out = $this->tmpPath();
+        $writer = SinkableXlsxWriter::fromTemplate(new FileSink($out), $this->standardTemplate());
+        $writer->sheet('Leaves', 3)->textColumns([1]);
+        $writer->writeRow(['12345678901', 12345678901]);
+        $writer->writeRow(['4720000000', 99.5]);
+        $writer->finishFile();
+
+        $body = $this->sheetBody($this->readOut($out, 'xl/worksheets/sheet1.xml'));
+        $sst = $this->readOut($out, 'xl/sharedStrings.xml');
+
+        // Column A is declared text: the identity number is interned, not
+        // converted. Column B is not declared, so it stays a number.
+        $this->assertStringContainsString('<c r="A3" s="4" t="s">', $body);
+        $this->assertStringContainsString('<si><t>12345678901</t></si>', $sst);
+        $this->assertStringContainsString('<c r="B3" s="5" t="n"><v>12345678901</v></c>', $body);
+        $this->assertStringContainsString('<c r="A4" s="4" t="s">', $body);
+        $this->assertStringContainsString('<si><t>4720000000</t></si>', $sst);
+    }
+
+    public function test_text_columns_also_apply_without_a_shared_table(): void
+    {
+        $out = $this->tmpPath();
+        $tpl = $this->templateFile(['Leaves' => $this->mainSheet()]);
+        $writer = SinkableXlsxWriter::fromTemplate(new FileSink($out), $tpl);
+        $writer->sheet('Leaves', 3)->textColumns([1]);
+        $writer->writeRow(['12345678901', 1.0]);
+        $writer->finishFile();
+
+        $body = $this->sheetBody($this->readOut($out, 'xl/worksheets/sheet1.xml'));
+        $this->assertStringContainsString('<c r="A3" s="4" t="inlineStr"><is><t>12345678901</t></is></c>', $body);
+    }
+
+    public function test_text_columns_are_one_based_and_reset_by_the_next_sheet(): void
+    {
+        $out = $this->tmpPath();
+        $writer = SinkableXlsxWriter::fromTemplate(new FileSink($out), $this->standardTemplate());
+        $writer->sheet('Leaves', 3)->textColumns([2]);
+        $writer->writeRow(['Ada', '4200']);
+        $writer->sheet('Summary', 2);
+        $writer->writeRow(['4200']);
+        $writer->finishFile();
+
+        // Column 2 is B, not C: 1-based like every other column argument.
+        $first = $this->sheetBody($this->readOut($out, 'xl/worksheets/sheet1.xml'));
+        $this->assertStringContainsString('<c r="B3" s="5" t="s">', $first);
+
+        // The next sheet starts with no declaration, so the same string is a
+        // number again — the reset is the reason textColumns() comes after
+        // sheet() rather than before it.
+        $second = $this->sheetBody($this->readOut($out, 'xl/worksheets/sheet2.xml'));
+        // (Summary's only row is its header, so this variant carries no
+        // style — what matters here is t="n": the declaration did not leak.)
+        $this->assertStringContainsString('<c r="A2" t="n"><v>4200</v></c>', $second);
+    }
+
+    public function test_text_columns_leave_non_string_values_alone(): void
+    {
+        $out = $this->tmpPath();
+        $writer = SinkableXlsxWriter::fromTemplate(new FileSink($out), $this->standardTemplate());
+        $writer->sheet('Leaves', 3)->textColumns([1, 2, 3]);
+        $writer->writeRow(['0042', 7, 3.5]);
+        $writer->finishFile();
+
+        $body = $this->sheetBody($this->readOut($out, 'xl/worksheets/sheet1.xml'));
+        $this->assertStringContainsString('<si><t>0042</t></si>', $this->readOut($out, 'xl/sharedStrings.xml'));
+        $this->assertStringContainsString('<c r="B3" s="5" t="n"><v>7</v></c>', $body, 'an int stays an int');
+        $this->assertStringContainsString('<c r="C3" s="6" t="n"><v>3.5</v></c>', $body, 'a float stays a float');
+    }
+
+    public function test_text_columns_before_a_sheet_or_outside_template_mode_throws(): void
+    {
+        $writer = SinkableXlsxWriter::fromTemplate(new FileSink($this->tmpPath()), $this->standardTemplate());
+        try {
+            $writer->textColumns([1]);
+            $this->fail('textColumns() before sheet() should throw');
+        } catch (XlsxStreamException $e) {
+            $this->assertStringContainsString('sheet()', $e->getMessage());
+        }
+
+        $writer->sheet('Leaves', 3);
+        try {
+            $writer->textColumns([0]);
+            $this->fail('a 0 column index should throw');
+        } catch (XlsxStreamException $e) {
+            $this->assertStringContainsString('>= 1', $e->getMessage());
+        }
+
+        $classic = SinkableXlsxWriter::createForFile($this->tmpPath());
+        $this->expectException(XlsxStreamException::class);
+        $this->expectExceptionMessageMatches('/textColumns\(\)/');
+        $classic->textColumns([1]);
+    }
+
     public function test_the_output_is_well_formed_xml(): void
     {
         $out = $this->tmpPath();

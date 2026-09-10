@@ -157,10 +157,10 @@ class XlsxStreamException extends \Exception
     public static function templateTablePartsUnsupported(): self
     {
         return new self(
-            'Template sheet uses <tableParts>. A table keeps its range in xl/tables/tableN.xml and its filter '.
-            'in a workbook defined name, both of which template mode carries across untouched, so the table '.
-            'would still cover only the rows the template declared. Remove the table and keep the styling, '.
-            'or filter across the header row instead.'
+            'Template sheet is backed by a table (<tablePart>). A table keeps its range in '.
+            'xl/tables/tableN.xml and its filter in a workbook defined name, both of which template mode '.
+            'carries across untouched, so the table would still cover only the rows the template declared. '.
+            'Remove the table and keep the styling, or filter across the header row instead.'
         );
     }
 

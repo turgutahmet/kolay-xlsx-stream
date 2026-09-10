@@ -39,6 +39,10 @@ and their `s="…"` ids tell the writer how that producer encoded each style.
 - **`Writers\SharedStringTable`** — appends to a template's shared strings,
   preserving its indices, with a ceiling past which new strings are written
   inline so memory stops growing.
+- **`textColumns(array $columns)`** — declare which columns of the current
+  template sheet hold text, so an identity or tax number is written as a
+  string rather than the number the type rules would infer. 1-based, governs
+  string values, cleared by the next `sheet()`.
 - **`StyleRegistry::fromStylesXml()`** — seeds the style table from the
   template's own `styles.xml` and appends to it, so the ids its sample rows
   hand out keep meaning what they meant. Blocks this package does not model
@@ -72,7 +76,10 @@ and their `s="…"` ids tell the writer how that producer encoded each style.
   format, data validation, sort state or hyperlink whose range reaches
   `dataStartRow` or below is refused, because the part below the data is
   copied verbatim and such a range would cover only the rows the template
-  declared. A sheet backed by `<tableParts>` is refused for the same reason.
+  declared. A sheet backed by a table is refused for the same reason — the
+  trigger is an actual `<tablePart>`, since PhpSpreadsheet 1.x writes an empty
+  `<tableParts count="0"/>` on every sheet and refusing that would refuse
+  every template it produces.
   A sheet that binds SpreadsheetML only to a namespace prefix is refused,
   because streamed rows are written unprefixed.
 - A file this package produced with `enableAutoFilter()` cannot serve as a
@@ -84,11 +91,11 @@ and their `s="…"` ids tell the writer how that producer encoded each style.
   with PhpSpreadsheet. Ratios depend on the workload — PhpSpreadsheet's
   per-row style cost is not linear — so [BENCHMARK.md §5](BENCHMARK.md)
   reports each figure with the workload it came from.
-- **Parity: zero differences.** The same layout written entirely by
-  PhpSpreadsheet versus written by PhpSpreadsheet and streamed into, both read
-  back through PhpSpreadsheet: 400 rows × 6 columns compared on value, type,
-  number format, font, fill, borders, alignment, merges, widths, heights,
-  frozen pane and gridlines.
+- **Parity: zero differences**, against PhpSpreadsheet **1.30.6 and 5.9.0**.
+  The same layout written entirely by PhpSpreadsheet versus written by
+  PhpSpreadsheet and streamed into, both read back through PhpSpreadsheet:
+  400 rows × 6 columns compared on value, type, number format, font, fill,
+  borders, alignment, merges, widths, heights, frozen pane and gridlines.
 - **About 4 % slower than the classic writer** at both 8,000 × 10 and
   100,000 × 20. The shared string table costs no measurable time and about
   12.8 MB for 100,000 distinct strings, bounded by `maxUniqueStrings`.

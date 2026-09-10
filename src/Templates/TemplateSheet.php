@@ -324,7 +324,13 @@ class TemplateSheet
             // A table keeps its range in xl/tables/tableN.xml and its filter
             // in a workbook defined name, both of which are carried across
             // untouched, so the table would cover the sample rows only.
-            if (self::localName($name) === 'tableParts') {
+            //
+            // The trigger is a <tablePart> child, never the <tableParts>
+            // wrapper: PhpSpreadsheet 1.x writes an empty <tableParts
+            // count="0"/> on every sheet it produces, so refusing the wrapper
+            // would refuse every template that library made — the false
+            // rejection this guard exists to avoid, not to cause.
+            if (self::localName($name) === 'tablePart') {
                 throw XlsxStreamException::templateTablePartsUnsupported();
             }
 
