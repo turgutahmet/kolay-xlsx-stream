@@ -31,3 +31,6 @@ jobs:
 
       - name: Run external roundtrip tests
         run: php tests/compat/external_readers_roundtrip.php
+
+      - name: Run template-mode parity
+        run: php tests/compat/template_roundtrip.php

@@ -17,6 +17,7 @@
  *      later columns (the compact-mode invariant).
  *
  * Exits non-zero on any failure; intended to be run from the workflow.
+ * Template-mode parity lives in its sibling, template_roundtrip.php.
  */
 
 declare(strict_types=1);

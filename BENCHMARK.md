@@ -326,7 +326,99 @@ The indexed reader reads `total_rows` straight out of the sidecar header — one
 
 ---
 
-## 5. Methodology & reproducibility
+## 5. Template mode — new in v3.5
+
+Template mode takes a layout another producer authored and streams rows
+into one sheet's `<sheetData>`, carrying every other part across without
+inflating it. Two things need measuring: whether the result is the file
+that producer would have written, and what the mechanism costs.
+
+Apple M4 laptop, PHP 8.2.28, PhpSpreadsheet 5.9.0, September 2026. The
+layout under test is a leave report — merged title, styled header row,
+five per-column number formats including a date and a datetime,
+alternating body styles, column widths, custom row heights, a frozen pane
+and gridlines off. A two-column fixture round-trips trivially and would
+measure nothing.
+
+### 5.1 Parity — is it the same file?
+
+`tests/compat/template_roundtrip.php` builds that layout twice. Once
+PhpSpreadsheet writes the layout **and** the rows. Once PhpSpreadsheet
+writes only the layout and two sample rows, and this package streams the
+rows into it. Both files are then read back through PhpSpreadsheet and
+compared cell by cell.
+
+| Compared | Result |
+|---|---|
+| 400 rows × 6 columns × 12 properties | **0 differences** |
+
+The twelve are value, data type, number format, font weight, font size,
+font colour, fill type, fill colour, all four borders, horizontal and
+vertical alignment, plus merges, column widths, row heights, frozen pane
+and gridlines at sheet level.
+
+One representation difference is normalised rather than reported: a whole
+float is written `549.0` by PhpSpreadsheet, which preserves its own PHP
+type, and `549` by this writer, because PHP's float-to-string drops the
+trailing zero. Excel reads both as the same number, so numeric cells are
+compared as numbers. Text cells stay strings, so a numeric-looking string
+is still compared strictly.
+
+The comparator was checked against two deliberate breakages before the
+result was trusted: forcing every row onto style variant 0 reports 26
+colour and fill differences, and starting the data one row late reports
+value and type differences from the first cell on.
+
+### 5.2 Cost against PhpSpreadsheet
+
+Same layout, 20,000 rows × 6 columns, rows supplied by a generator.
+
+| | Wall time | Peak RAM | Output |
+|---|---|---|---|
+| PhpSpreadsheet writes layout + rows | 28.41 s | 123.3 MB | 821,327 B |
+| PhpSpreadsheet writes layout, xlsx-stream writes rows | **0.107 s** | **6.0 MB** | 832,195 B |
+| | **265×** | **20.6×** | +1.3 % |
+
+The memory gap is structural rather than incidental: PhpSpreadsheet holds
+the whole sheet as objects before writing, so its peak grows with the row
+count, while the streamed path never holds more than one row buffer. The
+output is 1.3 % larger because our style table appends rather than
+de-duplicating against entries it deliberately treats as opaque.
+
+### 5.3 Cost against this package's own classic writer
+
+`bench/template_bench.php` writes identical data through both paths onto
+visually identical sheets. Median of 9 fresh processes each.
+
+| Workload | classic | template | template + shared strings |
+|---|---|---|---|
+| 8,000 × 10 — wall time | 0.052 s | 0.055 s (**+4.2 %**) | 0.055 s (**+4.0 %**) |
+| 8,000 × 10 — peak RAM | 6 MB | 6 MB | 8 MB |
+| 100,000 × 20 — wall time | 1.282 s | 1.341 s (**+4.6 %**) | 1.272 s (**−0.8 %**) |
+| 100,000 × 20 — peak RAM | 8 MB | 8 MB | 20.8 MB |
+
+Reading the table: the row-builder dispatch costs about 4 %, which is the
+price of the twin-builder family and the per-cell style lookup. Interning
+into a shared string table costs nothing in time — at 100,000 rows it is
+inside the noise, because the shorter cell bodies deflate faster than the
+interning costs — and it costs memory, which is the one place this mode
+holds state proportional to the data.
+
+That memory is the shared string dictionary: **+12.8 MB for ~100,000
+distinct strings**, roughly 130 bytes per entry. It is bounded by the
+`maxUniqueStrings` ceiling passed to `useTemplate()` / `fromTemplate()`,
+which defaults to 500,000; past the ceiling a new string is written inline
+instead, so the file stays valid and memory stops growing. A template
+without an `xl/sharedStrings.xml` part never enters this path at all.
+
+An earlier run of the 8,000-row case over 3 processes reported +24 % for
+the shared-string mode. That was noise on a 50 ms workload, not a result;
+the numbers above are the median of 9 and the two modes are indistinguishable
+at that size.
+
+---
+
+## 6. Methodology & reproducibility
 
 ### Scripts
 
@@ -382,7 +474,7 @@ Identical to the v1.x and v2.2.2 baselines so cross-version comparisons stay cle
 
 ---
 
-## 6. Comparison table — what changed since v2.2.2
+## 7. Comparison table — what changed since v2.2.2
 
 | Workload | v3.0 | v2.2.2 | Diff |
 |---|---|---|---|
@@ -407,7 +499,7 @@ Write is **unchanged** from v2.2.2 within measurement noise — opt-in indexing 
 ---
 ---
 
-## 7. Appendix — historical benchmark tables (moved from README, July 2026)
+## 8. Appendix — historical benchmark tables (moved from README, July 2026)
 
 Everything below previously lived in README.md. Preserved verbatim for
 cross-version comparison; the README now carries only the current
