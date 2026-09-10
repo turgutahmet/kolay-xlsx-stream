@@ -29,10 +29,10 @@ class Template
     /** @var list<array{name: string, sheetId: int, entry: string}> */
     private array $sheets;
 
-    /** @var array<string, string> "name|dataStartRow" => parsed sheet */
-    private array $parsed = [];
+    /** @var array<string, string> zip entry => raw sheet XML, read once */
+    private array $sheetXml = [];
 
-    /** @var array<string, TemplateSheet> */
+    /** @var array<string, TemplateSheet> "name|dataStartRow" => cut sheet */
     private array $sheetCache = [];
 
     private function __construct(
@@ -114,7 +114,7 @@ class Template
         }
 
         $entry = $this->entryFor($name);
-        $xml = $this->parsed[$entry] ??= $this->readEntry($entry);
+        $xml = $this->sheetXml[$entry] ??= $this->readEntry($entry);
 
         return $this->sheetCache[$key] = TemplateSheet::parse($xml, $dataStartRow, $entry);
     }

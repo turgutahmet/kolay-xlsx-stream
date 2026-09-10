@@ -34,6 +34,9 @@ class TemplateSheet
      */
     public const MAX_SAMPLE_ROWS = 256;
 
+    /** The SpreadsheetML namespace streamed rows must land in to be valid. */
+    private const MAIN_NAMESPACE = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+
     private function __construct(
         private string $head,
         private string $headerRowsXml,
@@ -44,6 +47,7 @@ class TemplateSheet
         /** @var list<array{ht: ?string, customHeight: bool, s: ?int, customFormat: bool}> */
         private array $rowAttributes,
         private string $prefix,
+        private bool $acceptsUnprefixedRows,
     ) {
     }
 
@@ -104,6 +108,24 @@ class TemplateSheet
     public function elementPrefix(): string
     {
         return $this->prefix;
+    }
+
+    /**
+     * Whether the writer may stream plain `<row>`/`<c>` elements into this
+     * sheet — true exactly when the document binds the DEFAULT namespace to
+     * SpreadsheetML, so unprefixed elements land in it.
+     *
+     * The row builders emit unprefixed tags (the classic hot path must not
+     * pay for prefix concatenation), so a sheet that only binds a prefix —
+     * `<x:worksheet xmlns:x="…main">` — would take our rows into no
+     * namespace at all and Excel would offer to repair the file. Template
+     * mode refuses that dialect rather than opening a fifth seam to inject
+     * an xmlns at the root. A document that binds BOTH (prefixed elements
+     * plus a default xmlns) is perfectly writable and is accepted.
+     */
+    public function acceptsUnprefixedRows(): bool
+    {
+        return $this->acceptsUnprefixedRows;
     }
 
     private function normaliseVariant(int $variant): int
@@ -180,7 +202,16 @@ class TemplateSheet
             $rowAttributes[] = ['ht' => null, 'customHeight' => false, 's' => null, 'customFormat' => false];
         }
 
-        return new self($head, $headerRows, $tail, $dataStartRow, $styleMaps, $rowAttributes, $prefix);
+        return new self(
+            $head,
+            $headerRows,
+            $tail,
+            $dataStartRow,
+            $styleMaps,
+            $rowAttributes,
+            $prefix,
+            self::bindsDefaultSpreadsheetNamespace($head)
+        );
     }
 
     /**
@@ -390,6 +421,20 @@ class TemplateSheet
             's' => preg_match('/(?<![A-Za-z])s="(\d+)"/', $attrs, $m) ? (int) $m[1] : null,
             'customFormat' => (bool) preg_match('/(?<![A-Za-z])customFormat="(?:1|true)"/', $attrs),
         ];
+    }
+
+    /**
+     * Does the root element bind the default namespace to SpreadsheetML?
+     * Only the root can, in practice — `<sheetData>`'s only ancestor is
+     * `<worksheet>` — so one look at the opening tag settles it.
+     */
+    private static function bindsDefaultSpreadsheetNamespace(string $head): bool
+    {
+        if (! preg_match('/<(?:[A-Za-z_][\\w.\\-]*:)?worksheet\\b([^>]*)>/', $head, $m)) {
+            return false;
+        }
+
+        return (bool) preg_match('/\\bxmlns="'.preg_quote(self::MAIN_NAMESPACE, '/').'"/', $m[1]);
     }
 
     private static function isTagBoundary(string $char): bool

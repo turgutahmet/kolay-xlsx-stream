@@ -310,4 +310,33 @@ class TemplateParseTest extends TestCase
         $c = $t->sheet('Leave', dataStartRow: 4);
         $this->assertSame(1, $c->variantCount());
     }
+
+    public function test_namespace_dialect_is_reported_for_the_writer_guard(): void
+    {
+        // The row builders emit unprefixed <row>/<c>. A sheet that binds only
+        // a prefix would take those rows into no namespace at all, so the
+        // parser reports the fact and template mode refuses that dialect.
+        $prefixOnly = $this->buildXlsx($this->scaffold(['Data' => $this->excelPrefixedSheet()]));
+        $this->assertFalse(
+            Template::fromString($prefixOnly)->sheet('Data', dataStartRow: 2)->acceptsUnprefixedRows(),
+            'prefix-only binding cannot take unprefixed rows'
+        );
+
+        // A plain default-namespace sheet is the common, writable case.
+        $plain = $this->buildXlsx($this->scaffold(['Leave' => $this->phpSpreadsheetSheet()]));
+        $this->assertTrue(
+            Template::fromString($plain)->sheet('Leave', dataStartRow: 3)->acceptsUnprefixedRows()
+        );
+
+        // Prefixed ELEMENTS but a default binding too: unprefixed rows still
+        // land in the main namespace, so this dialect is accepted.
+        $both = str_replace(
+            '<x:worksheet xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main">',
+            '<x:worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main">',
+            $this->excelPrefixedSheet()
+        );
+        $sheet = Template::fromString($this->buildXlsx($this->scaffold(['Data' => $both])))->sheet('Data', dataStartRow: 2);
+        $this->assertSame('x:', $sheet->elementPrefix());
+        $this->assertTrue($sheet->acceptsUnprefixedRows(), 'both bindings present → writable');
+    }
 }
