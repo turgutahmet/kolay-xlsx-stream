@@ -629,25 +629,6 @@ class TemplateWriteTest extends TestCase
         $this->assertStringContainsString('r="A22"', $xml, 'the data itself reaches row 22');
     }
 
-    public function test_the_random_access_index_is_refused_rather_than_dropped(): void
-    {
-        $writer = SinkableXlsxWriter::createForFile($this->tmpPath());
-        $writer->withRandomAccessIndex(100);
-        try {
-            $writer->useTemplate(Template::open($this->standardTemplate()));
-            $this->fail('the sidecar and template mode should not combine yet');
-        } catch (XlsxStreamException $e) {
-            $this->assertStringContainsString('withRandomAccessIndex()', $e->getMessage());
-        }
-
-        // And turned on between attaching the template and choosing a sheet.
-        $late = SinkableXlsxWriter::fromTemplate(new FileSink($this->tmpPath()), $this->standardTemplate());
-        $late->withRandomAccessIndex(100);
-        $this->expectException(XlsxStreamException::class);
-        $this->expectExceptionMessageMatches('/withRandomAccessIndex\(\)/');
-        $late->sheet('Leaves', 3);
-    }
-
     public function test_registering_a_row_style_is_refused(): void
     {
         $writer = SinkableXlsxWriter::fromTemplate(new FileSink($this->tmpPath()), $this->standardTemplate());

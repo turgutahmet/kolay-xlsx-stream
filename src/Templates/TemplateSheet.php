@@ -4,6 +4,7 @@ namespace Kolay\XlsxStream\Templates;
 
 use Kolay\XlsxStream\Exceptions\XlsxStreamException;
 use Kolay\XlsxStream\Readers\CellTokenizer;
+use Kolay\XlsxStream\Readers\SharedStrings;
 
 /**
  * One template sheet cut at its `<sheetData>` seam.
@@ -102,6 +103,30 @@ class TemplateSheet
     public function rowAttributes(int $variant): array
     {
         return $this->rowAttributes[$this->normaliseVariant($variant)];
+    }
+
+    /**
+     * The header rows' cell values, keyed by sheet row number, each row a
+     * 0-based column => value array.
+     *
+     * Only the random-access index needs these: the template's header rows
+     * are real rows inside the streamed sheet's first block, so a zone map
+     * built from the data alone could prune a block that a full scan would
+     * have matched. Tokenizing them with the reader's own tokenizer folds in
+     * exactly what a reader will see — a sheet whose cells the tokenizer
+     * cannot read yields nothing here, and the un-pruned path reads nothing
+     * from it either, so the two paths still agree.
+     *
+     * @return array<int, array<int, mixed>>
+     */
+    public function headerRowValues(?SharedStrings $sharedStrings = null): array
+    {
+        $values = [];
+        foreach (self::scanRows($this->headerRowsXml, $this->prefix) as $row) {
+            $values[$row['index']] = CellTokenizer::tokenizeRow($row['xml'], $sharedStrings);
+        }
+
+        return $values;
     }
 
     /** Namespace prefix the sheet uses on its elements ('' or e.g. 'x:'). */
@@ -270,6 +295,12 @@ class TemplateSheet
      * conditional-formatting extension uses, and refuses when any corner
      * falls on dataStartRow or below. A range with no row at all (whole
      * columns, `A:C`) covers every row and is refused too.
+     *
+     * Only the tail is scanned, and deliberately so. The head carries ranges
+     * that describe a viewport rather than a region of data — `<selection
+     * sqref="A5"/>` is where the author left the cursor — and refusing a
+     * template over the saved cursor position would be a false rejection,
+     * the failure that makes this mode unusable on real layouts.
      */
     private static function assertNoRangeInDataRegion(string $tail, int $dataStartRow): void
     {

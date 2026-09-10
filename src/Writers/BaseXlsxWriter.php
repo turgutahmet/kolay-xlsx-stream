@@ -3,6 +3,8 @@
 namespace Kolay\XlsxStream\Writers;
 
 use Kolay\XlsxStream\Exceptions\XlsxStreamException;
+use Kolay\XlsxStream\Readers\SharedStrings;
+use Kolay\XlsxStream\Readers\SharedStringsParser;
 use Kolay\XlsxStream\Sketches\CoMoments;
 use Kolay\XlsxStream\Sketches\HyperLogLog;
 use Kolay\XlsxStream\Sketches\MisraGries;
@@ -377,6 +379,8 @@ abstract class BaseXlsxWriter
 
     /** True when this writer opened the template itself and must close it. */
     protected bool $templateOwned = false;
+
+    protected ?SharedStrings $templateSharedStringsReader = null;
     protected ?TemplateSheet $templateSheet = null;
 
     /** Sheet currently being streamed: its workbook name and its zip entry. */
@@ -1753,11 +1757,17 @@ abstract class BaseXlsxWriter
     }
 
     /**
-     * Convenience accessor mirroring the path used in startNewSheet().
+     * The zip entry the sheet currently being written lives in.
+     *
+     * Classic sheets are numbered by the writer, so the path follows the
+     * sheet index. A template sheet keeps the entry the template gave it,
+     * which need not match the order it is streamed in — index sections are
+     * keyed by entry, so getting this wrong would file a sheet's sync points
+     * and zone maps under a sheet the reader never looks at.
      */
     protected function currentSheetEntry(): string
     {
-        return "xl/worksheets/sheet{$this->currentSheetIndex}.xml";
+        return $this->templateSheetEntry ?? "xl/worksheets/sheet{$this->currentSheetIndex}.xml";
     }
 
     /**
@@ -2905,7 +2915,6 @@ abstract class BaseXlsxWriter
         if ($this->compactMode) {
             throw XlsxStreamException::templateConflictsWith('compact()');
         }
-        $this->refuseTemplateIndex();
         foreach ([
             'setHeaderStyle()' => $this->headerStyleId !== null,
             'setColumnWidths()' => $this->columnWidths !== [],
@@ -2962,7 +2971,6 @@ abstract class BaseXlsxWriter
         if (! $this->templateMode) {
             throw XlsxStreamException::templateModeRequired('sheet()');
         }
-        $this->refuseTemplateIndex();
 
         $entry = $this->template->entryFor($name);
         if (isset($this->templateStreamedEntries[$entry]) || $entry === $this->templateSheetEntry) {
@@ -3013,6 +3021,15 @@ abstract class BaseXlsxWriter
         $this->inSampleMode = false;
 
         $this->resetPerSheetAccumulators();
+
+        // The template's header rows are real rows in this sheet's first
+        // index block. Fold them in before any data arrives so zone-map
+        // pruning can never hide a row the un-pruned path would return —
+        // the same reason startNewSheet() folds its own header row.
+        if ($this->statsColumns !== [] || $this->stringStatsColumns !== []) {
+            $this->foldTemplateHeaderRows();
+        }
+
         $this->openSheetStream($entry);
 
         // Resolve the variants once. Every row reads a style map and a row
@@ -3026,6 +3043,52 @@ abstract class BaseXlsxWriter
 
         $this->writeSheetData($sheet->head().$sheet->headerRowsXml());
         $this->currentSheetRow = $sheet->dataStartRow() - 1;
+    }
+
+    /**
+     * Fold the template's header rows into this sheet's zone maps.
+     *
+     * currentSheetRow is moved onto each header row for the duration, so an
+     * argmin/argmax pointer landing on a header cell records the row that
+     * cell actually occupies. Sortedness is deliberately not tracked: the
+     * header says nothing about how the data is ordered.
+     */
+    protected function foldTemplateHeaderRows(): void
+    {
+        $restore = $this->currentSheetRow;
+
+        foreach ($this->templateSheet->headerRowValues($this->templateSharedStringsReader()) as $rowNumber => $values) {
+            $this->currentSheetRow = $rowNumber;
+            if ($this->statsColumns !== []) {
+                $this->accumulateColumnStats($values, trackOrder: false);
+            }
+            if ($this->stringStatsColumns !== []) {
+                $this->accumulateStringStats($values, trackOrder: false);
+            }
+        }
+
+        $this->currentSheetRow = $restore;
+    }
+
+    /**
+     * Read-side view of the template's shared strings, used to resolve the
+     * t="s" cells in its header rows. Built once and only when something
+     * actually needs to read a template cell back.
+     */
+    protected function templateSharedStringsReader(): ?SharedStrings
+    {
+        if ($this->templateSharedStringsReader !== null) {
+            return $this->templateSharedStringsReader;
+        }
+
+        $entry = 'xl/sharedStrings.xml';
+        if (! $this->template->hasEntry($entry)) {
+            return null;
+        }
+
+        return $this->templateSharedStringsReader = SharedStringsParser::parseInMemory(
+            $this->template->readEntry($entry)
+        );
     }
 
     /**
@@ -3065,22 +3128,6 @@ abstract class BaseXlsxWriter
     protected function templateDateStyle(): int
     {
         return $this->templateDateStyleId ??= $this->styles->registerBuiltinNumFmt(self::BUILTIN_NUMFMT_DATETIME);
-    }
-
-    /**
-     * The random-access sidecar needs its own [Content_Types] override, and
-     * template mode carries that part across untouched. Enabling the index
-     * would therefore produce a workbook Excel offers to repair, so it is
-     * refused here rather than dropped without a word.
-     */
-    protected function refuseTemplateIndex(): void
-    {
-        if ($this->randomAccessIndexEnabled) {
-            throw XlsxStreamException::templateModeForbids(
-                'withRandomAccessIndex()',
-                'the sidecar part needs a content-type override that template mode does not inject'
-            );
-        }
     }
 
     /**
@@ -3304,6 +3351,33 @@ abstract class BaseXlsxWriter
     }
 
     /**
+     * Declare the sidecar's content type in a template's [Content_Types].xml.
+     *
+     * Every package part needs a declared type, and the sidecar's "bin"
+     * extension has no Default mapping, so without this override Excel's
+     * validator drops into repair mode. This is the only edit template mode
+     * makes to a part it did not author: one Override element before the
+     * closing tag, added only when the index is on and only when it is not
+     * already there, so a template that already declared it is untouched.
+     */
+    protected static function declareIndexContentType(string $xml): string
+    {
+        if (str_contains($xml, 'PartName="/'.RandomAccessIndex::ENTRY_PATH.'"')) {
+            return $xml;
+        }
+
+        if (! preg_match('/<\/((?:[A-Za-z_][\w.\-]*:)?)Types\s*>/', $xml, $match, PREG_OFFSET_CAPTURE)) {
+            throw XlsxStreamException::templateContentTypesUnreadable();
+        }
+
+        [$prefix, $at] = [$match[1][0], $match[0][1]];
+        $override = '<'.$prefix.'Override PartName="/'.RandomAccessIndex::ENTRY_PATH.'" '
+            .'ContentType="application/octet-stream"/>';
+
+        return substr($xml, 0, $at).$override.substr($xml, $at);
+    }
+
+    /**
      * Move one template entry into the output without touching its bytes.
      *
      * The compressed body is copied through as-is — no inflate, no deflate —
@@ -3394,9 +3468,25 @@ abstract class BaseXlsxWriter
 
         $stylesEntry = 'xl/styles.xml';
         $sstEntry = 'xl/sharedStrings.xml';
+        $contentTypes = '[Content_Types].xml';
+
+        if ($this->randomAccessIndexEnabled) {
+            $this->writeStaticFile(RandomAccessIndex::ENTRY_PATH, $this->buildRandomAccessIndexPayload());
+        }
 
         foreach ($this->template->zip()->names() as $name) {
             if (isset($this->templateStreamedEntries[$name])) {
+                continue;
+            }
+            // A template produced by this package may already carry a
+            // sidecar. It describes rows that are no longer there, and we
+            // have just written our own, so the stale one is dropped.
+            if ($name === RandomAccessIndex::ENTRY_PATH) {
+                continue;
+            }
+            if ($name === $contentTypes && $this->randomAccessIndexEnabled) {
+                $this->writeStaticFile($name, self::declareIndexContentType($this->template->readEntry($name)));
+
                 continue;
             }
             if ($name === $stylesEntry && ! $this->styles->isSeedUnmodified()) {

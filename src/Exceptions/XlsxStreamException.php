@@ -140,6 +140,18 @@ class XlsxStreamException extends \Exception
     }
 
     /**
+     * Create exception for a template whose content types part cannot be edited
+     */
+    public static function templateContentTypesUnreadable(): self
+    {
+        return new self(
+            'Template [Content_Types].xml has no closing <Types> element, so the random-access '.
+            'sidecar cannot be declared in it. Without that declaration Excel would offer to repair '.
+            'the workbook, so the file is refused rather than written broken.'
+        );
+    }
+
+    /**
      * Create exception for a template sheet backed by a table part
      */
     public static function templateTablePartsUnsupported(): self
