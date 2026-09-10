@@ -270,8 +270,101 @@ class TemplateParseTest extends TestCase
         $bytes = $this->buildXlsx($this->scaffold(['Leave' => $body]));
 
         $this->expectException(XlsxStreamException::class);
-        $this->expectExceptionMessageMatches('/merge/i');
+        $this->expectExceptionMessageMatches('/mergeCell/');
         Template::fromString($bytes)->sheet('Leave', dataStartRow: 3);
+    }
+
+    /**
+     * Every range below the sample rows is copied verbatim, so any of them
+     * that reaches into the streamed data would keep covering only the rows
+     * the template declared. Rewriting them is not one rule but several: a
+     * filter and a conditional format live in the sheet, a table's range
+     * lives in xl/tables and its filter in a workbook defined name. Rather
+     * than edit a second part, template mode refuses the template.
+     *
+     * The check reads no semantics — it looks at ref and sqref wherever they
+     * appear — so the matrix below is the contract, not a list of the cases
+     * someone happened to think of.
+     */
+    #[\PHPUnit\Framework\Attributes\DataProvider('rangesReachingTheData')]
+    public function test_a_tail_range_reaching_the_data_region_is_rejected(string $tail, string $needle): void
+    {
+        $bytes = $this->buildXlsx($this->scaffold(['Leave' => $this->sheetWithTail($tail)]));
+
+        $this->expectException(XlsxStreamException::class);
+        $this->expectExceptionMessageMatches('/'.preg_quote($needle, '/').'/');
+        Template::fromString($bytes)->sheet('Leave', dataStartRow: 3);
+    }
+
+    public static function rangesReachingTheData(): array
+    {
+        return [
+            'auto filter' => ['<autoFilter ref="A2:D40"/>', 'autoFilter'],
+            'sort state' => ['<autoFilter ref="A2:D2"><sortState ref="A3:D40"/></autoFilter>', 'sortState'],
+            'conditional format' => [
+                '<conditionalFormatting sqref="A3:D40"><cfRule type="expression" priority="1"/></conditionalFormatting>',
+                'conditionalFormatting',
+            ],
+            'second sqref in the list' => [
+                '<conditionalFormatting sqref="A1:D1 A3:D40"><cfRule type="expression" priority="1"/></conditionalFormatting>',
+                'conditionalFormatting',
+            ],
+            'data validation' => ['<dataValidations count="1"><dataValidation type="list" sqref="B3:B40"/></dataValidations>', 'dataValidation'],
+            'hyperlink' => ['<hyperlinks><hyperlink ref="A9" display="x"/></hyperlinks>', 'hyperlink'],
+            'whole columns cover every row' => ['<autoFilter ref="A:D"/>', 'autoFilter'],
+            'x14 extension spells sqref as an element' => [
+                '<extLst><ext uri="{78C0D931}"><x14:conditionalFormattings xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main">'
+                .'<x14:conditionalFormatting><x14:cfRule type="dataBar" id="{1}"/><xm:sqref>A3:D40</xm:sqref>'
+                .'</x14:conditionalFormatting></x14:conditionalFormattings></ext></extLst>',
+                'sqref',
+            ],
+            'namespace-prefixed filter' => ['<x:autoFilter ref="A2:D40"/>', 'autoFilter'],
+        ];
+    }
+
+    public function test_a_table_part_is_rejected_because_its_range_lives_elsewhere(): void
+    {
+        $bytes = $this->buildXlsx($this->scaffold(['Leave' => $this->sheetWithTail('<tableParts count="1"><tablePart r:id="rId1"/></tableParts>')]));
+
+        $this->expectException(XlsxStreamException::class);
+        $this->expectExceptionMessageMatches('/tableParts/');
+        Template::fromString($bytes)->sheet('Leave', dataStartRow: 3);
+    }
+
+    /**
+     * The shapes that must NOT trip the guard. A false rejection is the
+     * failure mode that would make template mode unusable on real layouts,
+     * so the accepted set is pinned as carefully as the refused one.
+     */
+    public function test_ranges_that_stay_above_the_data_region_are_accepted(): void
+    {
+        $tail = '<mergeCells count="1"><mergeCell ref="A1:D1"/></mergeCells>'
+            .'<autoFilter ref="A2:D2"/>'
+            .'<conditionalFormatting sqref="A1:D2"><cfRule type="expression" priority="1"/></conditionalFormatting>'
+            .'<hyperlinks><hyperlink ref="A1" display="x"/></hyperlinks>'
+            .'<pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>'
+            .'<pageSetup paperSize="9" orientation="landscape"/>'
+            .'<drawing r:id="rId2"/>';
+        $bytes = $this->buildXlsx($this->scaffold(['Leave' => $this->sheetWithTail($tail)]));
+
+        $sheet = Template::fromString($bytes)->sheet('Leave', dataStartRow: 3);
+        $this->assertSame('</sheetData>'.$tail.'</worksheet>', $sheet->tail());
+    }
+
+    /** Two header rows, two sample rows, and whatever tail the case needs. */
+    private function sheetWithTail(string $tail): string
+    {
+        return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            .'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            .'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
+            .'xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            .'xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main">'
+            .'<sheetData>'
+            .'<row r="1"><c r="A1" s="3"/></row>'
+            .'<row r="2"><c r="A2" s="1"/></row>'
+            .'<row r="3"><c r="A3" s="4"/><c r="B3" s="5"/></row>'
+            .'<row r="4"><c r="A4" s="6"/><c r="B4" s="7"/></row>'
+            .'</sheetData>'.$tail.'</worksheet>';
     }
 
     public function test_unknown_sheet_name_throws(): void

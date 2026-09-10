@@ -170,7 +170,7 @@ class TemplateSheet
         // (our own preamble never emits one). Drop it; Excel recomputes.
         $head = self::stripDimension($head);
 
-        self::assertNoMergeInDataRegion($tail, $dataStartRow);
+        self::assertNoRangeInDataRegion($tail, $dataStartRow);
 
         $rows = self::scanRows($rowsRegion, $prefix);
 
@@ -255,23 +255,89 @@ class TemplateSheet
     }
 
     /**
-     * A merge that reaches into the streamed rows would need the writer to
-     * rewrite the tail against a row count it only learns at the end — the
-     * second seam this design refuses to open. Reject it loudly.
+     * Reject any tail range that reaches into the streamed rows.
+     *
+     * The tail is copied verbatim, so a range the template author drew over
+     * the sample rows keeps exactly those rows once real data is streamed: a
+     * merge that lands mid-data, a filter that stops after four rows, a
+     * conditional format that colours only the sample. Rewriting them would
+     * mean editing the tail against a row count known only at the end, and
+     * for a table or a filter defined-name it would mean editing a different
+     * part altogether — the second seam this design refuses to open.
+     *
+     * The check reads no semantics. It walks the tail's start tags and looks
+     * at every `ref` and `sqref` attribute, plus the element form the x14
+     * conditional-formatting extension uses, and refuses when any corner
+     * falls on dataStartRow or below. A range with no row at all (whole
+     * columns, `A:C`) covers every row and is refused too.
      */
-    private static function assertNoMergeInDataRegion(string $tail, int $dataStartRow): void
+    private static function assertNoRangeInDataRegion(string $tail, int $dataStartRow): void
     {
-        if (! preg_match_all('/<(?:[A-Za-z_][\w.\-]*:)?mergeCell\b[^>]*?\bref="([^"]+)"/', $tail, $matches)) {
-            return;
-        }
+        $i = 0;
+        while (($i = strpos($tail, '<', $i)) !== false) {
+            $end = self::tagEnd($tail, $i + 1);
+            if ($end === false) {
+                break;
+            }
 
-        foreach ($matches[1] as $ref) {
-            foreach (explode(':', $ref) as $corner) {
-                if (preg_match('/(\d+)\s*$/', $corner, $rm) && (int) $rm[1] >= $dataStartRow) {
-                    throw XlsxStreamException::templateMergeInDataRegion($ref, $dataStartRow);
+            $tag = substr($tail, $i + 1, $end - $i - 1);
+            $i = $end + 1;
+
+            if ($tag === '' || $tag[0] === '/' || $tag[0] === '!' || $tag[0] === '?') {
+                continue;
+            }
+
+            $nameLength = strcspn($tag, " \t\r\n/>");
+            $name = substr($tag, 0, $nameLength);
+
+            // A table keeps its range in xl/tables/tableN.xml and its filter
+            // in a workbook defined name, both of which are carried across
+            // untouched, so the table would cover the sample rows only.
+            if (self::localName($name) === 'tableParts') {
+                throw XlsxStreamException::templateTablePartsUnsupported();
+            }
+
+            if (preg_match_all('/(?<![A-Za-z])(?:sqref|ref)="([^"]*)"/', substr($tag, $nameLength), $matches)) {
+                foreach ($matches[1] as $refs) {
+                    self::assertRefsAboveDataRegion($name, $refs, $dataStartRow);
                 }
             }
         }
+
+        // <xm:sqref>A3:C4</xm:sqref> — the extension list spells its ranges
+        // as element text rather than an attribute.
+        if (preg_match_all('/<(?:[A-Za-z_][\w.\-]*:)?sqref\b[^>]*>([^<]*)</', $tail, $matches)) {
+            foreach ($matches[1] as $refs) {
+                self::assertRefsAboveDataRegion('sqref', trim($refs), $dataStartRow);
+            }
+        }
+    }
+
+    /**
+     * Refuse a whitespace-separated reference list whose any corner reaches
+     * dataStartRow or below. A corner carrying no row number spans the whole
+     * column, which reaches the data region by definition.
+     */
+    private static function assertRefsAboveDataRegion(string $element, string $refs, int $dataStartRow): void
+    {
+        foreach (preg_split('/\s+/', trim($refs), -1, PREG_SPLIT_NO_EMPTY) ?: [] as $ref) {
+            foreach (explode(':', $ref) as $corner) {
+                if (! preg_match('/(\d+)\s*$/', $corner, $row)) {
+                    throw XlsxStreamException::templateRangeInDataRegion($element, $ref, $dataStartRow);
+                }
+                if ((int) $row[1] >= $dataStartRow) {
+                    throw XlsxStreamException::templateRangeInDataRegion($element, $ref, $dataStartRow);
+                }
+            }
+        }
+    }
+
+    /** Element name with any namespace prefix removed. */
+    private static function localName(string $name): string
+    {
+        $colon = strrpos($name, ':');
+
+        return $colon === false ? $name : substr($name, $colon + 1);
     }
 
     /**

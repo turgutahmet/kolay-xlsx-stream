@@ -121,9 +121,9 @@ class TemplateWriteTest extends TestCase
             .'<c r="C4" s="6"/></row>'
             .'</sheetData>'
             .'<mergeCells count="1"><mergeCell ref="A1:C1"/></mergeCells>'
-            .'<conditionalFormatting sqref="A3:C4"><cfRule type="expression" dxfId="0" priority="1">'
+            .'<conditionalFormatting sqref="A1:C2"><cfRule type="expression" dxfId="0" priority="1">'
             .'<formula>MOD(ROW(),2)=0</formula></cfRule></conditionalFormatting>'
-            .'<autoFilter ref="A2:C4"/>'
+            .'<autoFilter ref="A2:C2"/>'
             .'<pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>'
             .'</worksheet>';
     }
@@ -608,17 +608,12 @@ class TemplateWriteTest extends TestCase
     }
 
     /**
-     * Pinned, not accidental: a tail range the template drew over its sample
-     * rows is carried across exactly as written. The streamed data runs past
-     * it, so an auto filter or a conditional format that was meant to cover
-     * "the data" ends up covering only the rows the template declared.
-     *
-     * Extending those ranges to the last written row is a real improvement
-     * and a real change to the rule that the tail is copied verbatim, so it
-     * is a decision to take deliberately rather than a side effect to
-     * discover. This test fails the moment the behaviour changes.
+     * A range the template drew over its header block is copied verbatim and
+     * keeps meaning exactly what it meant. Ranges that reach into the data
+     * region are refused at parse time instead (see TemplateParseTest), so
+     * no output can carry a filter or format that silently stops short.
      */
-    public function test_tail_ranges_are_carried_over_exactly_as_the_template_drew_them(): void
+    public function test_header_scoped_tail_ranges_are_carried_over_verbatim(): void
     {
         $out = $this->tmpPath();
         $writer = SinkableXlsxWriter::fromTemplate(new FileSink($out), $this->standardTemplate());
@@ -629,8 +624,8 @@ class TemplateWriteTest extends TestCase
         $writer->finishFile();
 
         $xml = $this->readOut($out, 'xl/worksheets/sheet1.xml');
-        $this->assertStringContainsString('<autoFilter ref="A2:C4"/>', $xml);
-        $this->assertStringContainsString('<conditionalFormatting sqref="A3:C4">', $xml);
+        $this->assertStringContainsString('<autoFilter ref="A2:C2"/>', $xml);
+        $this->assertStringContainsString('<conditionalFormatting sqref="A1:C2">', $xml);
         $this->assertStringContainsString('r="A22"', $xml, 'the data itself reaches row 22');
     }
 

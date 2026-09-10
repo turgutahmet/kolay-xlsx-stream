@@ -127,13 +127,28 @@ class XlsxStreamException extends \Exception
     }
 
     /**
-     * Create exception for a merge that reaches into the streamed data region
+     * Create exception for a tail range that reaches into the streamed rows
      */
-    public static function templateMergeInDataRegion(string $ref, int $dataStartRow): self
+    public static function templateRangeInDataRegion(string $element, string $ref, int $dataStartRow): self
     {
         return new self(
-            "Template merge '{$ref}' reaches row {$dataStartRow} or below, inside the data region. ".
-            'Merges over streamed rows are not supported; keep merges above dataStartRow.'
+            "Template <{$element}> range '{$ref}' reaches row {$dataStartRow} or below, inside the data region. ".
+            'Everything below the sample rows is copied verbatim, so a range drawn over them would keep '.
+            'covering only those rows once real data is streamed — a filter, format or merge that silently '.
+            'stops short. Keep the range above dataStartRow (a filter across the header row is fine) or drop it.'
+        );
+    }
+
+    /**
+     * Create exception for a template sheet backed by a table part
+     */
+    public static function templateTablePartsUnsupported(): self
+    {
+        return new self(
+            'Template sheet uses <tableParts>. A table keeps its range in xl/tables/tableN.xml and its filter '.
+            'in a workbook defined name, both of which template mode carries across untouched, so the table '.
+            'would still cover only the rows the template declared. Remove the table and keep the styling, '.
+            'or filter across the header row instead.'
         );
     }
 
