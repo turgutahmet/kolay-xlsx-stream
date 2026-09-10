@@ -21,14 +21,50 @@ listed below `Backlog` is "considered, not committed".
 | [2.0.1](CHANGELOG.md#201--2026-05-03) | 2026-05-03 | CI / lint cleanup |
 | [2.0.0](CHANGELOG.md#200--2026-05-03) | 2026-05-03 | DateTime support, native boolean cells, big-int preservation, state machine guards, modernized dependency matrix |
 
-## Next: v3.5 — Resumable exports, Azure Blob source & tail-latency I/O
+## Next: v3.5 — Template mode
 
-Additive, no breaking changes planned. v3.3 shipped the smarter-reads and
-v3.4 the analytics / profiling half of the theme; v3.5 is the **durable**
-half — exports that survive a crash — plus the first non-S3 remote source
-and the tail-latency I/O work deferred from v3.3.
+Additive, no breaking changes; the KXSI format, [SPEC.md](SPEC.md) and the
+`Source` contract are untouched (format byte stays `2`).
 
-### Resumable S3 exports (the headline)
+The expensive part of an .xlsx is not its layout — it is its rows. Template
+mode takes the layout (headers, merges, the style table, column widths, freeze
+panes, rich text) from a workbook **another producer made** — PhpSpreadsheet,
+Excel, or xlsx-stream itself — and streams the rows into it with the streaming
+writer. The template doubles as a **style-id oracle**: a sample row's `s="…"`
+map tells the writer how that producer encoded each style, so no styling API
+has to be reinvented.
+
+```php
+$template = Template::open('/tmp/layout.xlsx');
+$writer = SinkableXlsxWriter::fromTemplate($template, $sink);
+$writer->sheet('Leave', dataStartRow: 3);
+foreach ($rows as $i => $row) {
+    $writer->writeRow($row, variant: $i % 2);   // zebra, styled by the template
+}
+$writer->finishFile();   // untouched sheets + static parts copied byte-identical
+```
+
+Measured on a real report (8,000 × 10 cells): **17× faster, 14× less memory**
+than building the same file with PhpSpreadsheet, and a PhpSpreadsheet
+round-trip over 80 cells shows **zero differences** in value, type, font, fill,
+border, alignment, number format, merge, width, height, freeze and gridlines.
+
+The classic writer is unaffected: template mode is a separate builder family
+behind one boolean, and existing golden outputs stay byte-identical. Everything
+outside the four-point seam (`<sheetData>` cut, shared-strings append, optional
+`styles.xml` append, one `[Content_Types]` override) is copied byte-for-byte —
+the package does not interpret the template, it opens and closes one seam.
+
+## Then: v3.6 — Resumable exports, Azure Blob source & writer styling
+
+### Writer styling API (merge / alignment / sheet name)
+
+Template mode covers *static* layout, but not a merge whose row span is only
+known while streaming. First-class `mergeColumnsByGroup()` (hooking the group
+tracking `syncAtGroupBoundaries()` already does), `halign`/`valign`/`wrap` via
+`setColumnStyle()`, and `setSheetName()` for the first sheet.
+
+### Resumable S3 exports
 
 Snapshot writer state at sync points — the `SCRC` running CRCs shipped
 in v3.2 exist precisely for this. `Writer::resume($snapshot)` after a
@@ -80,7 +116,7 @@ short gap when it beats a round-trip), **`explain()`/`estimatedRows()`**
   the first `write()` so the sink is cheap to instantiate in DI
   contexts.
 
-### Queryable-XLSX follow-ups (PoC-verified, sequenced after v3.5)
+### Queryable-XLSX follow-ups (PoC-verified, sequenced after v3.6)
 
 - **Appendable XLSX** — end the last sheet at a full-flush boundary,
   reopen and continue with a fresh deflate context; on S3,
