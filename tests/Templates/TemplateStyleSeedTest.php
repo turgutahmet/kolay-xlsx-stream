@@ -164,4 +164,45 @@ class TemplateStyleSeedTest extends TestCase
         $this->assertStringContainsString('<borders count="1">', $xml);
         $this->assertStringContainsString('numFmtId="164"', $xml);
     }
+
+    public function test_seed_tables_are_sized_from_elements_not_the_count_attribute(): void
+    {
+        // `count` is optional in the schema, and a producer may leave it
+        // stale. Trusting it would put our first appended xf at index 0,
+        // colliding with the template's own xf 0 — silently wrong styling
+        // rather than an error. Sizes come from the elements themselves.
+        $xml = str_replace(
+            ['<fonts count="2" x14ac:knownFonts="1">', '<fills count="3">', '<cellXfs count="4">'],
+            ['<fonts x14ac:knownFonts="1">', '<fills count="99">', '<cellXfs>'],
+            $this->templateStyles()
+        );
+
+        $registry = StyleRegistry::fromStylesXml($xml);
+        $this->assertSame($xml, $registry->toXml(), 'still byte-identical when nothing is registered');
+
+        // 4 real <xf> in cellXfs → ours is 4, NOT 0.
+        $id = $registry->registerRowStyle(['fill' => '#FFC7CE', 'color' => '#9C0006']);
+        $this->assertSame(4, $id);
+
+        $out = $registry->toXml();
+        // Missing counts are created; the stale 99 is corrected to the truth.
+        $this->assertStringContainsString('<cellXfs count="5">', $out);
+        $this->assertStringContainsString('count="4"', $out, 'fills 3 real + 1 appended');
+        $this->assertMatchesRegularExpression('/<fonts[^>]*count="3"/', $out);
+        // The appended xf references the appended font/fill by true position.
+        $this->assertMatchesRegularExpression('/<xf numFmtId="0" fontId="2" fillId="3"[^>]*\/><\/cellXfs>/', $out);
+    }
+
+    public function test_child_counting_is_scoped_to_its_own_block(): void
+    {
+        // <fill> also lives inside <dxf>, and <xf> inside <cellStyleXfs>;
+        // counting document-wide would inflate both offsets.
+        $registry = StyleRegistry::fromStylesXml($this->templateStyles());
+
+        // cellStyleXfs holds one <xf> and dxfs one <fill> — neither may count.
+        $this->assertSame(4, $registry->registerRowStyle(['bold' => true]), 'cellStyleXfs xf not counted');
+        $registry2 = StyleRegistry::fromStylesXml($this->templateStyles());
+        $registry2->registerRowStyle(['fill' => '#123456']);
+        $this->assertStringContainsString('fillId="3"', $registry2->toXml(), 'dxf fill not counted');
+    }
 }

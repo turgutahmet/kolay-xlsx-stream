@@ -114,15 +114,59 @@ class StyleRegistry
         $registry->fontOffset = self::seedCount($xml, 'fonts');
         $registry->fillOffset = self::seedCount($xml, 'fills');
         $registry->xfOffset = self::seedCount($xml, 'cellXfs');
+        // NB: counted from the elements themselves — see seedCount().
         $registry->numFmtFloor = self::seedNumFmtFloor($xml);
 
         return $registry;
     }
 
-    /** `count` attribute of a seed table, 0 when the block is absent. */
+    /** Seed table name => the child element whose occurrences define its size. */
+    private const SEED_TABLE_CHILD = [
+        'numFmts' => 'numFmt',
+        'fonts' => 'font',
+        'fills' => 'fill',
+        'cellXfs' => 'xf',
+    ];
+
+    /**
+     * Size of a seed table, counted from its CHILD ELEMENTS — never from the
+     * `count` attribute.
+     *
+     * Style ids are positional, and `count` is optional in the schema. A
+     * missing or stale attribute would put our first appended xf at index 0,
+     * colliding with the template's own xf 0, and the file would open with
+     * silently wrong styling rather than an error. Counting is scoped to the
+     * block's own body because `<fill>` also lives inside `<dxf>` and `<xf>`
+     * also lives inside `<cellStyleXfs>`.
+     */
     private static function seedCount(string $xml, string $tag): int
     {
-        return preg_match('/<'.$tag.'\b[^>]*?\bcount="(\d+)"/', $xml, $m) ? (int) $m[1] : 0;
+        return self::countChildren(self::blockBody($xml, $tag), self::SEED_TABLE_CHILD[$tag]);
+    }
+
+    /** Contents between a block's open and close tag, '' when absent or empty. */
+    private static function blockBody(string $xml, string $tag): string
+    {
+        $open = '/<(?:[A-Za-z_][\w.\-]*:)?'.$tag.'\b[^>]*?(\/?)>/';
+        if (! preg_match($open, $xml, $m, PREG_OFFSET_CAPTURE)) {
+            return '';
+        }
+        if ($m[1][0] === '/') {
+            return ''; // <fills/> — an empty table
+        }
+
+        $start = $m[0][1] + \strlen($m[0][0]);
+        $close = '/<\/(?:[A-Za-z_][\w.\-]*:)?'.$tag.'\s*>/';
+        if (! preg_match($close, $xml, $c, PREG_OFFSET_CAPTURE, $start)) {
+            return '';
+        }
+
+        return substr($xml, $start, $c[0][1] - $start);
+    }
+
+    private static function countChildren(string $body, string $child): int
+    {
+        return preg_match_all('/<(?:[A-Za-z_][\w.\-]*:)?'.$child.'(?=[\s\/>])/', $body);
     }
 
     /**
@@ -399,6 +443,10 @@ class StyleRegistry
      * insert is a plain substr splice — never a regex replacement, whose
      * `$` and backslash escapes would mangle a format code.
      *
+     * The refreshed `count` is derived from the elements present plus what we
+     * add — not from the old attribute, which may be missing or stale — and is
+     * created when the block never carried one.
+     *
      * @param  list<string>  $fragments
      */
     private static function spliceInto(string $xml, string $tag, array $fragments): string
@@ -407,13 +455,9 @@ class StyleRegistry
             return $xml;
         }
 
-        $bumped = preg_replace_callback(
-            '/<'.$tag.'\b([^>]*?)\bcount="(\d+)"/',
-            static fn (array $m): string => '<'.$tag.$m[1].'count="'.((int) $m[2] + count($fragments)).'"',
-            $xml,
-            1
-        );
-        $xml = $bumped ?? $xml;
+        $total = self::countChildren(self::blockBody($xml, $tag), self::SEED_TABLE_CHILD[$tag])
+            + count($fragments);
+        $xml = self::withBlockCount($xml, $tag, $total);
 
         $close = '</'.$tag.'>';
         $at = strpos($xml, $close);
@@ -422,6 +466,30 @@ class StyleRegistry
         }
 
         return substr($xml, 0, $at).implode('', $fragments).substr($xml, $at);
+    }
+
+    /** Set the block's `count`, adding the attribute when it is absent. */
+    private static function withBlockCount(string $xml, string $tag, int $total): string
+    {
+        $replaced = preg_replace_callback(
+            '/(<(?:[A-Za-z_][\w.\-]*:)?'.$tag.'\b[^>]*?)\bcount="\d+"/',
+            static fn (array $m): string => $m[1].'count="'.$total.'"',
+            $xml,
+            1,
+            $hits
+        );
+        if ($hits > 0 && $replaced !== null) {
+            return $replaced;
+        }
+
+        $added = preg_replace_callback(
+            '/<(?:[A-Za-z_][\w.\-]*:)?'.$tag.'\b[^>]*?(?=\/?>)/',
+            static fn (array $m): string => $m[0].' count="'.$total.'"',
+            $xml,
+            1
+        );
+
+        return $added ?? $xml;
     }
 
     /**
