@@ -8,6 +8,7 @@ listed below `Backlog` is "considered, not committed".
 
 | Version | Date | Highlights |
 |---|---|---|
+| [3.5.0](CHANGELOG.md#350--2026-09-11) | 2026-09-11 | **Template mode** — stream rows into a layout another producer authored. `Template::open()` + `SinkableXlsxWriter::fromTemplate()` + `sheet($name, $dataStartRow)`; the sample rows below `dataStartRow` are a **style oracle**, picked per row with `writeRow(..., variant: N)` / `writeRows($rows, $variantFor)`. One `<sheetData>` cut, shared-strings append, optional `styles.xml` append, one `[Content_Types]` override — every other entry is **moved, not rewritten** (CRC, compressed size and STORED method preserved). The template's number formats win, including for dates; text cells join its shared string table when it has one; `textColumns()` keeps an identity or tax number as text. Templates whose merge/filter/conditional-format range reaches the data region are **refused** rather than carried across stale. The random-access sidecar works on the streamed sheet. **Parity: 0 differences** vs PhpSpreadsheet's own output (400×6, 12 properties, 1.30.6 and 5.9.0). Classic writer output byte-identical; KXSI format byte stays `2`; SPEC unchanged |
 | [3.4.0](CHANGELOG.md#340--2026-08-02) | 2026-08-02 | The spreadsheet that profiles itself. **`profile()`** — a full per-column report (numeric/empty counts, min/max/avg, certified percentiles, histogram, distinct, top values, correlations) from the sidecar, reading no data rows. **Exact + certified quantiles:** `exactQuantile()` (Rank-Sandwich — the STAT × TDIG certificate brackets the value, then only the blocks that can hold it are read; a sorted column answers from one row), `explainQuantile()` (zero-I/O plan + rank certificate). **New sketches (five additive registered TLV sections):** `correlation()` exact Pearson (`CORR`, centred Welford/Chan moments — accurate on timestamp columns), `topValues()` frequent items (`TOPK`), `argMin()`/`argMax()` extreme-row pointers (`ARGP`), `quantile(col,q,from,to)` + `groupQuantile()` range/group percentiles (`TDGB`), string `rowsWhere()`/`findRow()` (`STRZ`, normative unsigned-UTF-8 collation — Turkish İ/ı is byte order, not locale). **Scan:** `histogram()` (equi-width / equi-depth), `countEmpty()`, late-materialization (probe-then-tokenize, planner-gated, byte-identical). KXSI format byte stays `2`; classic writer output byte-identical; SPEC doc 1.8.1 |
 | [3.3.0](CHANGELOG.md#330--2026-07-06) | 2026-07-06 | The query engine grows up + integrity + O(1) S3 writes. **Query:** `rowsWhereAll()` (multi-predicate AND via zone-map intersection), `estimatedRows()`/`explain()` (zero-I/O plans), `topRows()` (indexed ORDER BY … LIMIT), `sampleRows()` (seeded uniform sample), column addressing by header name, `Bucket::month/day/year` for `groupStats`, bounded ranged reads + gap-bridging. **Writer/DX:** `queryable()` one-call preset, opt-in `compact()` (r-less cells, ~52–62% smaller sheets), `syncAtGroupBoundaries()` (zero-scan `groupStats`), `onFullScan()` hook. **Integrity:** `verify()` (block-granularity CRC report), opt-in per-part `Content-MD5` so S3 rejects a corrupted part. **Fixed:** S3 multipart writes are now O(1) memory (was O(file size)) — default `concurrency` 1, parallel opt-in. No breaking changes (base `Source` contract stable; classic output byte-identical) |
 | [3.2.2](CHANGELOG.md#322--2026-07-05) | 2026-07-05 | Correctness patch: on auto-split workbooks (>1,048,575 rows) the entire query surface — `rowCount`/`rows`/`rowAt`/`rowRange`/`rowsWhere`/`findRow`/`columnStats`/`groupStats`/`quantile`/`countDistinct`/`shards` — now spans the continuation chain as one logical table instead of silently answering from the active sheet alone; misleading never-read config keys removed |
@@ -21,7 +22,7 @@ listed below `Backlog` is "considered, not committed".
 | [2.0.1](CHANGELOG.md#201--2026-05-03) | 2026-05-03 | CI / lint cleanup |
 | [2.0.0](CHANGELOG.md#200--2026-05-03) | 2026-05-03 | DateTime support, native boolean cells, big-int preservation, state machine guards, modernized dependency matrix |
 
-## Next: v3.5 — Template mode
+## Shipped in v3.5 — Template mode
 
 Additive, no breaking changes; the KXSI format, [SPEC.md](SPEC.md) and the
 `Source` contract are untouched (format byte stays `2`).
@@ -67,7 +68,7 @@ outside the four-point seam (`<sheetData>` cut, shared-strings append, optional
 `styles.xml` append, one `[Content_Types]` override) is copied byte-for-byte —
 the package does not interpret the template, it opens and closes one seam.
 
-## Then: v3.6 — Resumable exports, Azure Blob source & writer styling
+## Next: v3.6 — Resumable exports, Azure Blob source & writer styling
 
 ### Writer styling API (merge / alignment / sheet name)
 
@@ -75,6 +76,18 @@ Template mode covers *static* layout, but not a merge whose row span is only
 known while streaming. First-class `mergeColumnsByGroup()` (hooking the group
 tracking `syncAtGroupBoundaries()` already does), `halign`/`valign`/`wrap` via
 `setColumnStyle()`, and `setSheetName()` for the first sheet.
+
+### Two gaps template mode surfaced
+
+- **`extendTailRanges()`** — opt-in, sheet-internal ranges only. A template's
+  auto filter or conditional format is currently refused when it reaches the
+  data region, because the tail is copied verbatim. Extending those ranges to
+  the last written row is a real improvement, but a table's range and a
+  `_FilterDatabase` defined name live in other parts of the archive, so the
+  opt-in would deliberately stop at the sheet boundary.
+- **A text-column declaration for the classic writer.** `textColumns()` exists
+  only in template mode. The classic writer has the same gap — an eleven-digit
+  identity number is written as a number — with no escape hatch.
 
 ### Resumable S3 exports
 

@@ -49,6 +49,25 @@ $template->close();
   package's default, and `setColumnFormat()` throws in template mode instead
   of competing with it.
 
+### One case that is not "nothing to change": subclasses
+
+Callers are unaffected — every addition is a new method or a trailing
+optional argument. But a class that **extends** the writer or the reader and
+**overrides** one of these methods must widen its own signature to match, or
+PHP refuses to load it with `Declaration … must be compatible`:
+
+| Method | v3.3 signature | now |
+|---|---|---|
+| `writeRow` | `(array $row, ?int $styleId = null)` | `(array $row, ?int $styleId = null, int $variant = 0)` |
+| `writeRows` | `(iterable $rows)` | `(iterable $rows, ?callable $variantFor = null)` |
+| `findRow` | `(int\|string $column, int\|float $value)` | `(int\|string $column, int\|float\|string $value)` |
+| `rowsWhere` | `(…, int\|float $value, int\|float\|null $value2 = null)` | `(…, int\|float\|string $value, int\|float\|string\|null $value2 = null)` |
+| `quantile` | `(int\|string $column, float $q)` | `(int\|string $column, float $q, ?int $from = null, ?int $to = null)` |
+
+`findRow`, `rowsWhere` and `quantile` moved in v3.4 when string queries and
+range quantiles arrived; `writeRow` and `writeRows` moved in v3.5. A project
+that only calls these methods needs no change at all.
+
 ### If you query the result
 
 `withRandomAccessIndex()` and the analytics opt-ins work on the streamed

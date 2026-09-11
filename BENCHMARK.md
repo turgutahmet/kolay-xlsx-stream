@@ -418,6 +418,13 @@ inside the noise, because the shorter cell bodies deflate faster than the
 interning costs — and it costs memory, which is the one place this mode
 holds state proportional to the data.
 
+The percentages above time the row loop only. The setup they exclude —
+opening the template, seeding the style table and the shared strings from
+it, parsing the sheet and cutting it — was measured separately at **0.17 ms**
+for a template this package wrote and **0.19 ms** for one PhpSpreadsheet
+wrote, medians of 40 runs. That is a fixed cost per file, below a millisecond,
+so it does not change the picture even for a hundred-row export.
+
 That memory is the shared string dictionary: **+12.8 MB for ~100,000
 distinct strings**, roughly 130 bytes per entry. It is bounded by the
 `maxUniqueStrings` ceiling passed to `useTemplate()` / `fromTemplate()`,
@@ -429,6 +436,58 @@ An earlier run of the 8,000-row case over 3 processes reported +24 % for
 the shared-string mode. That was noise on a 50 ms workload, not a result;
 the numbers above are the median of 9 and the two modes are indistinguishable
 at that size.
+
+### 5.4 Did v3.5 cost the classic paths anything?
+
+Template mode added a builder family and a dispatch to the writer's hot
+path, so the v3.4.0 tag and the v3.5 tree were measured side by side on the
+canonical 8-column workload. Each tree is loaded through a prepended
+autoloader and the run aborts unless the class actually resolves inside the
+tree under test — sharing one vendor directory would otherwise have both
+"versions" running the same code.
+
+| Workload | v3.4.0 | v3.5 | Delta |
+|---|---|---|---|
+| Local write, 200K rows | 0.876 s | 0.889 s | +1.5 % |
+| Local write, 200K rows, indexed | 0.874 s | 0.875 s | +0.1 % |
+| Local read, 200K rows | 2.124 s | 2.103 s | −1.0 % |
+| S3 read, 100K rows | 3.20 s | 3.25 s | +1.5 % |
+| Peak RAM, every workload | identical | identical | — |
+
+Medians of 5 local runs and 8 S3 runs in alternating order, fresh process
+each. Every delta is inside this machine's run-to-run spread, which the
+earlier template measurement put at about ±5 % on a one-second workload.
+
+**S3 write is measured separately, because one number would misrepresent
+it.** Fifteen alternating runs per version at 100K rows:
+
+| | best | p25 | median | p75 | worst |
+|---|---|---|---|---|---|
+| v3.4.0 | 2.52 s | 2.80 s | 4.19 s | 10.02 s | 11.01 s |
+| v3.5 | 2.61 s | 3.19 s | 4.31 s | 10.07 s | 10.94 s |
+
+The distribution is bimodal for both: a fast cluster between 2.5 and 6
+seconds and a slow cluster tight against 10 seconds, which five of fifteen
+runs hit on each version. A cluster that lands on a round number is a
+retry or a timeout on the upload side, not throughput, so it says nothing
+about the library. Version to version the two distributions are the same
+shape with the same split, and the byte output is identical.
+
+An earlier three-run sample of this same workload made v3.5 look 2.8×
+faster than v3.4.0. It was the slow mode landing three times on one version
+and none on the other. Three runs of a bimodal distribution is not a
+measurement.
+
+**The output did not change.** Writing the same 50,000 rows through both
+trees produces archives with the same entries in the same order, the same
+content for every entry, the same CRCs and the same total size. The indexed
+fixtures hash identically, sidecar included.
+
+**Files cross versions in both directions.** A v3.4.0 file read by v3.5 and
+a v3.5 file read by v3.4.0 return identical answers across `rowCount`,
+`rowAt`, `quantile`, `exactQuantile` with its certificate, `findRow` by
+number and by string, `rowsWhere`, `correlation`, `columnStats` and
+`verify` — which is what the format byte staying `2` is supposed to mean.
 
 ---
 

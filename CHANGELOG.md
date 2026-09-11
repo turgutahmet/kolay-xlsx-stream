@@ -5,7 +5,7 @@ All notable changes to `kolay/xlsx-stream` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — 3.5.0
+## [3.5.0] — 2026-09-11
 
 Template mode: stream rows into a layout another producer authored. A
 backward-compatible minor — the classic writer's output stays byte-identical,
