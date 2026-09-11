@@ -4,9 +4,11 @@ namespace Kolay\XlsxStream\Writers;
 
 use Aws\S3\S3Client;
 use Kolay\XlsxStream\Contracts\Sink;
+use Kolay\XlsxStream\Contracts\Source;
 use Kolay\XlsxStream\Exceptions\XlsxStreamException;
 use Kolay\XlsxStream\Sinks\FileSink;
 use Kolay\XlsxStream\Sinks\S3MultipartSink;
+use Kolay\XlsxStream\Templates\Template;
 
 /**
  * Sinkable XLSX Writer - S3 & Local File Compatible
@@ -30,6 +32,33 @@ class SinkableXlsxWriter extends BaseXlsxWriter
     public static function createForFile(string $path): self
     {
         return new self(new FileSink($path));
+    }
+
+    /**
+     * Create a writer that streams rows into another producer's layout.
+     *
+     * Accepts an already-opened Template, a Source, or a path to the
+     * template workbook:
+     *
+     *   $writer = SinkableXlsxWriter::fromTemplate(new FileSink($out), $layoutPath);
+     *   $writer->sheet('Leaves', dataStartRow: 3);
+     *
+     * See BaseXlsxWriter::useTemplate() for what the template owns and what
+     * the writer is still allowed to decide.
+     */
+    public static function fromTemplate(
+        Sink $sink,
+        Template|Source|string $template,
+        int $maxUniqueStrings = SharedStringTable::DEFAULT_MAX_UNIQUE
+    ): self {
+        $writer = new self($sink);
+        $writer->useTemplate(
+            $template instanceof Template ? $template : Template::open($template),
+            $maxUniqueStrings
+        );
+        $writer->templateOwned = ! $template instanceof Template;
+
+        return $writer;
     }
 
     /**
@@ -195,34 +224,43 @@ class SinkableXlsxWriter extends BaseXlsxWriter
             throw XlsxStreamException::writerAlreadyClosed();
         }
         if (!$this->started) {
-            throw XlsxStreamException::headersNotSet();
+            throw $this->templateMode
+                ? XlsxStreamException::templateSheetNotSelected()
+                : XlsxStreamException::headersNotSet();
         }
 
         try {
-            if ($this->currentSheetRow > 0) {
-                $this->flushRowBuffer();
-                $this->finishCurrentSheet();
-            }
+            if ($this->templateMode) {
+                // Template mode authors nothing the template already owns —
+                // the workbook, the rels and the content types are carried
+                // across, so only the remainder pass runs here.
+                $this->writeTemplateRemainder();
+            } else {
+                if ($this->currentSheetRow > 0) {
+                    $this->flushRowBuffer();
+                    $this->finishCurrentSheet();
+                }
 
-            // Empty workbook = invalid XLSX (Excel and most readers reject
-            // <sheets/>). Fail loudly so the caller realises they had no
-            // data instead of producing a file users can't open.
-            if (empty($this->sheets)) {
-                throw XlsxStreamException::emptyWorkbook();
-            }
+                // Empty workbook = invalid XLSX (Excel and most readers reject
+                // <sheets/>). Fail loudly so the caller realises they had no
+                // data instead of producing a file users can't open.
+                if (empty($this->sheets)) {
+                    throw XlsxStreamException::emptyWorkbook();
+                }
 
-            $this->writeStaticFile('xl/styles.xml', $this->getStylesXml());
-            if ($this->randomAccessIndexEnabled) {
-                $this->writeStaticFile(
-                    RandomAccessIndex::ENTRY_PATH,
-                    $this->buildRandomAccessIndexPayload()
-                );
-            }
-            $this->writeStaticFile('xl/_rels/workbook.xml.rels', $this->getWorkbookRelsXml());
-            $this->writeStaticFile('xl/workbook.xml', $this->getWorkbookXml());
-            $this->writeStaticFile('[Content_Types].xml', $this->getContentTypesXml());
+                $this->writeStaticFile('xl/styles.xml', $this->getStylesXml());
+                if ($this->randomAccessIndexEnabled) {
+                    $this->writeStaticFile(
+                        RandomAccessIndex::ENTRY_PATH,
+                        $this->buildRandomAccessIndexPayload()
+                    );
+                }
+                $this->writeStaticFile('xl/_rels/workbook.xml.rels', $this->getWorkbookRelsXml());
+                $this->writeStaticFile('xl/workbook.xml', $this->getWorkbookXml());
+                $this->writeStaticFile('[Content_Types].xml', $this->getContentTypesXml());
 
-            $this->writeCentralDirectory();
+                $this->writeCentralDirectory();
+            }
 
             $this->sink->close();
             $this->closed = true;

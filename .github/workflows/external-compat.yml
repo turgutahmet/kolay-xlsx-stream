@@ -31,3 +31,33 @@ jobs:
 
       - name: Run external roundtrip tests
         run: php tests/compat/external_readers_roundtrip.php
+
+  # Template parity runs across PhpSpreadsheet majors on purpose. The two
+  # lines differ in ways a template feature feels: 1.x writes an empty
+  # <tableParts count="0"/> on every sheet, which a naive "no tables"
+  # guard refuses, and only a 1.x leg would have caught that. Both must
+  # produce a layout this package can stream into with zero differences.
+  template-parity:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        phpspreadsheet: ['^1.29', '^5.0']
+    name: template parity (PhpSpreadsheet ${{ matrix.phpspreadsheet }})
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: mbstring, zip
+          tools: composer:v2
+
+      - name: Install package + PhpSpreadsheet
+        run: |
+          composer install --no-progress --no-interaction
+          composer require --dev --no-interaction \
+            "phpoffice/phpspreadsheet:${{ matrix.phpspreadsheet }}"
+
+      - name: Run template-mode parity
+        run: php tests/compat/template_roundtrip.php

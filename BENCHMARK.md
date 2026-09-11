@@ -326,7 +326,172 @@ The indexed reader reads `total_rows` straight out of the sidecar header — one
 
 ---
 
-## 5. Methodology & reproducibility
+## 5. Template mode — new in v3.5
+
+Template mode takes a layout another producer authored and streams rows
+into one sheet's `<sheetData>`, carrying every other part across without
+inflating it. Two things need measuring: whether the result is the file
+that producer would have written, and what the mechanism costs.
+
+Apple M4 laptop, PHP 8.2.28, PhpSpreadsheet 5.9.0, September 2026. The
+layout under test is a leave report — merged title, styled header row,
+five per-column number formats including a date and a datetime,
+alternating body styles, column widths, custom row heights, a frozen pane
+and gridlines off. A two-column fixture round-trips trivially and would
+measure nothing.
+
+### 5.1 Parity — is it the same file?
+
+`tests/compat/template_roundtrip.php` builds that layout twice. Once
+PhpSpreadsheet writes the layout **and** the rows. Once PhpSpreadsheet
+writes only the layout and two sample rows, and this package streams the
+rows into it. Both files are then read back through PhpSpreadsheet and
+compared cell by cell.
+
+| Compared | Result |
+|---|---|
+| 400 rows × 6 columns × 12 properties, PhpSpreadsheet 5.9.0 | **0 differences** |
+| the same, PhpSpreadsheet 1.30.6 | **0 differences** |
+
+Both majors run on tag day. They differ in ways a template feature feels —
+1.x writes an empty `<tableParts count="0"/>` on every sheet, which a guard
+against table-backed sheets refuses unless it triggers on an actual
+`<tablePart>` — and only a 1.x leg catches that.
+
+The twelve are value, data type, number format, font weight, font size,
+font colour, fill type, fill colour, all four borders, horizontal and
+vertical alignment, plus merges, column widths, row heights, frozen pane
+and gridlines at sheet level.
+
+One representation difference is normalised rather than reported: a whole
+float is written `549.0` by PhpSpreadsheet, which preserves its own PHP
+type, and `549` by this writer, because PHP's float-to-string drops the
+trailing zero. Excel reads both as the same number, so numeric cells are
+compared as numbers. Text cells stay strings, so a numeric-looking string
+is still compared strictly.
+
+The comparator was checked against two deliberate breakages before the
+result was trusted: forcing every row onto style variant 0 reports 26
+colour and fill differences, and starting the data one row late reports
+value and type differences from the first cell on.
+
+### 5.2 Cost against PhpSpreadsheet
+
+Same layout, 20,000 rows × 6 columns, rows supplied by a generator.
+
+| | Wall time | Peak RAM | Output |
+|---|---|---|---|
+| PhpSpreadsheet writes layout + rows | 28.41 s | 123.3 MB | 821,327 B |
+| PhpSpreadsheet writes layout, xlsx-stream writes rows | **0.107 s** | **6.0 MB** | 832,195 B |
+| | **265×** | **20.6×** | +1.3 % |
+
+The memory gap is structural rather than incidental: PhpSpreadsheet holds
+the whole sheet as objects before writing, so its peak grows with the row
+count, while the streamed path never holds more than one row buffer. The
+output is 1.3 % larger because our style table appends rather than
+de-duplicating against entries it deliberately treats as opaque.
+
+**Read this ratio with its workload, not as a headline.** The README and the
+roadmap quote 17× faster and 14× less memory, measured on a real 8,000 × 10
+report where PhpSpreadsheet took 3.1 s. The 265× above is 20,000 × 6 where it
+took 28.4 s. Neither number is wrong and neither generalises: PhpSpreadsheet's
+per-row cost is dominated by the style objects it builds for every cell, so it
+grows faster than linearly with the row count while the streamed path stays
+flat. A number without its load is not a measurement.
+
+### 5.3 Cost against this package's own classic writer
+
+`bench/template_bench.php` writes identical data through both paths onto
+visually identical sheets. Median of 9 fresh processes each.
+
+| Workload | classic | template | template + shared strings |
+|---|---|---|---|
+| 8,000 × 10 — wall time | 0.052 s | 0.055 s (**+4.2 %**) | 0.055 s (**+4.0 %**) |
+| 8,000 × 10 — peak RAM | 6 MB | 6 MB | 8 MB |
+| 100,000 × 20 — wall time | 1.282 s | 1.341 s (**+4.6 %**) | 1.272 s (**−0.8 %**) |
+| 100,000 × 20 — peak RAM | 8 MB | 8 MB | 20.8 MB |
+
+Reading the table: the row-builder dispatch costs about 4 %, which is the
+price of the twin-builder family and the per-cell style lookup. Interning
+into a shared string table costs nothing in time — at 100,000 rows it is
+inside the noise, because the shorter cell bodies deflate faster than the
+interning costs — and it costs memory, which is the one place this mode
+holds state proportional to the data.
+
+The percentages above time the row loop only. The setup they exclude —
+opening the template, seeding the style table and the shared strings from
+it, parsing the sheet and cutting it — was measured separately at **0.17 ms**
+for a template this package wrote and **0.19 ms** for one PhpSpreadsheet
+wrote, medians of 40 runs. That is a fixed cost per file, below a millisecond,
+so it does not change the picture even for a hundred-row export.
+
+That memory is the shared string dictionary: **+12.8 MB for ~100,000
+distinct strings**, roughly 130 bytes per entry. It is bounded by the
+`maxUniqueStrings` ceiling passed to `useTemplate()` / `fromTemplate()`,
+which defaults to 500,000; past the ceiling a new string is written inline
+instead, so the file stays valid and memory stops growing. A template
+without an `xl/sharedStrings.xml` part never enters this path at all.
+
+An earlier run of the 8,000-row case over 3 processes reported +24 % for
+the shared-string mode. That was noise on a 50 ms workload, not a result;
+the numbers above are the median of 9 and the two modes are indistinguishable
+at that size.
+
+### 5.4 Did v3.5 cost the classic paths anything?
+
+Template mode added a builder family and a dispatch to the writer's hot
+path, so the v3.4.0 tag and the v3.5 tree were measured side by side on the
+canonical 8-column workload. Each tree is loaded through a prepended
+autoloader and the run aborts unless the class actually resolves inside the
+tree under test — sharing one vendor directory would otherwise have both
+"versions" running the same code.
+
+| Workload | v3.4.0 | v3.5 | Delta |
+|---|---|---|---|
+| Local write, 200K rows | 0.876 s | 0.889 s | +1.5 % |
+| Local write, 200K rows, indexed | 0.874 s | 0.875 s | +0.1 % |
+| Local read, 200K rows | 2.124 s | 2.103 s | −1.0 % |
+| S3 read, 100K rows | 3.20 s | 3.25 s | +1.5 % |
+| Peak RAM, every workload | identical | identical | — |
+
+Medians of 5 local runs and 8 S3 runs in alternating order, fresh process
+each. Every delta is inside this machine's run-to-run spread, which the
+earlier template measurement put at about ±5 % on a one-second workload.
+
+**S3 write is measured separately, because one number would misrepresent
+it.** Fifteen alternating runs per version at 100K rows:
+
+| | best | p25 | median | p75 | worst |
+|---|---|---|---|---|---|
+| v3.4.0 | 2.52 s | 2.80 s | 4.19 s | 10.02 s | 11.01 s |
+| v3.5 | 2.61 s | 3.19 s | 4.31 s | 10.07 s | 10.94 s |
+
+The distribution is bimodal for both: a fast cluster between 2.5 and 6
+seconds and a slow cluster tight against 10 seconds, which five of fifteen
+runs hit on each version. A cluster that lands on a round number is a
+retry or a timeout on the upload side, not throughput, so it says nothing
+about the library. Version to version the two distributions are the same
+shape with the same split, and the byte output is identical.
+
+An earlier three-run sample of this same workload made v3.5 look 2.8×
+faster than v3.4.0. It was the slow mode landing three times on one version
+and none on the other. Three runs of a bimodal distribution is not a
+measurement.
+
+**The output did not change.** Writing the same 50,000 rows through both
+trees produces archives with the same entries in the same order, the same
+content for every entry, the same CRCs and the same total size. The indexed
+fixtures hash identically, sidecar included.
+
+**Files cross versions in both directions.** A v3.4.0 file read by v3.5 and
+a v3.5 file read by v3.4.0 return identical answers across `rowCount`,
+`rowAt`, `quantile`, `exactQuantile` with its certificate, `findRow` by
+number and by string, `rowsWhere`, `correlation`, `columnStats` and
+`verify` — which is what the format byte staying `2` is supposed to mean.
+
+---
+
+## 6. Methodology & reproducibility
 
 ### Scripts
 
@@ -382,7 +547,7 @@ Identical to the v1.x and v2.2.2 baselines so cross-version comparisons stay cle
 
 ---
 
-## 6. Comparison table — what changed since v2.2.2
+## 7. Comparison table — what changed since v2.2.2
 
 | Workload | v3.0 | v2.2.2 | Diff |
 |---|---|---|---|
@@ -407,7 +572,7 @@ Write is **unchanged** from v2.2.2 within measurement noise — opt-in indexing 
 ---
 ---
 
-## 7. Appendix — historical benchmark tables (moved from README, July 2026)
+## 8. Appendix — historical benchmark tables (moved from README, July 2026)
 
 Everything below previously lived in README.md. Preserved verbatim for
 cross-version comparison; the README now carries only the current

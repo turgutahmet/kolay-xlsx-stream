@@ -78,6 +78,17 @@ class ZipDirectory
         return $this->entries[$name] ?? null;
     }
 
+    /**
+     * Every entry name in central-directory order. Template mode copies
+     * the untouched entries verbatim, so it needs the full listing.
+     *
+     * @return list<string>
+     */
+    public function names(): array
+    {
+        return array_keys($this->entries);
+    }
+
     public function has(string $name): bool
     {
         return isset($this->entries[$name]);

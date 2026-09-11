@@ -1,5 +1,84 @@
 # Upgrade Guide
 
+## Upgrading from v3.4.0 to v3.5.0
+
+**Nothing to change.** No breaking API changes and no behavioural changes to
+anything that exists today: every call site works unchanged, classic writer
+output stays byte-identical, the base `Source` contract is unchanged, the KXSI
+format byte stays `2` and [SPEC.md](SPEC.md) is unchanged. A v3.5 reader reads
+v3.3 and v3.4 files unchanged, and 3.3 → 3.5 is a single step.
+
+`writeRow()` and `writeRows()` gained trailing optional arguments, so existing
+calls keep their meaning:
+
+```php
+public function writeRow(array $row, ?int $styleId = null, int $variant = 0): void
+public function writeRows(iterable $rows, ?callable $variantFor = null): void
+```
+
+### The new capability
+
+Template mode streams rows into a layout another producer authored. See
+[Template mode](README.md#template-mode--stream-into-someone-elses-layout-v35)
+in the README for the full surface; the shape is:
+
+```php
+$template = Template::open($layoutPath);
+$writer = SinkableXlsxWriter::fromTemplate($sink, $template);
+$writer->sheet('Leaves', dataStartRow: 3);
+$writer->writeRows($rows, fn ($row, $i) => $i % 2);
+$writer->finishFile();
+$template->close();
+```
+
+### Three things worth knowing before you write a template
+
+- **Keep every range above the data.** A merge, auto filter, conditional
+  format or data validation whose range reaches `dataStartRow` or below is
+  refused when the template is opened. Everything below the sample rows is
+  copied verbatim, so such a range would keep covering only the rows the
+  template declared — a filter that silently stops after four rows. Draw the
+  filter across the header row instead. A sheet backed by a table
+  (`<tableParts>`) is refused for the same reason: its range lives in another
+  part of the archive.
+- **A file this package wrote with `enableAutoFilter()` cannot be a
+  template**, because that filter spans the whole sheet by construction.
+  Author templates in Excel or PhpSpreadsheet, or drop the filter.
+- **The template decides the formats.** A `DateTimeInterface` in a column the
+  sample row styled takes that column's number format rather than this
+  package's default, and `setColumnFormat()` throws in template mode instead
+  of competing with it.
+
+### One case that is not "nothing to change": subclasses
+
+Callers are unaffected — every addition is a new method or a trailing
+optional argument. But a class that **extends** the writer or the reader and
+**overrides** one of these methods must widen its own signature to match, or
+PHP refuses to load it with `Declaration … must be compatible`:
+
+| Method | v3.3 signature | now |
+|---|---|---|
+| `writeRow` | `(array $row, ?int $styleId = null)` | `(array $row, ?int $styleId = null, int $variant = 0)` |
+| `writeRows` | `(iterable $rows)` | `(iterable $rows, ?callable $variantFor = null)` |
+| `findRow` | `(int\|string $column, int\|float $value)` | `(int\|string $column, int\|float\|string $value)` |
+| `rowsWhere` | `(…, int\|float $value, int\|float\|null $value2 = null)` | `(…, int\|float\|string $value, int\|float\|string\|null $value2 = null)` |
+| `quantile` | `(int\|string $column, float $q)` | `(int\|string $column, float $q, ?int $from = null, ?int $to = null)` |
+
+`findRow`, `rowsWhere` and `quantile` moved in v3.4 when string queries and
+range quantiles arrived; `writeRow` and `writeRows` moved in v3.5. A project
+that only calls these methods needs no change at all.
+
+### If you query the result
+
+`withRandomAccessIndex()` and the analytics opt-ins work on the streamed
+sheet. Two differences from a classic write:
+
+- Sheets carried across untouched carry no index section. They still read
+  correctly; the reader scans them instead of seeking.
+- The reader treats physical row 1 as the header. If your template's first
+  row is a merged report title rather than column names, address columns by
+  index rather than by name.
+
 ## Upgrading from v3.3.0 to v3.4.0
 
 **Nothing to change.** No breaking API changes, no behavioral changes: every

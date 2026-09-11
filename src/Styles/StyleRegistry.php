@@ -67,6 +67,138 @@ class StyleRegistry
         null, // built-in: <patternFill patternType="gray125"/>
     ];
 
+    /**
+     * Template mode: the seed stylesheet, kept VERBATIM. A template carries
+     * borders, cellStyleXfs, dxfs, tableStyles and colors this package does
+     * not model, so a seeded registry never regenerates the document — it
+     * appends into it and leaves every other byte alone.
+     */
+    private ?string $seedXml = null;
+
+    private bool $seeded = false;
+
+    /** Index of our first appended entry in each seeded table. */
+    private int $fontOffset = 0;
+
+    private int $fillOffset = 0;
+
+    private int $xfOffset = 0;
+
+    /** Highest numFmtId already used by the seed; ours continue above it. */
+    private int $numFmtFloor = self::CUSTOM_NUMFMT_START - 1;
+
+    /**
+     * Seed the registry from a template's styles.xml.
+     *
+     * The seed is the authority. Registering nothing gives that stylesheet
+     * back byte-for-byte — the common case, since most templates already
+     * carry every style their sample rows reference. Registering a style
+     * APPENDS a font/fill/xf to the end of the matching table and bumps its
+     * count, so ids the template already handed out never shift.
+     *
+     * Entries are not de-duplicated against the seed's own (that would mean
+     * parsing fonts and fills we deliberately treat as opaque), so a style
+     * identical to one already in the template becomes a second entry —
+     * harmless, and the price of not interpreting the file.
+     */
+    public static function fromStylesXml(string $xml): self
+    {
+        $registry = new self();
+        $registry->seedXml = $xml;
+        $registry->seeded = true;
+        // Our tables now hold ONLY what we append; the seed owns the rest.
+        $registry->customNumFmts = [];
+        $registry->fonts = [];
+        $registry->fills = [];
+        $registry->cellXfs = [];
+        $registry->fontOffset = self::seedCount($xml, 'fonts');
+        $registry->fillOffset = self::seedCount($xml, 'fills');
+        $registry->xfOffset = self::seedCount($xml, 'cellXfs');
+        // NB: counted from the elements themselves — see seedCount().
+        $registry->numFmtFloor = self::seedNumFmtFloor($xml);
+
+        return $registry;
+    }
+
+    /**
+     * True when this registry is a template seed nothing has been appended
+     * to, so the template's own styles.xml can be moved into the output
+     * instead of re-rendered.
+     */
+    public function isSeedUnmodified(): bool
+    {
+        return $this->seeded
+            && $this->customNumFmts === []
+            && $this->fonts === []
+            && $this->fills === []
+            && $this->cellXfs === [];
+    }
+
+    /** Seed table name => the child element whose occurrences define its size. */
+    private const SEED_TABLE_CHILD = [
+        'numFmts' => 'numFmt',
+        'fonts' => 'font',
+        'fills' => 'fill',
+        'cellXfs' => 'xf',
+    ];
+
+    /**
+     * Size of a seed table, counted from its CHILD ELEMENTS — never from the
+     * `count` attribute.
+     *
+     * Style ids are positional, and `count` is optional in the schema. A
+     * missing or stale attribute would put our first appended xf at index 0,
+     * colliding with the template's own xf 0, and the file would open with
+     * silently wrong styling rather than an error. Counting is scoped to the
+     * block's own body because `<fill>` also lives inside `<dxf>` and `<xf>`
+     * also lives inside `<cellStyleXfs>`.
+     */
+    private static function seedCount(string $xml, string $tag): int
+    {
+        return self::countChildren(self::blockBody($xml, $tag), self::SEED_TABLE_CHILD[$tag]);
+    }
+
+    /** Contents between a block's open and close tag, '' when absent or empty. */
+    private static function blockBody(string $xml, string $tag): string
+    {
+        $open = '/<(?:[A-Za-z_][\w.\-]*:)?'.$tag.'\b[^>]*?(\/?)>/';
+        if (! preg_match($open, $xml, $m, PREG_OFFSET_CAPTURE)) {
+            return '';
+        }
+        if ($m[1][0] === '/') {
+            return ''; // <fills/> — an empty table
+        }
+
+        $start = $m[0][1] + \strlen($m[0][0]);
+        $close = '/<\/(?:[A-Za-z_][\w.\-]*:)?'.$tag.'\s*>/';
+        if (! preg_match($close, $xml, $c, PREG_OFFSET_CAPTURE, $start)) {
+            return '';
+        }
+
+        return substr($xml, $start, $c[0][1] - $start);
+    }
+
+    private static function countChildren(string $body, string $child): int
+    {
+        return preg_match_all('/<(?:[A-Za-z_][\w.\-]*:)?'.$child.'(?=[\s\/>])/', $body);
+    }
+
+    /**
+     * Highest numFmtId the seed declares. Only <numFmt> declarations count —
+     * an <xf numFmtId="165"> merely references one.
+     */
+    private static function seedNumFmtFloor(string $xml): int
+    {
+        $floor = self::CUSTOM_NUMFMT_START - 1;
+        if (preg_match_all('/<numFmt\b[^>]*?\bnumFmtId="(\d+)"/', $xml, $m)) {
+            foreach ($m[1] as $id) {
+                $floor = max($floor, (int) $id);
+            }
+        }
+
+        return $floor;
+    }
+
     public function __construct()
     {
         // Reserve numFmtId 164 for the legacy datetime format used at cellXfs[1].
@@ -209,8 +341,8 @@ class StyleRegistry
      */
     public function mergeRowStyleWithColumn(int $rowStyleId, int $columnStyleId): int
     {
-        $row = $this->cellXfs[$rowStyleId] ?? null;
-        $col = $this->cellXfs[$columnStyleId] ?? null;
+        $row = $this->cellXfs[$rowStyleId - $this->xfOffset] ?? null;
+        $col = $this->cellXfs[$columnStyleId - $this->xfOffset] ?? null;
 
         // Defensive: an unknown id means the caller passed something we never
         // handed out. Fall back to whichever side we do know rather than
@@ -251,6 +383,10 @@ class StyleRegistry
      */
     public function toXml(): string
     {
+        if ($this->seedXml !== null) {
+            return $this->seededXml();
+        }
+
         $xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
         $xml .= '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">';
 
@@ -266,16 +402,7 @@ class StyleRegistry
         // <fonts>
         $xml .= '<fonts count="'.count($this->fonts).'">';
         foreach ($this->fonts as $font) {
-            $xml .= '<font>';
-            $xml .= '<sz val="'.$font['size'].'"/>';
-            if ($font['bold']) {
-                $xml .= '<b/>';
-            }
-            if ($font['color'] !== null) {
-                $xml .= '<color rgb="FF'.ltrim($font['color'], '#').'"/>';
-            }
-            $xml .= '<name val="'.htmlspecialchars($font['name'], ENT_QUOTES | ENT_XML1).'"/>';
-            $xml .= '</font>';
+            $xml .= self::renderFont($font);
         }
         $xml .= '</fonts>';
 
@@ -284,8 +411,7 @@ class StyleRegistry
         $xml .= '<fill><patternFill patternType="none"/></fill>';
         $xml .= '<fill><patternFill patternType="gray125"/></fill>';
         for ($i = 2; $i < count($this->fills); $i++) {
-            $color = ltrim($this->fills[$i] ?? '', '#');
-            $xml .= '<fill><patternFill patternType="solid"><fgColor rgb="FF'.$color.'"/></patternFill></fill>';
+            $xml .= self::renderSolidFill((string) ($this->fills[$i] ?? ''));
         }
         $xml .= '</fills>';
 
@@ -294,22 +420,7 @@ class StyleRegistry
         // <cellXfs>
         $xml .= '<cellXfs count="'.count($this->cellXfs).'">';
         foreach ($this->cellXfs as $xf) {
-            $xml .= '<xf';
-            $xml .= ' numFmtId="'.$xf['numFmtId'].'"';
-            $xml .= ' fontId="'.$xf['fontId'].'"';
-            $xml .= ' fillId="'.$xf['fillId'].'"';
-            $xml .= ' borderId="0"';
-            $xml .= ' xfId="0"';
-            if ($xf['applyNumberFormat']) {
-                $xml .= ' applyNumberFormat="1"';
-            }
-            if ($xf['applyFont']) {
-                $xml .= ' applyFont="1"';
-            }
-            if ($xf['applyFill']) {
-                $xml .= ' applyFill="1"';
-            }
-            $xml .= '/>';
+            $xml .= self::renderXf($xf);
         }
         $xml .= '</cellXfs>';
 
@@ -318,13 +429,173 @@ class StyleRegistry
         return $xml;
     }
 
+    /**
+     * Seeded output: the template's stylesheet with our appends spliced in.
+     * Nothing registered → the seed comes back untouched, byte-for-byte.
+     */
+    private function seededXml(): string
+    {
+        $xml = $this->seedXml ?? '';
+
+        if ($this->customNumFmts === [] && $this->fonts === [] && $this->fills === [] && $this->cellXfs === []) {
+            return $xml;
+        }
+
+        $xml = $this->spliceNumFmts($xml);
+        $xml = self::spliceInto($xml, 'fonts', array_map(self::renderFont(...), $this->fonts));
+        $xml = self::spliceInto($xml, 'fills', array_map(
+            static fn ($color): string => self::renderSolidFill((string) $color),
+            $this->fills
+        ));
+
+        return self::spliceInto($xml, 'cellXfs', array_map(self::renderXf(...), $this->cellXfs));
+    }
+
+    /**
+     * Append fragments to a seed table and bump its `count`. The block is
+     * unique in a stylesheet, so the first match is the right one, and the
+     * insert is a plain substr splice — never a regex replacement, whose
+     * `$` and backslash escapes would mangle a format code.
+     *
+     * The refreshed `count` is derived from the elements present plus what we
+     * add — not from the old attribute, which may be missing or stale — and is
+     * created when the block never carried one.
+     *
+     * @param  list<string>  $fragments
+     */
+    private static function spliceInto(string $xml, string $tag, array $fragments): string
+    {
+        if ($fragments === []) {
+            return $xml;
+        }
+
+        $total = self::countChildren(self::blockBody($xml, $tag), self::SEED_TABLE_CHILD[$tag])
+            + count($fragments);
+        $xml = self::withBlockCount($xml, $tag, $total);
+
+        $close = '</'.$tag.'>';
+        $at = strpos($xml, $close);
+        if ($at === false) {
+            return $xml;
+        }
+
+        return substr($xml, 0, $at).implode('', $fragments).substr($xml, $at);
+    }
+
+    /** Set the block's `count`, adding the attribute when it is absent. */
+    private static function withBlockCount(string $xml, string $tag, int $total): string
+    {
+        $replaced = preg_replace_callback(
+            '/(<(?:[A-Za-z_][\w.\-]*:)?'.$tag.'\b[^>]*?)\bcount="\d+"/',
+            static fn (array $m): string => $m[1].'count="'.$total.'"',
+            $xml,
+            1,
+            $hits
+        );
+        if ($hits > 0 && $replaced !== null) {
+            return $replaced;
+        }
+
+        $added = preg_replace_callback(
+            '/<(?:[A-Za-z_][\w.\-]*:)?'.$tag.'\b[^>]*?(?=\/?>)/',
+            static fn (array $m): string => $m[0].' count="'.$total.'"',
+            $xml,
+            1
+        );
+
+        return $added ?? $xml;
+    }
+
+    /**
+     * Splice our custom number formats in, creating the <numFmts> block when
+     * the template has none — schema order puts it first inside styleSheet.
+     */
+    private function spliceNumFmts(string $xml): string
+    {
+        if ($this->customNumFmts === []) {
+            return $xml;
+        }
+
+        $fragments = [];
+        foreach ($this->customNumFmts as $code => $id) {
+            $fragments[] = '<numFmt numFmtId="'.$id.'" formatCode="'
+                .htmlspecialchars($code, ENT_QUOTES | ENT_XML1).'"/>';
+        }
+
+        if (preg_match('/<numFmts\b[^>]*>/', $xml)) {
+            return self::spliceInto($xml, 'numFmts', $fragments);
+        }
+
+        $block = '<numFmts count="'.count($fragments).'">'.implode('', $fragments).'</numFmts>';
+        $created = preg_replace_callback(
+            '/<styleSheet\b[^>]*>/',
+            static fn (array $m): string => $m[0].$block,
+            $xml,
+            1
+        );
+
+        return $created ?? $xml;
+    }
+
+    /** @param array{bold:bool, color:?string, size:int, name:string} $font */
+    private static function renderFont(array $font): string
+    {
+        $xml = '<font>';
+        $xml .= '<sz val="'.$font['size'].'"/>';
+        if ($font['bold']) {
+            $xml .= '<b/>';
+        }
+        if ($font['color'] !== null) {
+            $xml .= '<color rgb="FF'.ltrim($font['color'], '#').'"/>';
+        }
+        $xml .= '<name val="'.htmlspecialchars($font['name'], ENT_QUOTES | ENT_XML1).'"/>';
+
+        return $xml.'</font>';
+    }
+
+    private static function renderSolidFill(string $color): string
+    {
+        return '<fill><patternFill patternType="solid"><fgColor rgb="FF'
+            .ltrim($color, '#').'"/></patternFill></fill>';
+    }
+
+    /**
+     * borderId="0" is the OOXML convention for "no border" and is what every
+     * producer puts at index 0, so an appended xf inherits the seed's empty
+     * border rather than one of its decorated ones.
+     *
+     * @param array{numFmtId:int, fontId:int, fillId:int, applyNumberFormat:int, applyFont:int, applyFill:int} $xf
+     */
+    private static function renderXf(array $xf): string
+    {
+        $xml = '<xf';
+        $xml .= ' numFmtId="'.$xf['numFmtId'].'"';
+        $xml .= ' fontId="'.$xf['fontId'].'"';
+        $xml .= ' fillId="'.$xf['fillId'].'"';
+        $xml .= ' borderId="0"';
+        $xml .= ' xfId="0"';
+        if ($xf['applyNumberFormat']) {
+            $xml .= ' applyNumberFormat="1"';
+        }
+        if ($xf['applyFont']) {
+            $xml .= ' applyFont="1"';
+        }
+        if ($xf['applyFill']) {
+            $xml .= ' applyFill="1"';
+        }
+
+        return $xml.'/>';
+    }
+
     private function resolveNumFmtId(string $code): int
     {
         if (isset($this->customNumFmts[$code])) {
             return $this->customNumFmts[$code];
         }
 
-        $id = self::CUSTOM_NUMFMT_START + count($this->customNumFmts);
+        $id = $this->seeded
+            ? $this->numFmtFloor + 1 + count($this->customNumFmts)
+            : self::CUSTOM_NUMFMT_START + count($this->customNumFmts);
         $this->customNumFmts[$code] = $id;
 
         return $id;
@@ -337,39 +608,39 @@ class StyleRegistry
         // so === is both faster and semantically more correct than ==.
         foreach ($this->cellXfs as $i => $existing) {
             if ($existing === $xf) {
-                return $i;
+                return $this->xfOffset + $i;
             }
         }
         $this->cellXfs[] = $xf;
 
-        return count($this->cellXfs) - 1;
+        return $this->xfOffset + count($this->cellXfs) - 1;
     }
 
     private function resolveFont(array $font): int
     {
         foreach ($this->fonts as $i => $existing) {
             if ($existing === $font) {
-                return $i;
+                return $this->fontOffset + $i;
             }
         }
         $this->fonts[] = $font;
 
-        return count($this->fonts) - 1;
+        return $this->fontOffset + count($this->fonts) - 1;
     }
 
     private function resolveFill(string $color): int
     {
         $color = ltrim($color, '#');
         foreach ($this->fills as $i => $existing) {
-            if ($i < 2) {
-                continue; // skip built-ins
+            if ($this->fillOffset === 0 && $i < 2) {
+                continue; // skip the two built-ins the classic table starts with
             }
             if (ltrim((string) $existing, '#') === $color) {
-                return $i;
+                return $this->fillOffset + $i;
             }
         }
         $this->fills[] = $color;
 
-        return count($this->fills) - 1;
+        return $this->fillOffset + count($this->fills) - 1;
     }
 }

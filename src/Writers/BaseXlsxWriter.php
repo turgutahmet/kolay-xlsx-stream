@@ -3,11 +3,15 @@
 namespace Kolay\XlsxStream\Writers;
 
 use Kolay\XlsxStream\Exceptions\XlsxStreamException;
+use Kolay\XlsxStream\Readers\SharedStrings;
+use Kolay\XlsxStream\Readers\SharedStringsParser;
 use Kolay\XlsxStream\Sketches\CoMoments;
 use Kolay\XlsxStream\Sketches\HyperLogLog;
 use Kolay\XlsxStream\Sketches\MisraGries;
 use Kolay\XlsxStream\Sketches\TDigest;
 use Kolay\XlsxStream\Styles\StyleRegistry;
+use Kolay\XlsxStream\Templates\Template;
+use Kolay\XlsxStream\Templates\TemplateSheet;
 
 /**
  * Base XLSX Writer - Core streaming functionality
@@ -365,6 +369,57 @@ abstract class BaseXlsxWriter
     /** @var array<string, array<string, string>> finished: entry => pairKey => serialized CoMoments */
     protected array $indexCorrelations = [];
 
+    // ── Template mode (v3.5) ─────────────────────────────────────────────
+    // The writer keeps a foreign workbook's layout and streams rows into one
+    // sheet's <sheetData>. Every field below is null/false on the classic
+    // path, which is why a single boolean guards the row builder dispatch.
+
+    protected ?Template $template = null;
+    protected bool $templateMode = false;
+
+    /** True when this writer opened the template itself and must close it. */
+    protected bool $templateOwned = false;
+
+    protected ?SharedStrings $templateSharedStringsReader = null;
+    protected ?TemplateSheet $templateSheet = null;
+
+    /** Sheet currently being streamed: its workbook name and its zip entry. */
+    protected ?string $templateSheetName = null;
+    protected ?string $templateSheetEntry = null;
+
+    /** @var array<string, true> template sheet entries already streamed */
+    protected array $templateStreamedEntries = [];
+
+    protected ?SharedStringTable $sharedStrings = null;
+
+    /**
+     * variant => 0-based column index => cellXfs id, and variant => the
+     * pre-rendered `<row r="N"` suffix. Both are read once per row, so they
+     * are resolved when the sheet opens rather than per row.
+     *
+     * @var list<array<int, int>>
+     */
+    protected array $templateStyleMaps = [];
+
+    /** @var list<string> */
+    protected array $templateRowSuffixes = [];
+
+    /**
+     * Template mode: 0-based columns whose string values are written as text
+     * even when they look numeric. Filled from the 1-based indexes passed to
+     * textColumns() and cleared by the next sheet().
+     *
+     * @var array<int, true>
+     */
+    protected array $templateTextColumns = [];
+
+    /**
+     * cellXfs id for a date written into a column the sample rows never
+     * styled. Registered lazily, so a template whose data is all text or
+     * numbers keeps its styles.xml byte-identical.
+     */
+    protected ?int $templateDateStyleId = null;
+
     public function __construct()
     {
         $this->styles = new StyleRegistry();
@@ -483,6 +538,7 @@ abstract class BaseXlsxWriter
         if ($this->closed) {
             throw XlsxStreamException::writerAlreadyClosed();
         }
+        $this->refuseInTemplateMode('compact()', 'the sample rows carry r attributes that the compact shape drops');
         if ($this->started) {
             throw XlsxStreamException::alreadyStarted();
         }
@@ -965,6 +1021,7 @@ abstract class BaseXlsxWriter
         if ($this->closed) {
             throw XlsxStreamException::writerAlreadyClosed();
         }
+        $this->refuseInTemplateMode('setHeaderStyle()', 'the template owns its header rows and their styles');
         $this->finalizePendingSample();
         // Allowed before startFile() (for sheet 1) and between newSheet() calls
         // (to give each manually-rotated sheet its own header style).
@@ -1001,6 +1058,10 @@ abstract class BaseXlsxWriter
         if ($this->closed) {
             throw XlsxStreamException::writerAlreadyClosed();
         }
+        $this->refuseInTemplateMode(
+            'registerRowStyle()',
+            'a template row is styled by its variant, so the id could never be used'
+        );
 
         return $this->styles->registerRowStyle($options);
     }
@@ -1012,6 +1073,7 @@ abstract class BaseXlsxWriter
      */
     public function freezeFirstRow(): self
     {
+        $this->refuseInTemplateMode('freezeFirstRow()', 'the template owns the <sheetViews> block');
         return $this->freezeRowsAndColumns(1, 0);
     }
 
@@ -1025,6 +1087,7 @@ abstract class BaseXlsxWriter
         if ($this->closed) {
             throw XlsxStreamException::writerAlreadyClosed();
         }
+        $this->refuseInTemplateMode('freezeRowsAndColumns()', 'the template owns the <sheetViews> block');
         $this->finalizePendingSample();
         if ($rows < 0 || $columns < 0) {
             throw new XlsxStreamException('Freeze rows/columns must be >= 0.');
@@ -1052,6 +1115,7 @@ abstract class BaseXlsxWriter
         if ($this->closed) {
             throw XlsxStreamException::writerAlreadyClosed();
         }
+        $this->refuseInTemplateMode('setColumnWidths()', 'the template owns the <cols> block');
         $this->finalizePendingSample();
         foreach ($widths as $col => $width) {
             if ($col < 1) {
@@ -1094,6 +1158,7 @@ abstract class BaseXlsxWriter
         if ($this->closed) {
             throw XlsxStreamException::writerAlreadyClosed();
         }
+        $this->refuseInTemplateMode('setAutoColumnWidth()', 'the template owns the <cols> block');
         $this->finalizePendingSample();
 
         if (is_int($sample)) {
@@ -1124,6 +1189,7 @@ abstract class BaseXlsxWriter
         if ($this->closed) {
             throw XlsxStreamException::writerAlreadyClosed();
         }
+        $this->refuseInTemplateMode('enableAutoFilter()', 'the template owns the auto filter');
         $this->autoFilterEnabled = $enabled;
 
         return $this;
@@ -1162,6 +1228,7 @@ abstract class BaseXlsxWriter
         if ($this->closed) {
             throw XlsxStreamException::writerAlreadyClosed();
         }
+        $this->refuseInTemplateMode('setColumnFormat()', 'the sample row is the format oracle and the template number format wins');
         $this->finalizePendingSample();
         if ($column < 1) {
             throw new XlsxStreamException("Column index must be >= 1, got {$column}.");
@@ -1206,6 +1273,7 @@ abstract class BaseXlsxWriter
         if ($this->closed) {
             throw XlsxStreamException::writerAlreadyClosed();
         }
+        $this->refuseInTemplateMode('clearColumnFormats()', 'the sample row is the format oracle and the template number format wins');
         $this->finalizePendingSample();
         $this->columnStyleIds = [];
         $this->columnFormatNames = [];
@@ -1239,6 +1307,7 @@ abstract class BaseXlsxWriter
      */
     public function startFile(array $headers): void
     {
+        $this->refuseInTemplateMode('startFile()', 'the template already supplies the header rows; choose a sheet with sheet($name, $dataStartRow)');
         if ($this->started) {
             throw XlsxStreamException::alreadyStarted();
         }
@@ -1259,12 +1328,20 @@ abstract class BaseXlsxWriter
     }
 
     /**
-     * Write a single row (handles multi-sheet automatically)
+     * Write a single row (handles multi-sheet automatically).
+     *
+     * $styleId stamps a style registered with registerRowStyle() over the
+     * whole row. $variant selects which of a template's sample rows this row
+     * should look like, and is meaningful only in template mode. They are
+     * separate arguments on purpose: one parameter never changes meaning
+     * with the writer's mode, so a style id can never be read as a variant.
      */
-    public function writeRow(array $row, ?int $styleId = null): void
+    public function writeRow(array $row, ?int $styleId = null, int $variant = 0): void
     {
         if (!$this->started) {
-            throw XlsxStreamException::headersNotSet();
+            throw $this->templateMode
+                ? XlsxStreamException::templateSheetNotSelected()
+                : XlsxStreamException::headersNotSet();
         }
         if ($this->closed) {
             throw XlsxStreamException::writerAlreadyClosed();
@@ -1275,12 +1352,7 @@ abstract class BaseXlsxWriter
 
         // Check if we need to start a new sheet
         if ($this->currentSheetRow === 0 || $this->currentSheetRow >= self::ROWS_PER_SHEET) {
-            if ($this->currentSheetRow > 0) {
-                $this->flushRowBuffer();
-                $this->finishCurrentSheet();
-            }
-            $this->currentSheetIndex++;
-            $this->startNewSheet();
+            $this->rollSheet();
         }
 
         // Group-boundary sync: when this row starts a new group, flush the
@@ -1320,7 +1392,14 @@ abstract class BaseXlsxWriter
             $this->accumulateCorrelations($row);
         }
 
-        $rowXml = $this->buildRowXml($this->currentSheetRow, $row, $styleId);
+        // One boolean picks the builder family, the same price the compact
+        // shape already pays; the classic builders stay untouched so their
+        // golden-file bytes cannot drift.
+        $rowXml = $this->templateMode
+            ? ($this->sharedStrings !== null
+                ? $this->buildRowXmlTemplateShared($this->currentSheetRow, $row, $variant, $styleId)
+                : $this->buildRowXmlTemplate($this->currentSheetRow, $row, $variant, $styleId))
+            : $this->buildRowXml($this->currentSheetRow, $row, $styleId);
 
         // Sample-mode width tracking (opt-in). Buffers row XML + records
         // per-column max char length until the sample size is reached or
@@ -1355,6 +1434,35 @@ abstract class BaseXlsxWriter
         if ($this->progressCallback !== null && $this->totalRows % $this->progressInterval === 0) {
             ($this->progressCallback)($this->totalRows, $this->currentOffset);
         }
+    }
+
+    /**
+     * Sheet boundary reached: finalize the current sheet and open the next.
+     *
+     * Template mode never auto-splits — an overflow sheet would have no
+     * layout to inherit — so it either returns (a template whose data starts
+     * on row 1 legitimately leaves the counter at zero before its first row)
+     * or refuses at Excel's row ceiling.
+     */
+    protected function rollSheet(): void
+    {
+        if ($this->templateMode) {
+            if ($this->currentSheetRow >= self::ROWS_PER_SHEET) {
+                throw XlsxStreamException::templateSheetRowLimit(
+                    (string) $this->templateSheetName,
+                    self::ROWS_PER_SHEET
+                );
+            }
+
+            return;
+        }
+
+        if ($this->currentSheetRow > 0) {
+            $this->flushRowBuffer();
+            $this->finishCurrentSheet();
+        }
+        $this->currentSheetIndex++;
+        $this->startNewSheet();
     }
 
     /**
@@ -1502,10 +1610,22 @@ abstract class BaseXlsxWriter
      *
      *   $writer->writeRows(User::query()->lazy(1000));
      */
-    public function writeRows(iterable $rows): void
+    public function writeRows(iterable $rows, ?callable $variantFor = null): void
     {
+        if ($variantFor === null) {
+            foreach ($rows as $row) {
+                $this->writeRow($row);
+            }
+
+            return;
+        }
+
+        // Template mode: the caller decides which sample row each row should
+        // look like. The ordinal is passed alongside the row so zebra
+        // striping needs no counter of its own.
+        $ordinal = 0;
         foreach ($rows as $row) {
-            $this->writeRow($row);
+            $this->writeRow($row, null, (int) $variantFor($row, $ordinal++));
         }
     }
 
@@ -1525,6 +1645,7 @@ abstract class BaseXlsxWriter
      */
     public function newSheet(string $name, ?array $headers = null): self
     {
+        $this->refuseInTemplateMode('newSheet()', 'sheets come from the template; move to the next one with sheet($name, $dataStartRow)');
         if (! $this->started) {
             throw XlsxStreamException::headersNotSet();
         }
@@ -1645,11 +1766,17 @@ abstract class BaseXlsxWriter
     }
 
     /**
-     * Convenience accessor mirroring the path used in startNewSheet().
+     * The zip entry the sheet currently being written lives in.
+     *
+     * Classic sheets are numbered by the writer, so the path follows the
+     * sheet index. A template sheet keeps the entry the template gave it,
+     * which need not match the order it is streamed in — index sections are
+     * keyed by entry, so getting this wrong would file a sheet's sync points
+     * and zone maps under a sheet the reader never looks at.
      */
     protected function currentSheetEntry(): string
     {
-        return "xl/worksheets/sheet{$this->currentSheetIndex}.xml";
+        return $this->templateSheetEntry ?? "xl/worksheets/sheet{$this->currentSheetIndex}.xml";
     }
 
     /**
@@ -2280,6 +2407,61 @@ abstract class BaseXlsxWriter
         $this->sheetOffset = $this->currentOffset;
         $this->currentSheetRow = 0;
 
+        $this->resetPerSheetAccumulators();
+
+        $this->openSheetStream($filename);
+
+        // Reset per-sheet sample state (multi-sheet workbooks re-sample
+        // because each sheet may have different column widths). Clear
+        // any widths the previous sheet's sample wrote into columnWidths
+        // so this sheet starts from a clean slate — user-explicit widths
+        // (set via setColumnWidths) survive intentionally.
+        foreach ($this->sampleAutoSetWidthCols as $col) {
+            unset($this->columnWidths[$col]);
+        }
+        $this->sampleAutoSetWidthCols = [];
+        $this->autoWidthSampleBuffer = [];
+        $this->autoWidthSampleBufferBytes = 0;
+        $this->autoWidthMaxLengths = [];
+        $this->autoWidthFinalized = false;
+
+        $sampleMode = $this->autoColumnWidth
+            && $this->autoWidthSampleSize !== null
+            && $this->autoWidthSampleSize > 0;
+
+        if ($sampleMode) {
+            // Sample mode: defer preamble + header emission until we know
+            // the per-column widths. Seed the width tracker with the
+            // header lengths so a long header still influences the result.
+            $this->inSampleMode = true;
+            if (! empty($this->columns)) {
+                foreach ($this->columns as $i => $headerCell) {
+                    $col = $i + 1;
+                    $len = mb_strlen((string) $headerCell);
+                    $this->autoWidthMaxLengths[$col] = $len;
+                }
+                $this->currentSheetRow = 1; // claim row 1 for the eventual header
+            }
+
+            return;
+        }
+
+        // Normal path: emit preamble + header right away.
+        $this->inSampleMode = false;
+        $this->writeSheetData($this->buildSheetPreambleXml());
+        if (! empty($this->columns)) {
+            $this->currentSheetRow = 1;
+        }
+    }
+
+    /**
+     * Reset every per-sheet accumulator so a freshly started sheet carries
+     * its own verdicts. Shared by the classic and the template sheet-open
+     * paths; the header fold below is guarded on $this->columns, which
+     * template mode leaves empty because the template writes its own header.
+     */
+    protected function resetPerSheetAccumulators(): void
+    {
         // Fresh sheet -> fresh stat accumulators and sortedness trackers
         // (sortedness is a per-sheet property; auto-split sheets each get
         // their own verdict).
@@ -2356,7 +2538,15 @@ abstract class BaseXlsxWriter
                 $this->coMomentAccum[$a.','.$b] = new CoMoments();
             }
         }
+    }
 
+    /**
+     * Open a sheet's ZIP entry: a local file header whose sizes are deferred
+     * to a data descriptor, then a fresh deflate + CRC context and empty row
+     * buffers. These are the bytes the golden-file tests pin.
+     */
+    protected function openSheetStream(string $filename): void
+    {
         [$mtime, $mdate] = $this->dosTimeParts(time());
 
         // Write local file header
@@ -2384,48 +2574,6 @@ abstract class BaseXlsxWriter
         $this->rowBuffer = '';
         $this->rowBufferCount = 0;
         $this->rowsSinceSync = 0;
-
-        // Reset per-sheet sample state (multi-sheet workbooks re-sample
-        // because each sheet may have different column widths). Clear
-        // any widths the previous sheet's sample wrote into columnWidths
-        // so this sheet starts from a clean slate — user-explicit widths
-        // (set via setColumnWidths) survive intentionally.
-        foreach ($this->sampleAutoSetWidthCols as $col) {
-            unset($this->columnWidths[$col]);
-        }
-        $this->sampleAutoSetWidthCols = [];
-        $this->autoWidthSampleBuffer = [];
-        $this->autoWidthSampleBufferBytes = 0;
-        $this->autoWidthMaxLengths = [];
-        $this->autoWidthFinalized = false;
-
-        $sampleMode = $this->autoColumnWidth
-            && $this->autoWidthSampleSize !== null
-            && $this->autoWidthSampleSize > 0;
-
-        if ($sampleMode) {
-            // Sample mode: defer preamble + header emission until we know
-            // the per-column widths. Seed the width tracker with the
-            // header lengths so a long header still influences the result.
-            $this->inSampleMode = true;
-            if (! empty($this->columns)) {
-                foreach ($this->columns as $i => $headerCell) {
-                    $col = $i + 1;
-                    $len = mb_strlen((string) $headerCell);
-                    $this->autoWidthMaxLengths[$col] = $len;
-                }
-                $this->currentSheetRow = 1; // claim row 1 for the eventual header
-            }
-
-            return;
-        }
-
-        // Normal path: emit preamble + header right away.
-        $this->inSampleMode = false;
-        $this->writeSheetData($this->buildSheetPreambleXml());
-        if (! empty($this->columns)) {
-            $this->currentSheetRow = 1;
-        }
     }
 
     /**
@@ -2624,7 +2772,12 @@ abstract class BaseXlsxWriter
 
         $this->flushRowBuffer();
 
-        $sheetFooter = '</sheetData>'.$this->buildAutoFilterXml().'</worksheet>';
+        // Template mode closes with the template's own tail — mergeCells,
+        // conditional formatting, page setup, everything below the data —
+        // carried across verbatim.
+        $sheetFooter = $this->templateSheet !== null
+            ? $this->templateSheet->tail()
+            : '</sheetData>'.$this->buildAutoFilterXml().'</worksheet>';
 
         hash_update($this->crcContext, $sheetFooter);
         $this->sheetUncompressedSize += strlen($sheetFooter);
@@ -2720,6 +2873,706 @@ abstract class BaseXlsxWriter
             foreach ($this->correlationPairs as [$a, $b]) {
                 $this->indexCorrelations[$entry][$a.','.$b] = $this->coMomentAccum[$a.','.$b]->serialize();
             }
+        }
+
+        // Retire the template sheet: its entry is written, so the copy pass
+        // must skip it and a second sheet() call on the same name is refused.
+        if ($this->templateSheet !== null) {
+            $this->templateStreamedEntries[(string) $this->templateSheetEntry] = true;
+            $this->templateSheet = null;
+            $this->templateSheetEntry = null;
+            $this->templateSheetName = null;
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Template mode (v3.5)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /**
+     * Stream rows into a layout another producer authored.
+     *
+     * The template supplies everything above and below the data: header
+     * rows, column widths, frozen panes, merges, conditional formatting,
+     * page setup, and the style table its sample rows point into. This
+     * writer cuts the chosen sheet once at `<sheetData>`, streams rows into
+     * the cut, and carries every other ZIP entry across without inflating
+     * it. Classic layout calls are refused rather than half-applied,
+     * because the template already owns what they would set.
+     *
+     *   $writer = SinkableXlsxWriter::fromTemplate(new FileSink($out), $path);
+     *   $writer->sheet('Leaves', dataStartRow: 3);
+     *   $writer->writeRow(['Ada', $start, 1200.0]);
+     *   $writer->writeRow(['Grace', $start, 900.0], variant: 1);
+     *   $writer->finishFile();
+     *
+     * $maxUniqueStrings caps the shared string dictionary, the one place
+     * template mode holds memory proportional to the data. Past the ceiling
+     * new strings are written inline instead, so a column of unique free text
+     * degrades the file's size rather than the process's memory.
+     */
+    public function useTemplate(
+        Template $template,
+        int $maxUniqueStrings = SharedStringTable::DEFAULT_MAX_UNIQUE
+    ): self {
+        if ($this->closed) {
+            throw XlsxStreamException::writerAlreadyClosed();
+        }
+        if ($this->started) {
+            throw XlsxStreamException::alreadyStarted();
+        }
+        if ($this->compactMode) {
+            throw XlsxStreamException::templateConflictsWith('compact()');
+        }
+        foreach ([
+            'setHeaderStyle()' => $this->headerStyleId !== null,
+            'setColumnWidths()' => $this->columnWidths !== [],
+            'setAutoColumnWidth()' => $this->autoColumnWidth,
+            'freezeRowsAndColumns()' => $this->freezeRows > 0 || $this->freezeColumns > 0,
+            'enableAutoFilter()' => $this->autoFilterEnabled,
+            'setColumnFormat()' => $this->columnStyleIds !== [],
+        ] as $what => $configured) {
+            if ($configured) {
+                throw XlsxStreamException::templateConflictsWith($what);
+            }
+        }
+
+        $this->template = $template;
+        $this->templateMode = true;
+
+        // The template's own tables become the authority: style ids the
+        // sample rows hand out must keep meaning what they meant, and a
+        // string we intern must land after the seed's own entries.
+        $stylesEntry = 'xl/styles.xml';
+        if ($template->hasEntry($stylesEntry)) {
+            $this->styles = StyleRegistry::fromStylesXml($template->readEntry($stylesEntry));
+        }
+
+        // Shared strings are used only when the template already carries the
+        // part. Creating one would need a new workbook relationship and a new
+        // content-type override — a fifth seam this feature does not open —
+        // so a template without one takes inline strings instead.
+        $sstEntry = 'xl/sharedStrings.xml';
+        if ($template->hasEntry($sstEntry)) {
+            $this->sharedStrings = SharedStringTable::fromXml(
+                $template->readEntry($sstEntry),
+                $maxUniqueStrings
+            );
+        }
+
+        return $this;
+    }
+
+    /**
+     * Choose the template sheet to stream into and where its data begins.
+     *
+     * Rows above `$dataStartRow` are the template's header block and are
+     * copied verbatim. The rows from `$dataStartRow` down are the sample
+     * rows: they are read as a style oracle (one per variant) and are NOT
+     * written to the output. Calling `sheet()` again finalizes the current
+     * sheet and opens the next, so a workbook is written sheet by sheet.
+     */
+    public function sheet(string $name, int $dataStartRow): self
+    {
+        if ($this->closed) {
+            throw XlsxStreamException::writerAlreadyClosed();
+        }
+        if (! $this->templateMode) {
+            throw XlsxStreamException::templateModeRequired('sheet()');
+        }
+
+        $entry = $this->template->entryFor($name);
+        if (isset($this->templateStreamedEntries[$entry]) || $entry === $this->templateSheetEntry) {
+            throw XlsxStreamException::templateSheetAlreadyStreamed($name);
+        }
+
+        $sheet = $this->template->sheet($name, $dataStartRow);
+        if (! $sheet->acceptsUnprefixedRows()) {
+            throw XlsxStreamException::templateUnsupportedDialect($name);
+        }
+
+        // Close the sheet already in flight before opening the next entry —
+        // one deflate context is live at a time.
+        if ($this->templateSheet !== null) {
+            $this->flushRowBuffer();
+            $this->finishCurrentSheet();
+        }
+
+        $this->templateSheet = $sheet;
+        $this->templateTextColumns = [];
+        $this->templateSheetName = $name;
+        $this->templateSheetEntry = $entry;
+        $this->started = true;
+        $this->currentSheetIndex++;
+        $this->startTemplateSheet();
+
+        return $this;
+    }
+
+    /**
+     * Declare which columns of the current template sheet hold text, so a
+     * value like "12345678901" is written as a string rather than the number
+     * the type rules would otherwise infer.
+     *
+     *   $writer->sheet('Employees', dataStartRow: 3)->textColumns([1, 4]);
+     *
+     * A numeric-looking string is normally written as a number unless
+     * precision would be lost — a leading zero, a leading plus, or more than
+     * fifteen digits. A national identity number, a tax number or an account
+     * number sits inside that window, so it would silently become a
+     * right-aligned number Excel may even render in scientific notation.
+     * This is the column-level counterpart of PhpSpreadsheet's
+     * setCellValueExplicit(TYPE_STRING).
+     *
+     * Columns are 1-based, as everywhere else in this package. The
+     * declaration governs STRING values only: an int stays an int, so pass
+     * the identifier as a string when you want it written as text. It applies
+     * to the sheet chosen by the last sheet() call and the next sheet()
+     * clears it, which is why calling it before choosing a sheet throws
+     * rather than being quietly dropped.
+     *
+     * @param  list<int>  $columns  1-based column indexes
+     */
+    public function textColumns(array $columns): self
+    {
+        if ($this->closed) {
+            throw XlsxStreamException::writerAlreadyClosed();
+        }
+        if (! $this->templateMode) {
+            throw XlsxStreamException::templateModeRequired('textColumns()');
+        }
+        if ($this->templateSheet === null) {
+            throw XlsxStreamException::templateSheetNotSelected();
+        }
+
+        $map = [];
+        foreach ($columns as $column) {
+            if ($column < 1) {
+                throw new XlsxStreamException("Column index must be >= 1, got {$column}.");
+            }
+            $map[$column - 1] = true;
+        }
+        $this->templateTextColumns = $map;
+
+        return $this;
+    }
+
+    /**
+     * Open the chosen template sheet's ZIP entry and emit everything down to
+     * the last header row, then park the row counter one below the first data
+     * row so the next writeRow() lands exactly on dataStartRow.
+     */
+    protected function startTemplateSheet(): void
+    {
+        $sheet = $this->templateSheet;
+        $entry = $this->templateSheetEntry;
+
+        $this->sheets[] = [
+            'index' => $this->currentSheetIndex,
+            'name' => $this->templateSheetName,
+            'filename' => $entry,
+            'rows' => 0,
+        ];
+
+        $this->sheetOffset = $this->currentOffset;
+        $this->currentSheetRow = 0;
+        $this->inSampleMode = false;
+
+        $this->resetPerSheetAccumulators();
+
+        // The template's header rows are real rows in this sheet's first
+        // index block. Fold them in before any data arrives so zone-map
+        // pruning can never hide a row the un-pruned path would return —
+        // the same reason startNewSheet() folds its own header row.
+        if ($this->statsColumns !== [] || $this->stringStatsColumns !== []) {
+            $this->foldTemplateHeaderRows();
+        }
+
+        $this->openSheetStream($entry);
+
+        // Resolve the variants once. Every row reads a style map and a row
+        // tag suffix; neither depends on the data, so neither is rebuilt.
+        $this->templateStyleMaps = [];
+        $this->templateRowSuffixes = [];
+        for ($variant = 0, $n = $sheet->variantCount(); $variant < $n; $variant++) {
+            $this->templateStyleMaps[$variant] = $sheet->styleMap($variant);
+            $this->templateRowSuffixes[$variant] = self::renderRowSuffix($sheet->rowAttributes($variant));
+        }
+
+        $this->writeSheetData($sheet->head().$sheet->headerRowsXml());
+        $this->currentSheetRow = $sheet->dataStartRow() - 1;
+    }
+
+    /**
+     * Fold the template's header rows into this sheet's zone maps.
+     *
+     * currentSheetRow is moved onto each header row for the duration, so an
+     * argmin/argmax pointer landing on a header cell records the row that
+     * cell actually occupies. Sortedness is deliberately not tracked: the
+     * header says nothing about how the data is ordered.
+     */
+    protected function foldTemplateHeaderRows(): void
+    {
+        $restore = $this->currentSheetRow;
+
+        foreach ($this->templateSheet->headerRowValues($this->templateSharedStringsReader()) as $rowNumber => $values) {
+            $this->currentSheetRow = $rowNumber;
+            if ($this->statsColumns !== []) {
+                $this->accumulateColumnStats($values, trackOrder: false);
+            }
+            if ($this->stringStatsColumns !== []) {
+                $this->accumulateStringStats($values, trackOrder: false);
+            }
+        }
+
+        $this->currentSheetRow = $restore;
+    }
+
+    /**
+     * Read-side view of the template's shared strings, used to resolve the
+     * t="s" cells in its header rows. Built once and only when something
+     * actually needs to read a template cell back.
+     */
+    protected function templateSharedStringsReader(): ?SharedStrings
+    {
+        if ($this->templateSharedStringsReader !== null) {
+            return $this->templateSharedStringsReader;
+        }
+
+        $entry = 'xl/sharedStrings.xml';
+        if (! $this->template->hasEntry($entry)) {
+            return null;
+        }
+
+        return $this->templateSharedStringsReader = SharedStringsParser::parseInMemory(
+            $this->template->readEntry($entry)
+        );
+    }
+
+    /**
+     * Render a variant's row-level attributes into the `<row r="N"` suffix,
+     * height and row style included, ending with the closing bracket.
+     *
+     * @param  array{ht: ?string, customHeight: bool, s: ?int, customFormat: bool}  $attributes
+     */
+    protected static function renderRowSuffix(array $attributes): string
+    {
+        $suffix = '';
+        if ($attributes['ht'] !== null) {
+            $suffix .= ' ht="'.$attributes['ht'].'"';
+        }
+        if ($attributes['customHeight']) {
+            $suffix .= ' customHeight="1"';
+        }
+        if ($attributes['s'] !== null) {
+            $suffix .= ' s="'.$attributes['s'].'"';
+        }
+        if ($attributes['customFormat']) {
+            $suffix .= ' customFormat="1"';
+        }
+
+        return $suffix.'>';
+    }
+
+    /**
+     * cellXfs id for a date in a column the sample rows never styled.
+     *
+     * Where the template holds an opinion its number format wins outright —
+     * that is the whole point of the sample row. Past the sample's last
+     * styled cell the template says nothing, so the classic date rule
+     * applies; the format is appended to the seeded table on first use, so
+     * a template whose data carries no dates keeps styles.xml untouched.
+     */
+    protected function templateDateStyle(): int
+    {
+        return $this->templateDateStyleId ??= $this->styles->registerBuiltinNumFmt(self::BUILTIN_NUMFMT_DATETIME);
+    }
+
+    /**
+     * Refuse a classic operation whose result the template already owns.
+     * Called from the setters themselves, never per row.
+     */
+    protected function refuseInTemplateMode(string $operation, string $because): void
+    {
+        if ($this->templateMode) {
+            throw XlsxStreamException::templateModeForbids($operation, $because);
+        }
+    }
+
+    /**
+     * A template row is styled by its variant, so a registered row style
+     * would have two sources fighting for the same s attribute.
+     */
+    protected function assertTemplateRowUnstyled(?int $rowStyleId): void
+    {
+        if ($rowStyleId !== null) {
+            throw XlsxStreamException::templateModeForbids(
+                'writeRow($row, $styleId)',
+                'a template row is styled by its variant — pass variant: N instead'
+            );
+        }
+    }
+
+    /**
+     * Template row builder, inline-string flavour (the template carries no
+     * shared string table).
+     *
+     * Mirrors buildRowXml's type dispatch exactly; the difference is where
+     * the s attribute comes from. The classic writer reads a per-column
+     * format registered through the API, this one reads the sample row the
+     * template shipped, so the number formats the template chose survive.
+     */
+    protected function buildRowXmlTemplate(int $rowIndex, array $data, int $variant, ?int $rowStyleId): string
+    {
+        $this->assertTemplateRowUnstyled($rowStyleId);
+
+        $styleMap = $this->templateStyleMaps[$variant] ?? $this->templateStyleMaps[0];
+        $text = $this->templateTextColumns;
+        $count = count($data);
+        if ($count > 0 && ! isset($this->colLetterCache[$count])) {
+            for ($c = 1; $c <= $count; $c++) {
+                $this->getColumnLetter($c);
+            }
+        }
+        $letters = $this->colLetterCache;
+
+        $xml = '<row r="'.$rowIndex.'"'.($this->templateRowSuffixes[$variant] ?? $this->templateRowSuffixes[0]);
+        $col = 0;
+
+        foreach ($data as $value) {
+            $index = $col++;
+            $cellRef = $letters[$col].$rowIndex;
+            $style = $styleMap[$index] ?? null;
+            $s = $style !== null ? ' s="'.$style.'"' : '';
+
+            if (is_string($value)) {
+                if ($value === '') {
+                    $xml .= '<c r="'.$cellRef.'"'.$s.'/>';
+
+                    continue;
+                }
+
+                if (! isset($text[$index]) && is_numeric($value)) {
+                    if ($this->shouldPreserveNumericString($value)) {
+                        $xml .= '<c r="'.$cellRef.'"'.$s.' t="inlineStr"><is>'
+                            .self::renderInlineText($this->fastXmlEscape($value)).'</is></c>';
+                    } else {
+                        $xml .= '<c r="'.$cellRef.'"'.$s.' t="n"><v>'.(0 + $value).'</v></c>';
+                    }
+
+                    continue;
+                }
+
+                $xml .= '<c r="'.$cellRef.'"'.$s.' t="inlineStr"><is>'
+                    .self::renderInlineText($this->fastXmlEscape($value)).'</is></c>';
+
+                continue;
+            }
+
+            if (is_int($value) || is_float($value)) {
+                $xml .= '<c r="'.$cellRef.'"'.$s.' t="n"><v>'.$value.'</v></c>';
+
+                continue;
+            }
+
+            if ($value === null) {
+                $xml .= '<c r="'.$cellRef.'"'.$s.'/>';
+
+                continue;
+            }
+
+            if (is_bool($value)) {
+                $xml .= '<c r="'.$cellRef.'"'.$s.' t="b"><v>'.($value ? 1 : 0).'</v></c>';
+
+                continue;
+            }
+
+            if ($value instanceof \DateTimeInterface) {
+                $serial = ($value->getTimestamp() - self::EXCEL_EPOCH_TIMESTAMP) / 86400;
+                $dateStyle = $style ?? $this->templateDateStyle();
+                $xml .= '<c r="'.$cellRef.'" s="'.$dateStyle.'" t="n"><v>'.$serial.'</v></c>';
+
+                continue;
+            }
+
+            $xml .= '<c r="'.$cellRef.'"'.$s.' t="inlineStr"><is>'
+                .self::renderInlineText($this->fastXmlEscape((string) $value)).'</is></c>';
+        }
+
+        return $xml.'</row>';
+    }
+
+    /**
+     * Template row builder, shared-string flavour — the twin used when the
+     * template ships an xl/sharedStrings.xml.
+     *
+     * Text cells become `t="s"` references into the seeded table, which is
+     * what the producers that read these files expect: PhpSpreadsheet turns
+     * an inline string into a RichText object, so a round trip through it
+     * would not compare equal to the value that went in. When the dictionary
+     * hits its ceiling intern() returns null and the cell falls back to an
+     * inline string, so the file stays valid rather than growing without
+     * bound.
+     */
+    protected function buildRowXmlTemplateShared(int $rowIndex, array $data, int $variant, ?int $rowStyleId): string
+    {
+        $this->assertTemplateRowUnstyled($rowStyleId);
+
+        $sst = $this->sharedStrings;
+        $styleMap = $this->templateStyleMaps[$variant] ?? $this->templateStyleMaps[0];
+        $text = $this->templateTextColumns;
+        $count = count($data);
+        if ($count > 0 && ! isset($this->colLetterCache[$count])) {
+            for ($c = 1; $c <= $count; $c++) {
+                $this->getColumnLetter($c);
+            }
+        }
+        $letters = $this->colLetterCache;
+
+        $xml = '<row r="'.$rowIndex.'"'.($this->templateRowSuffixes[$variant] ?? $this->templateRowSuffixes[0]);
+        $col = 0;
+
+        foreach ($data as $value) {
+            $index = $col++;
+            $cellRef = $letters[$col].$rowIndex;
+            $style = $styleMap[$index] ?? null;
+            $s = $style !== null ? ' s="'.$style.'"' : '';
+
+            if (is_string($value)) {
+                if ($value === '') {
+                    $xml .= '<c r="'.$cellRef.'"'.$s.'/>';
+
+                    continue;
+                }
+
+                if (! isset($text[$index]) && is_numeric($value) && ! $this->shouldPreserveNumericString($value)) {
+                    $xml .= '<c r="'.$cellRef.'"'.$s.' t="n"><v>'.(0 + $value).'</v></c>';
+
+                    continue;
+                }
+
+                $escaped = $this->fastXmlEscape($value);
+                $shared = $sst->intern($escaped);
+                $xml .= $shared !== null
+                    ? '<c r="'.$cellRef.'"'.$s.' t="s"><v>'.$shared.'</v></c>'
+                    : '<c r="'.$cellRef.'"'.$s.' t="inlineStr"><is>'.self::renderInlineText($escaped).'</is></c>';
+
+                continue;
+            }
+
+            if (is_int($value) || is_float($value)) {
+                $xml .= '<c r="'.$cellRef.'"'.$s.' t="n"><v>'.$value.'</v></c>';
+
+                continue;
+            }
+
+            if ($value === null) {
+                $xml .= '<c r="'.$cellRef.'"'.$s.'/>';
+
+                continue;
+            }
+
+            if (is_bool($value)) {
+                $xml .= '<c r="'.$cellRef.'"'.$s.' t="b"><v>'.($value ? 1 : 0).'</v></c>';
+
+                continue;
+            }
+
+            if ($value instanceof \DateTimeInterface) {
+                $serial = ($value->getTimestamp() - self::EXCEL_EPOCH_TIMESTAMP) / 86400;
+                $dateStyle = $style ?? $this->templateDateStyle();
+                $xml .= '<c r="'.$cellRef.'" s="'.$dateStyle.'" t="n"><v>'.$serial.'</v></c>';
+
+                continue;
+            }
+
+            $escaped = $this->fastXmlEscape((string) $value);
+            $shared = $sst->intern($escaped);
+            $xml .= $shared !== null
+                ? '<c r="'.$cellRef.'"'.$s.' t="s"><v>'.$shared.'</v></c>'
+                : '<c r="'.$cellRef.'"'.$s.' t="inlineStr"><is>'.self::renderInlineText($escaped).'</is></c>';
+        }
+
+        return $xml.'</row>';
+    }
+
+    /**
+     * Wrap already-escaped text in `<t>`, adding xml:space="preserve" only
+     * when a leading or trailing space would otherwise be collapsed away.
+     */
+    protected static function renderInlineText(string $escaped): string
+    {
+        if ($escaped !== '' && ($escaped[0] === ' ' || $escaped[0] === "\t" ||
+            $escaped[strlen($escaped) - 1] === ' ' || $escaped[strlen($escaped) - 1] === "\t")) {
+            return '<t xml:space="preserve">'.$escaped.'</t>';
+        }
+
+        return '<t>'.$escaped.'</t>';
+    }
+
+    /**
+     * Declare the sidecar's content type in a template's [Content_Types].xml.
+     *
+     * Every package part needs a declared type, and the sidecar's "bin"
+     * extension has no Default mapping, so without this override Excel's
+     * validator drops into repair mode. This is the only edit template mode
+     * makes to a part it did not author: one Override element before the
+     * closing tag, added only when the index is on and only when it is not
+     * already there, so a template that already declared it is untouched.
+     */
+    protected static function declareIndexContentType(string $xml): string
+    {
+        if (str_contains($xml, 'PartName="/'.RandomAccessIndex::ENTRY_PATH.'"')) {
+            return $xml;
+        }
+
+        if (! preg_match('/<\/((?:[A-Za-z_][\w.\-]*:)?)Types\s*>/', $xml, $match, PREG_OFFSET_CAPTURE)) {
+            throw XlsxStreamException::templateContentTypesUnreadable();
+        }
+
+        [$prefix, $at] = [$match[1][0], $match[0][1]];
+        $override = '<'.$prefix.'Override PartName="/'.RandomAccessIndex::ENTRY_PATH.'" '
+            .'ContentType="application/octet-stream"/>';
+
+        return substr($xml, 0, $at).$override.substr($xml, $at);
+    }
+
+    /**
+     * Move one template entry into the output without touching its bytes.
+     *
+     * The compressed body is copied through as-is — no inflate, no deflate —
+     * so the CRC and the compressed size in the central directory are the
+     * template's own and the copy is provably faithful. STORED entries stay
+     * stored. Sizes come from the template's central directory, so an entry
+     * written with a streaming data descriptor arrives with its sizes in the
+     * local header and no descriptor of its own.
+     */
+    protected function copyEntry(string $name): void
+    {
+        $zip = $this->template->zip();
+        $source = $this->template->source();
+        $entry = $zip->entry($name);
+        if ($entry === null) {
+            throw XlsxStreamException::templateSheetDataMissing($name);
+        }
+
+        $this->assertZip32Compatible($this->currentOffset, "cumulative archive offset before copying '{$name}'");
+
+        [$mtime, $mdate] = $this->dosTimeParts(time());
+
+        $header = pack('V', self::LOCAL_FILE_HEADER_SIGNATURE);
+        $header .= pack('v', self::VERSION_NEEDED);
+        $header .= pack('v', 0x0000);
+        $header .= pack('v', $entry['method']);
+        $header .= pack('v', $mtime);
+        $header .= pack('v', $mdate);
+        $header .= pack('V', $entry['crc32']);
+        $header .= pack('V', $entry['compressed_size']);
+        $header .= pack('V', $entry['uncompressed_size']);
+        $header .= pack('v', strlen($name));
+        $header .= pack('v', 0);
+        $header .= $name;
+
+        $offset = $this->currentOffset;
+        $this->writeToDest($header);
+
+        $remaining = $entry['compressed_size'];
+        if ($remaining > 0) {
+            $stream = $source->streamFrom($zip->dataOffset($source, $name));
+            try {
+                while ($remaining > 0) {
+                    $chunk = fread($stream, (int) min(65536, $remaining));
+                    if (! is_string($chunk) || $chunk === '') {
+                        throw XlsxStreamException::templateSheetDataMissing($name);
+                    }
+                    $this->writeToDest($chunk);
+                    $remaining -= strlen($chunk);
+                }
+            } finally {
+                if (is_resource($stream)) {
+                    fclose($stream);
+                }
+            }
+        }
+
+        $this->centralDirectory[] = [
+            'filename' => $name,
+            'crc32' => $entry['crc32'],
+            'compressed_size' => $entry['compressed_size'],
+            'uncompressed_size' => $entry['uncompressed_size'],
+            'offset' => $offset,
+            'compression' => $entry['method'],
+            'flags' => 0x0000,
+            'timestamp' => time(),
+        ];
+    }
+
+    /**
+     * Close the streamed sheets, then carry every remaining template entry
+     * across. Only the parts this writer actually changed are re-authored:
+     * the style table when a format was appended, the shared string table
+     * when a string was interned. Everything else — the workbook, the rels,
+     * the content types, the sheets nobody streamed into, themes, drawings —
+     * is moved byte for byte. The caller owns closing the sink.
+     */
+    protected function writeTemplateRemainder(): void
+    {
+        if ($this->templateSheet !== null) {
+            $this->flushRowBuffer();
+            $this->finishCurrentSheet();
+        }
+
+        if ($this->sheets === []) {
+            throw XlsxStreamException::templateSheetNotSelected();
+        }
+
+        $stylesEntry = 'xl/styles.xml';
+        $sstEntry = 'xl/sharedStrings.xml';
+        $contentTypes = '[Content_Types].xml';
+
+        if ($this->randomAccessIndexEnabled) {
+            $this->writeStaticFile(RandomAccessIndex::ENTRY_PATH, $this->buildRandomAccessIndexPayload());
+        }
+
+        foreach ($this->template->zip()->names() as $name) {
+            if (isset($this->templateStreamedEntries[$name])) {
+                continue;
+            }
+            // A template produced by this package may already carry a
+            // sidecar. It describes rows that are no longer there, and we
+            // have just written our own, so the stale one is dropped.
+            if ($name === RandomAccessIndex::ENTRY_PATH) {
+                continue;
+            }
+            if ($name === $contentTypes && $this->randomAccessIndexEnabled) {
+                $this->writeStaticFile($name, self::declareIndexContentType($this->template->readEntry($name)));
+
+                continue;
+            }
+            if ($name === $stylesEntry && ! $this->styles->isSeedUnmodified()) {
+                $this->writeStaticFile($name, $this->styles->toXml());
+
+                continue;
+            }
+            if (
+                $name === $sstEntry
+                && $this->sharedStrings !== null
+                && ! $this->sharedStrings->isSeedUnmodified()
+            ) {
+                $this->writeStaticFile($name, $this->sharedStrings->toXml());
+
+                continue;
+            }
+
+            $this->copyEntry($name);
+        }
+
+        $this->writeCentralDirectory();
+
+        // Release the template's own handle when this writer opened it; a
+        // caller who passed a Template in keeps it and may reuse the layout.
+        if ($this->templateOwned) {
+            $this->template->close();
         }
     }
 
@@ -3344,13 +4197,27 @@ abstract class BaseXlsxWriter
             throw XlsxStreamException::writerAlreadyClosed();
         }
         if (!$this->started) {
-            throw XlsxStreamException::headersNotSet();
+            throw $this->templateMode
+                ? XlsxStreamException::templateSheetNotSelected()
+                : XlsxStreamException::headersNotSet();
         }
 
         // Sample never reached its target — finalize with whatever we
         // collected so the preamble + header still get emitted.
         if ($this->inSampleMode && ! $this->autoWidthFinalized) {
             $this->finalizeAutoWidthSample();
+        }
+
+        if ($this->templateMode) {
+            $this->writeTemplateRemainder();
+            $this->closed = true;
+
+            return [
+                'bytes' => $this->currentOffset,
+                'rows' => $this->totalRows,
+                'sheets' => count($this->sheets),
+                'sheet_details' => $this->sheets,
+            ];
         }
 
         if ($this->currentSheetRow > 0) {

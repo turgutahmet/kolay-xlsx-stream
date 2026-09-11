@@ -107,4 +107,145 @@ class XlsxStreamException extends \Exception
             'ZIP64 writer support is tracked for a future release.'
         );
     }
+
+    /**
+     * Create exception for a template sheet name that is not in the workbook
+     */
+    public static function templateSheetNotFound(string $name, array $available): self
+    {
+        $list = $available === [] ? '(none)' : implode(', ', $available);
+
+        return new self("Template has no sheet named '{$name}'. Available: {$list}.");
+    }
+
+    /**
+     * Create exception for a template sheet with no sheetData element
+     */
+    public static function templateSheetDataMissing(string $entry): self
+    {
+        return new self("Template sheet '{$entry}' has no <sheetData> element to stream into.");
+    }
+
+    /**
+     * Create exception for a tail range that reaches into the streamed rows
+     */
+    public static function templateRangeInDataRegion(string $element, string $ref, int $dataStartRow): self
+    {
+        return new self(
+            "Template <{$element}> range '{$ref}' reaches row {$dataStartRow} or below, inside the data region. ".
+            'Everything below the sample rows is copied verbatim, so a range drawn over them would keep '.
+            'covering only those rows once real data is streamed — a filter, format or merge that silently '.
+            'stops short. Keep the range above dataStartRow (a filter across the header row is fine) or drop it.'
+        );
+    }
+
+    /**
+     * Create exception for a template whose content types part cannot be edited
+     */
+    public static function templateContentTypesUnreadable(): self
+    {
+        return new self(
+            'Template [Content_Types].xml has no closing <Types> element, so the random-access '.
+            'sidecar cannot be declared in it. Without that declaration Excel would offer to repair '.
+            'the workbook, so the file is refused rather than written broken.'
+        );
+    }
+
+    /**
+     * Create exception for a template sheet backed by a table part
+     */
+    public static function templateTablePartsUnsupported(): self
+    {
+        return new self(
+            'Template sheet is backed by a table (<tablePart>). A table keeps its range in '.
+            'xl/tables/tableN.xml and its filter in a workbook defined name, both of which template mode '.
+            'carries across untouched, so the table would still cover only the rows the template declared. '.
+            'Remove the table and keep the styling, or filter across the header row instead.'
+        );
+    }
+
+    /**
+     * Create exception for a template whose sample-row block is implausibly large
+     */
+    public static function templateTooManySampleRows(int $count, int $max): self
+    {
+        return new self(
+            "Template declares {$count} sample rows (limit {$max}). ".
+            'A template is a layout: put one row per style variant below dataStartRow, not a full report.'
+        );
+    }
+
+    /**
+     * Create exception for a sheet whose dialect the row builders cannot write into
+     */
+    public static function templateUnsupportedDialect(string $name): self
+    {
+        return new self(
+            "Template sheet '{$name}' binds SpreadsheetML only to a namespace prefix, ".
+            'never as the default namespace. Streamed rows are written unprefixed, so they '.
+            'would land in no namespace at all and Excel would offer to repair the file. '.
+            'Re-save the template from Excel or PhpSpreadsheet, which both declare the default namespace.'
+        );
+    }
+
+    /**
+     * Create exception for a template operation attempted before a sheet was chosen
+     */
+    public static function templateSheetNotSelected(): self
+    {
+        return new self(
+            'No template sheet is being streamed. Call sheet() with the sheet name '.
+            'and the row its data starts on before writing rows.'
+        );
+    }
+
+    /**
+     * Create exception for a template sheet chosen twice
+     */
+    public static function templateSheetAlreadyStreamed(string $name): self
+    {
+        return new self(
+            "Template sheet '{$name}' has already been streamed. ".
+            'Each sheet is cut once; write all of its rows before moving to the next.'
+        );
+    }
+
+    /**
+     * Create exception for a classic operation that template mode forbids
+     */
+    public static function templateModeForbids(string $operation, string $because): self
+    {
+        return new self("{$operation} is not available in template mode — {$because}.");
+    }
+
+    /**
+     * Create exception for a template operation attempted on a classic writer
+     */
+    public static function templateModeRequired(string $operation): self
+    {
+        return new self("{$operation} requires template mode. Attach a template with useTemplate() first.");
+    }
+
+    /**
+     * Create exception for a template attached to an already-configured writer
+     */
+    public static function templateConflictsWith(string $what): self
+    {
+        return new self(
+            "A template cannot be attached after {$what} — the template owns the layout. ".
+            'Call useTemplate() on a fresh writer.'
+        );
+    }
+
+    /**
+     * Create exception for a template sheet that ran past Excel's row limit
+     */
+    public static function templateSheetRowLimit(string $name, int $limit): self
+    {
+        return new self(
+            "Template sheet '{$name}' reached row {$limit}, Excel's per-sheet limit. ".
+            'Template mode cannot auto-split — the overflow sheet would have no layout to inherit. '.
+            'Split the data across template sheets yourself.'
+        );
+    }
 }

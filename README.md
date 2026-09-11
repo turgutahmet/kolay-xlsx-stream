@@ -976,6 +976,130 @@ also respects a per-format minimum so a `currency_try` column with the
 header `Salary` won't render as `####`. Override per column with
 `setColumnWidths([1 => 8, 2 => 30])` when you want exact control.
 
+### Template mode — stream into someone else's layout *(v3.5+)*
+
+The expensive part of an .xlsx is not its layout, it is its rows. Template
+mode takes the layout from a workbook another producer authored — Excel,
+PhpSpreadsheet, or this package — and streams only the rows into it. The
+sheet is cut once at `<sheetData>`; everything else in the archive is moved
+across without being inflated.
+
+The template doubles as a **style oracle**. The rows below `dataStartRow`
+are sample rows, one per look you want, and they are read rather than
+written: their `s="…"` ids tell the writer how that producer encoded each
+style, so nothing has to be re-specified here.
+
+```php
+use Kolay\XlsxStream\Templates\Template;
+
+$template = Template::open(storage_path('layouts/leave-report.xlsx'));
+
+$writer = SinkableXlsxWriter::fromTemplate(new FileSink($path), $template);
+$writer->sheet('Leaves', dataStartRow: 3);   // rows 1-2 are the header block
+
+foreach ($leaves->lazy() as $i => $leave) {
+    $writer->writeRow([
+        $leave->employee_name,
+        $leave->amount,
+        $leave->starts_at,          // formatted by the template's own numFmt
+        $leave->days,
+    ], variant: $i % 2);            // alternate the two sample rows: zebra
+}
+
+$writer->finishFile();
+$template->close();
+```
+
+`writeRows()` takes the same choice as a callback:
+
+```php
+$writer->writeRows($leaves->lazy(), fn ($row, $i) => $i % 2);
+```
+
+**What the template owns**, and what this writer will therefore refuse:
+the header rows and their styles, column widths, freeze panes, the auto
+filter, per-column number formats, and the style table itself. Calling
+`startFile()`, `newSheet()`, `compact()`, `setHeaderStyle()`,
+`setColumnWidths()`, `setAutoColumnWidth()`, `freezeFirstRow()`,
+`enableAutoFilter()`, `setColumnFormat()` or `registerRowStyle()` in
+template mode throws, rather than half-applying over a layout that already
+decided. A row's look comes from its `variant`, so passing a registered
+style id to `writeRow()` throws too — one argument, one meaning.
+
+**Writing a template.** Author it in Excel or PhpSpreadsheet, put one
+sample row per style variant below the header, and keep every range in the
+sheet above the data:
+
+- A merge, an auto filter, a conditional format or a data validation whose
+  range reaches `dataStartRow` or below is **refused**, because the part
+  below the data is copied verbatim and such a range would keep covering
+  only the rows the template declared — a filter that silently stops after
+  four rows. Draw the filter across the header row instead.
+- A sheet backed by a **table** is refused for the same reason: its range
+  lives in another part of the archive. An empty `<tableParts count="0"/>`
+  is fine — PhpSpreadsheet 1.x writes one on every sheet.
+- A file this package produced with `enableAutoFilter()` therefore cannot
+  serve as a template — that filter spans the whole sheet by construction.
+
+**Identity numbers stay text.** A numeric-looking string is written as a
+number unless precision would be lost — a leading zero, a leading plus, or
+more than fifteen digits. A national identity number, a tax number or an
+account number sits inside that window, so it would otherwise land as a
+right-aligned number. Declare those columns:
+
+```php
+$writer->sheet('Employees', dataStartRow: 3)->textColumns([1, 4]);
+```
+
+Columns are 1-based. The declaration governs string values, so an `int`
+stays an `int` — pass the identifier as a string when you want it as text.
+It applies to the sheet chosen by the last `sheet()` call, and the next
+`sheet()` clears it.
+
+**Number formats.** Where the template holds an opinion it wins outright,
+including for dates: a `DateTimeInterface` written into a column the sample
+row styled takes that column's format, not this package's default. Past the
+sample row's last styled cell the template says nothing, so the classic date
+format applies and is appended to the style table on first use.
+
+**Text cells** join the template's `xl/sharedStrings.xml` when it has one,
+which is what PhpSpreadsheet expects on the way back in. A template without
+that part gets inline strings instead. The dictionary is the one place this
+mode holds memory proportional to the data, so it has a ceiling:
+
+```php
+$writer = SinkableXlsxWriter::fromTemplate($sink, $template, maxUniqueStrings: 200_000);
+```
+
+Past the ceiling new strings are written inline, so the file stays valid and
+memory stops growing.
+
+**Random access** works on the streamed sheet: `withRandomAccessIndex()`
+and the analytics opt-ins behave exactly as they do for a classic write, and
+the sidecar's content type is declared in the template's
+`[Content_Types].xml`. Sheets carried across untouched are not described by
+the sidecar; the reader answers from them by scanning.
+
+**Header addressing.** The reader treats physical row 1 as the header. If a
+template's first row is a merged report title rather than column names,
+address columns by index (`profile([2])`, `rowsWhere(2, …)`) instead of by
+name.
+
+**When not to use it.** Template mode covers a layout that is fixed before
+the data arrives. A merge whose row span is only known while streaming is
+not covered — that is first-class writer styling, and it is on the roadmap
+for v3.6.
+
+Templates from **PhpSpreadsheet 1.x and 5.x** are both covered by the parity
+suite, which runs against each major on tag day.
+
+Measured on a real 8,000 × 10 report against building the same file with
+PhpSpreadsheet: **17× faster, 14× less memory**. A different workload gives
+a different ratio — PhpSpreadsheet's per-row style cost is not linear — so
+[BENCHMARK.md §5](BENCHMARK.md) reports each number with the workload it was
+measured on, alongside the parity result: 400 rows × 6 columns compared
+against PhpSpreadsheet's own output on 12 properties, **zero differences**.
+
 ### Manual Multi-Sheet Workbooks *(v2.2+)*
 
 `newSheet($name, $headers = null)` carves a workbook into named domain

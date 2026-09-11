@@ -1,0 +1,451 @@
+<?php
+
+namespace Kolay\XlsxStream\Tests\Templates;
+
+use Kolay\XlsxStream\Exceptions\XlsxStreamException;
+use Kolay\XlsxStream\Sinks\FileSink;
+use Kolay\XlsxStream\Templates\Template;
+use Kolay\XlsxStream\Tests\TestCase;
+use Kolay\XlsxStream\Writers\SinkableXlsxWriter;
+
+/**
+ * Template parsing — the four-point seam's first point: cutting a foreign
+ * sheet at <sheetData>. The package must NOT interpret the template; it
+ * opens the seam, reads the sample rows as a style-id oracle, and keeps
+ * every other byte verbatim.
+ *
+ * The matrix covers three producer dialects (xlsx-stream, a
+ * PhpSpreadsheet-shaped sheet, an Excel-shaped namespace-prefixed sheet)
+ * plus the shapes that break naive parsers: self-closing <sheetData/>,
+ * rows without an r attribute, and customHeight preceding ht.
+ */
+class TemplateParseTest extends TestCase
+{
+    /** @var list<string> */
+    private array $tmp = [];
+
+    protected function tearDown(): void
+    {
+        foreach ($this->tmp as $f) {
+            @unlink($f);
+        }
+        $this->tmp = [];
+        parent::tearDown();
+    }
+
+    // ─── fixture plumbing ────────────────────────────────────────────────
+
+    /** @param array<string,string> $parts entry name => contents */
+    private function buildXlsx(array $parts): string
+    {
+        $path = sys_get_temp_dir().'/kxs-tpl-'.uniqid('', true).'.xlsx';
+        $this->tmp[] = $path;
+        $zip = new \ZipArchive();
+        $this->assertTrue($zip->open($path, \ZipArchive::CREATE | \ZipArchive::OVERWRITE) === true);
+        foreach ($parts as $name => $body) {
+            $zip->addFromString($name, $body);
+        }
+        $zip->close();
+
+        return file_get_contents($path);
+    }
+
+    /** Minimal workbook scaffolding around one or more sheet XML bodies. */
+    private function scaffold(array $sheets, array $extra = []): array
+    {
+        $sheetTags = '';
+        $rels = '';
+        $overrides = '';
+        $i = 0;
+        foreach ($sheets as $name => $_) {
+            $i++;
+            $sheetTags .= '<sheet name="'.$name.'" sheetId="'.$i.'" r:id="rId'.$i.'"/>';
+            $rels .= '<Relationship Id="rId'.$i.'" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet'.$i.'.xml"/>';
+            $overrides .= '<Override PartName="/xl/worksheets/sheet'.$i.'.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>';
+        }
+
+        $parts = [
+            '[Content_Types].xml' => '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                .'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                .'<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+                .'<Default Extension="xml" ContentType="application/xml"/>'
+                .'<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+                .$overrides.'</Types>',
+            '_rels/.rels' => '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                .'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                .'<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+                .'</Relationships>',
+            'xl/workbook.xml' => '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                .'<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+                .'<sheets>'.$sheetTags.'</sheets></workbook>',
+            'xl/_rels/workbook.xml.rels' => '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                .'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'.$rels.'</Relationships>',
+        ];
+        $i = 0;
+        foreach ($sheets as $body) {
+            $parts['xl/worksheets/sheet'.(++$i).'.xml'] = $body;
+        }
+
+        return $parts + $extra;
+    }
+
+    /** PhpSpreadsheet-shaped: dimension, sheetFormatPr, cols, frozen pane, merge tail. */
+    private function phpSpreadsheetSheet(): string
+    {
+        return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            .'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            .'<sheetPr/><dimension ref="A1:D4"/>'
+            .'<sheetViews><sheetView tabSelected="1" workbookViewId="0">'
+            .'<pane ySplit="2" topLeftCell="A3" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>'
+            .'<sheetFormatPr defaultRowHeight="14.4"/>'
+            .'<cols><col min="1" max="1" width="12.5" customWidth="1"/></cols>'
+            .'<sheetData>'
+            .'<row r="1" spans="1:4" ht="24" customHeight="1"><c r="A1" s="3" t="s"><v>0</v></c><c r="B1" s="3" t="s"><v>1</v></c></row>'
+            .'<row r="2" spans="1:4"><c r="A2" s="4" t="s"><v>2</v></c></row>'
+            // sample variant 0 — customHeight BEFORE ht: the naive /ht="/ trap
+            .'<row r="3" spans="1:4" customHeight="1" ht="18.75"><c r="A3" s="5"/><c r="B3" s="6"/><c r="D3" s="9"/></row>'
+            // sample variant 1 — zebra
+            .'<row r="4" spans="1:4" customHeight="1" ht="18.75"><c r="A4" s="7"/><c r="B4" s="8"/><c r="D4" s="10"/></row>'
+            .'</sheetData>'
+            .'<mergeCells count="1"><mergeCell ref="A1:D1"/></mergeCells>'
+            .'<pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>'
+            .'</worksheet>';
+    }
+
+    /** Excel-shaped: everything namespace-prefixed with x:. */
+    private function excelPrefixedSheet(): string
+    {
+        return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            .'<x:worksheet xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            .'<x:dimension ref="A1:B3"/>'
+            .'<x:sheetViews><x:sheetView workbookViewId="0"/></x:sheetViews>'
+            .'<x:sheetData>'
+            .'<x:row r="1"><x:c r="A1" s="1" t="s"><x:v>0</x:v></x:c></x:row>'
+            .'<x:row r="2"><x:c r="A2" s="2"/><x:c r="B2" s="3"/></x:row>'
+            .'</x:sheetData>'
+            .'<x:pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>'
+            .'</x:worksheet>';
+    }
+
+    // ─── tests ───────────────────────────────────────────────────────────
+
+    public function test_parses_our_own_writer_output(): void
+    {
+        $path = sys_get_temp_dir().'/kxs-tpl-own-'.uniqid('', true).'.xlsx';
+        $this->tmp[] = $path;
+        $w = new SinkableXlsxWriter(new FileSink($path));
+        $w->setHeaderStyle(['bold' => true, 'fill' => '#1F4E78', 'color' => '#FFFFFF']);
+        $w->setColumnFormat(3, 'currency_try');
+        $w->startFile(['id', 'name', 'amount']);
+        $w->writeRow([1, 'sample', 10.5]);   // becomes the sample row
+        $w->finishFile();
+
+        $sheet = Template::open($path)->sheet('Report', dataStartRow: 2);
+
+        $this->assertSame(1, $sheet->variantCount(), 'one sample row → one variant');
+        $this->assertStringEndsWith('<sheetData>', $sheet->head());
+        $this->assertStringStartsWith('</sheetData>', $sheet->tail());
+        // Header row 1 is kept verbatim, the sample row is not emitted.
+        $this->assertStringContainsString('r="1"', $sheet->headerRowsXml());
+        $this->assertStringNotContainsString('r="2"', $sheet->headerRowsXml());
+        // The formatted column carries a style id the writer chose.
+        $this->assertArrayHasKey(2, $sheet->styleMap(0));
+    }
+
+    public function test_parses_phpspreadsheet_shaped_sheet(): void
+    {
+        $bytes = $this->buildXlsx($this->scaffold(['Leave' => $this->phpSpreadsheetSheet()]));
+        $sheet = Template::fromString($bytes)->sheet('Leave', dataStartRow: 3);
+
+        // head keeps layout, ends at the seam.
+        $head = $sheet->head();
+        $this->assertStringContainsString('<sheetViews>', $head);
+        $this->assertStringContainsString('state="frozen"', $head);
+        $this->assertStringContainsString('<cols>', $head);
+        $this->assertStringEndsWith('<sheetData>', $head);
+
+        // Two header rows kept, two sample rows consumed.
+        $this->assertStringContainsString('r="1"', $sheet->headerRowsXml());
+        $this->assertStringContainsString('r="2"', $sheet->headerRowsXml());
+        $this->assertStringNotContainsString('r="3"', $sheet->headerRowsXml());
+        $this->assertSame(2, $sheet->variantCount());
+
+        // Style oracle: 0-based column => cellXfs id, gaps allowed (C absent).
+        $this->assertSame([0 => 5, 1 => 6, 3 => 9], $sheet->styleMap(0));
+        $this->assertSame([0 => 7, 1 => 8, 3 => 10], $sheet->styleMap(1));
+
+        // tail byte-identical from the closing tag on.
+        $this->assertStringStartsWith('</sheetData>', $sheet->tail());
+        $this->assertStringContainsString('<mergeCell ref="A1:D1"/>', $sheet->tail());
+        $this->assertStringContainsString('<pageMargins', $sheet->tail());
+        $this->assertStringEndsWith('</worksheet>', $sheet->tail());
+    }
+
+    public function test_custom_height_before_ht_does_not_fool_the_row_height_parser(): void
+    {
+        $bytes = $this->buildXlsx($this->scaffold(['Leave' => $this->phpSpreadsheetSheet()]));
+        $sheet = Template::fromString($bytes)->sheet('Leave', dataStartRow: 3);
+
+        $attrs = $sheet->rowAttributes(0);
+        // Naive /ht="([^"]*)"/ would read "1" out of customHeight="1".
+        $this->assertSame('18.75', $attrs['ht']);
+        $this->assertTrue($attrs['customHeight']);
+    }
+
+    public function test_namespace_prefixed_excel_dialect(): void
+    {
+        $bytes = $this->buildXlsx($this->scaffold(['Data' => $this->excelPrefixedSheet()]));
+        $sheet = Template::fromString($bytes)->sheet('Data', dataStartRow: 2);
+
+        $this->assertStringEndsWith('<x:sheetData>', $sheet->head());
+        $this->assertStringStartsWith('</x:sheetData>', $sheet->tail());
+        $this->assertSame(1, $sheet->variantCount());
+        $this->assertSame([0 => 2, 1 => 3], $sheet->styleMap(0));
+    }
+
+    public function test_self_closing_sheet_data(): void
+    {
+        $body = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            .'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            .'<dimension ref="A1:A1"/><sheetData/>'
+            .'<pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>'
+            .'</worksheet>';
+        $bytes = $this->buildXlsx($this->scaffold(['Empty' => $body]));
+        $sheet = Template::fromString($bytes)->sheet('Empty', dataStartRow: 1);
+
+        // The self-closing tag is normalised into an open/close pair.
+        $this->assertStringEndsWith('<sheetData>', $sheet->head());
+        $this->assertStringStartsWith('</sheetData>', $sheet->tail());
+        $this->assertStringContainsString('<pageMargins', $sheet->tail());
+        $this->assertSame('', $sheet->headerRowsXml());
+        $this->assertSame(1, $sheet->variantCount(), 'no samples → one default variant');
+        $this->assertSame([], $sheet->styleMap(0));
+    }
+
+    public function test_no_sample_rows_yields_one_unstyled_variant(): void
+    {
+        // dataStartRow past the last row: everything is a header row.
+        $bytes = $this->buildXlsx($this->scaffold(['Leave' => $this->phpSpreadsheetSheet()]));
+        $sheet = Template::fromString($bytes)->sheet('Leave', dataStartRow: 99);
+
+        $this->assertSame(1, $sheet->variantCount());
+        $this->assertSame([], $sheet->styleMap(0));
+        $this->assertStringContainsString('r="4"', $sheet->headerRowsXml());
+    }
+
+    public function test_rows_without_r_attribute_use_positional_index(): void
+    {
+        $body = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            .'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>'
+            .'<row><c s="1" t="inlineStr"><is><t>h</t></is></c></row>'
+            .'<row><c s="4"/><c s="5"/></row>'
+            .'</sheetData></worksheet>';
+        $bytes = $this->buildXlsx($this->scaffold(['Compact' => $body]));
+        $sheet = Template::fromString($bytes)->sheet('Compact', dataStartRow: 2);
+
+        $this->assertSame(1, $sheet->variantCount());
+        // No r on the cells either → positional columns.
+        $this->assertSame([0 => 4, 1 => 5], $sheet->styleMap(0));
+    }
+
+    public function test_dimension_is_stripped_from_head(): void
+    {
+        // <dimension> cannot be rewritten in a streaming write (the last row
+        // is unknown when head goes out) and is optional in the schema —
+        // exactly what our own preamble does. Strip it.
+        $bytes = $this->buildXlsx($this->scaffold(['Leave' => $this->phpSpreadsheetSheet()]));
+        $sheet = Template::fromString($bytes)->sheet('Leave', dataStartRow: 3);
+
+        $this->assertStringNotContainsString('<dimension', $sheet->head());
+        $this->assertStringContainsString('<sheetPr/>', $sheet->head(), 'only dimension is removed');
+    }
+
+    public function test_merge_inside_the_data_region_is_rejected(): void
+    {
+        $body = str_replace(
+            '<mergeCell ref="A1:D1"/>',
+            '<mergeCell ref="A3:B4"/>',
+            $this->phpSpreadsheetSheet()
+        );
+        $bytes = $this->buildXlsx($this->scaffold(['Leave' => $body]));
+
+        $this->expectException(XlsxStreamException::class);
+        $this->expectExceptionMessageMatches('/mergeCell/');
+        Template::fromString($bytes)->sheet('Leave', dataStartRow: 3);
+    }
+
+    /**
+     * Every range below the sample rows is copied verbatim, so any of them
+     * that reaches into the streamed data would keep covering only the rows
+     * the template declared. Rewriting them is not one rule but several: a
+     * filter and a conditional format live in the sheet, a table's range
+     * lives in xl/tables and its filter in a workbook defined name. Rather
+     * than edit a second part, template mode refuses the template.
+     *
+     * The check reads no semantics — it looks at ref and sqref wherever they
+     * appear — so the matrix below is the contract, not a list of the cases
+     * someone happened to think of.
+     */
+    #[\PHPUnit\Framework\Attributes\DataProvider('rangesReachingTheData')]
+    public function test_a_tail_range_reaching_the_data_region_is_rejected(string $tail, string $needle): void
+    {
+        $bytes = $this->buildXlsx($this->scaffold(['Leave' => $this->sheetWithTail($tail)]));
+
+        $this->expectException(XlsxStreamException::class);
+        $this->expectExceptionMessageMatches('/'.preg_quote($needle, '/').'/');
+        Template::fromString($bytes)->sheet('Leave', dataStartRow: 3);
+    }
+
+    public static function rangesReachingTheData(): array
+    {
+        return [
+            'auto filter' => ['<autoFilter ref="A2:D40"/>', 'autoFilter'],
+            'sort state' => ['<autoFilter ref="A2:D2"><sortState ref="A3:D40"/></autoFilter>', 'sortState'],
+            'conditional format' => [
+                '<conditionalFormatting sqref="A3:D40"><cfRule type="expression" priority="1"/></conditionalFormatting>',
+                'conditionalFormatting',
+            ],
+            'second sqref in the list' => [
+                '<conditionalFormatting sqref="A1:D1 A3:D40"><cfRule type="expression" priority="1"/></conditionalFormatting>',
+                'conditionalFormatting',
+            ],
+            'data validation' => ['<dataValidations count="1"><dataValidation type="list" sqref="B3:B40"/></dataValidations>', 'dataValidation'],
+            'hyperlink' => ['<hyperlinks><hyperlink ref="A9" display="x"/></hyperlinks>', 'hyperlink'],
+            'whole columns cover every row' => ['<autoFilter ref="A:D"/>', 'autoFilter'],
+            'x14 extension spells sqref as an element' => [
+                '<extLst><ext uri="{78C0D931}"><x14:conditionalFormattings xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main">'
+                .'<x14:conditionalFormatting><x14:cfRule type="dataBar" id="{1}"/><xm:sqref>A3:D40</xm:sqref>'
+                .'</x14:conditionalFormatting></x14:conditionalFormattings></ext></extLst>',
+                'sqref',
+            ],
+            'namespace-prefixed filter' => ['<x:autoFilter ref="A2:D40"/>', 'autoFilter'],
+        ];
+    }
+
+    public function test_a_table_part_is_rejected_because_its_range_lives_elsewhere(): void
+    {
+        $bytes = $this->buildXlsx($this->scaffold(['Leave' => $this->sheetWithTail('<tableParts count="1"><tablePart r:id="rId1"/></tableParts>')]));
+
+        $this->expectException(XlsxStreamException::class);
+        $this->expectExceptionMessageMatches('/tablePart/');
+        Template::fromString($bytes)->sheet('Leave', dataStartRow: 3);
+    }
+
+    /**
+     * PhpSpreadsheet 1.x writes an empty <tableParts count="0"/> on every
+     * sheet it produces. Refusing the wrapper rather than an actual
+     * <tablePart> child would therefore refuse every template that library
+     * made — verified against 1.30.6, which emits it, and 5.9.0, which does
+     * not. A guard against false rejection must not be the thing causing one.
+     */
+    public function test_an_empty_table_parts_wrapper_is_accepted(): void
+    {
+        $tail = '<autoFilter ref="A2:D2"/><tableParts count="0"/>';
+        $bytes = $this->buildXlsx($this->scaffold(['Leave' => $this->sheetWithTail($tail)]));
+
+        $sheet = Template::fromString($bytes)->sheet('Leave', dataStartRow: 3);
+        $this->assertStringContainsString('<tableParts count="0"/>', $sheet->tail());
+    }
+
+    /**
+     * The shapes that must NOT trip the guard. A false rejection is the
+     * failure mode that would make template mode unusable on real layouts,
+     * so the accepted set is pinned as carefully as the refused one.
+     */
+    public function test_ranges_that_stay_above_the_data_region_are_accepted(): void
+    {
+        $tail = '<mergeCells count="1"><mergeCell ref="A1:D1"/></mergeCells>'
+            .'<autoFilter ref="A2:D2"/>'
+            .'<conditionalFormatting sqref="A1:D2"><cfRule type="expression" priority="1"/></conditionalFormatting>'
+            .'<hyperlinks><hyperlink ref="A1" display="x"/></hyperlinks>'
+            .'<pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>'
+            .'<pageSetup paperSize="9" orientation="landscape"/>'
+            .'<drawing r:id="rId2"/>';
+        $bytes = $this->buildXlsx($this->scaffold(['Leave' => $this->sheetWithTail($tail)]));
+
+        $sheet = Template::fromString($bytes)->sheet('Leave', dataStartRow: 3);
+        $this->assertSame('</sheetData>'.$tail.'</worksheet>', $sheet->tail());
+    }
+
+    /** Two header rows, two sample rows, and whatever tail the case needs. */
+    private function sheetWithTail(string $tail): string
+    {
+        return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            .'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            .'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
+            .'xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            .'xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main">'
+            .'<sheetData>'
+            .'<row r="1"><c r="A1" s="3"/></row>'
+            .'<row r="2"><c r="A2" s="1"/></row>'
+            .'<row r="3"><c r="A3" s="4"/><c r="B3" s="5"/></row>'
+            .'<row r="4"><c r="A4" s="6"/><c r="B4" s="7"/></row>'
+            .'</sheetData>'.$tail.'</worksheet>';
+    }
+
+    public function test_unknown_sheet_name_throws(): void
+    {
+        $bytes = $this->buildXlsx($this->scaffold(['Leave' => $this->phpSpreadsheetSheet()]));
+        $this->expectException(XlsxStreamException::class);
+        $this->expectExceptionMessageMatches('/Nope/');
+        Template::fromString($bytes)->sheet('Nope', dataStartRow: 2);
+    }
+
+    public function test_sheet_names_and_entries_are_listed(): void
+    {
+        $bytes = $this->buildXlsx($this->scaffold([
+            'Leave' => $this->phpSpreadsheetSheet(),
+            'Data' => $this->excelPrefixedSheet(),
+        ]));
+        $t = Template::fromString($bytes);
+
+        $this->assertSame(['Leave', 'Data'], $t->sheetNames());
+        $this->assertSame('xl/worksheets/sheet2.xml', $t->entryFor('Data'));
+        // Every zip entry is visible so finishFile() can copy the untouched ones.
+        $this->assertContains('xl/workbook.xml', $t->entryNames());
+        $this->assertContains('[Content_Types].xml', $t->entryNames());
+    }
+
+    public function test_template_is_parsed_once_and_reusable(): void
+    {
+        $bytes = $this->buildXlsx($this->scaffold(['Leave' => $this->phpSpreadsheetSheet()]));
+        $t = Template::fromString($bytes);
+
+        $a = $t->sheet('Leave', dataStartRow: 3);
+        $b = $t->sheet('Leave', dataStartRow: 3);
+        $this->assertSame($a->head(), $b->head());
+        $this->assertSame($a->styleMap(1), $b->styleMap(1));
+        // Different cut point on the same template object is allowed.
+        $c = $t->sheet('Leave', dataStartRow: 4);
+        $this->assertSame(1, $c->variantCount());
+    }
+
+    public function test_namespace_dialect_is_reported_for_the_writer_guard(): void
+    {
+        // The row builders emit unprefixed <row>/<c>. A sheet that binds only
+        // a prefix would take those rows into no namespace at all, so the
+        // parser reports the fact and template mode refuses that dialect.
+        $prefixOnly = $this->buildXlsx($this->scaffold(['Data' => $this->excelPrefixedSheet()]));
+        $this->assertFalse(
+            Template::fromString($prefixOnly)->sheet('Data', dataStartRow: 2)->acceptsUnprefixedRows(),
+            'prefix-only binding cannot take unprefixed rows'
+        );
+
+        // A plain default-namespace sheet is the common, writable case.
+        $plain = $this->buildXlsx($this->scaffold(['Leave' => $this->phpSpreadsheetSheet()]));
+        $this->assertTrue(
+            Template::fromString($plain)->sheet('Leave', dataStartRow: 3)->acceptsUnprefixedRows()
+        );
+
+        // Prefixed ELEMENTS but a default binding too: unprefixed rows still
+        // land in the main namespace, so this dialect is accepted.
+        $both = str_replace(
+            '<x:worksheet xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main">',
+            '<x:worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main">',
+            $this->excelPrefixedSheet()
+        );
+        $sheet = Template::fromString($this->buildXlsx($this->scaffold(['Data' => $both])))->sheet('Data', dataStartRow: 2);
+        $this->assertSame('x:', $sheet->elementPrefix());
+        $this->assertTrue($sheet->acceptsUnprefixedRows(), 'both bindings present → writable');
+    }
+}
